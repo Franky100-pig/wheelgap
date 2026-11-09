@@ -395,6 +395,8 @@ def parse_pipfile_lock(path: Path) -> Source:
             if not isinstance(p, dict):
                 raise SourceError(f"{path.name}: {section}.{name} isn't a package entry")
             version = p.get("version")
+            if version is not None and not isinstance(version, str):
+                raise SourceError(f"{path.name}: {section}.{name} has a version that isn't a string")
             pkg = Package(name, version.removeprefix("==") if version else None, origin=path.name)
             if p.get("markers"):
                 pkg.markers = [p["markers"]]

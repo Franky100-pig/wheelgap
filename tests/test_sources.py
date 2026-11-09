@@ -552,3 +552,10 @@ def test_pylock_records_requires_python_and_index(tmp_path):
     )
     (src,) = load_inputs([str(tmp_path / "pylock.toml")])
     assert src.requires_python == "==3.13.*" and src.packages[0].registry == "https://pypi.org/simple"
+
+
+def test_pipfile_lock_non_string_version_raises(tmp_path):
+    path = tmp_path / "Pipfile.lock"
+    path.write_text(json.dumps({"default": {"requests": {"version": 2}}}), encoding="utf-8")
+    with pytest.raises(SourceError, match="default.requests has a version that isn't a string"):
+        load_inputs([str(path)])

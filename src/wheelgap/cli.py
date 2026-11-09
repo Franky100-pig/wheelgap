@@ -407,9 +407,8 @@ def print_target_list(args: argparse.Namespace, config: dict) -> None:
     glibc = parse_version_pair(versions["manylinux"][1], "glibc")
     if glibc[0] == MANYLINUX_FLOOR[0]:  # pip's 2.17 floor outside x86 (no manylinux before manylinux2014)
         floor = ".".join(map(str, MANYLINUX_FLOOR))
-        floored = (
-            f", glibc {floor} to {glibc[0]}.{glibc[1]}" if glibc >= MANYLINUX_FLOOR else f", none below glibc {floor}"
-        )
+        below = f", no manylinux (glibc {glibc[0]}.{glibc[1]} is below the {floor} floor)"
+        floored = f", glibc {floor} to {glibc[0]}.{glibc[1]}" if glibc >= MANYLINUX_FLOOR else below
     else:
         floored = limits["manylinux"]
 
@@ -612,11 +611,12 @@ def main(argv: list[str] | None = None) -> int:
                     f"wheelgap: note: {s.label} is locked for Python {s.requires_python}, so it may be missing "
                     f"wheels for Python {', '.join(outside)}; looked its PyPI packages up on the index too"
                 )
-                if other:
-                    note += f" ({other} from other indexes left as locked)"
-                if failed:
-                    note += f"; {failed} couldn't be looked up, so for those Pythons they may show false gaps"
-                if failed or not quiet:  # quiet runs stay quiet unless the answer may be wrong
+                unchecked = [f"{other} from other indexes"] * bool(other) + [
+                    f"{failed} that couldn't be looked up"
+                ] * bool(failed)
+                if unchecked:
+                    note += f"; {' and '.join(unchecked)} may show false gaps for those Pythons"
+                if unchecked or not quiet:  # quiet runs stay quiet unless the answer may be wrong
                     print(note, file=sys.stderr)
     skipped = [p for p in packages if p.skip]
     rows = [r for r in check(sources, targets) if r.needed]
