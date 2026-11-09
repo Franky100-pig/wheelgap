@@ -50,6 +50,8 @@ class Package:
     spec: str | None = None
     # Files of a pinned release that the index marks as yanked (see check.status_for).
     yanked: frozenset[str] = frozenset()
+    # uv.lock / pylock.toml: the index the lock says the package came from, e.g. https://pypi.org/simple.
+    registry: str | None = None
 
     @property
     def key(self) -> str:
@@ -78,18 +80,27 @@ class Source:
 def pythons_outside_lock(source: Source, targets: Iterable[Target]) -> list[str]:
     """Target Pythons the lockfile's requires-python leaves out, e.g. ['3.14t'] for `==3.13.*`.
 
-    uv drops the wheels for those Pythons from uv.lock, so its file lists can't answer for them.
+    uv keeps only the wheels that can serve requires-python (abi3 and pure wheels survive), so the lock may
+    be missing wheels for those Pythons. Like uv, only the bounds count: `!=3.12.*` doesn't exclude 3.12.
     """
     if not source.requires_python:
         return []
     try:
-        spec = SpecifierSet(source.requires_python)
+        spec = SpecifierSet(",".join(str(s) for s in SpecifierSet(source.requires_python) if s.operator != "!="))
     except InvalidSpecifier:
         return []
     out = []
     for t in targets:
-        # Any patch release of that minor counts (>=3.11.4 still serves 3.11).
-        if not any(spec.contains(Version(f"{t.major}.{t.minor}.{patch}"), prereleases=True) for patch in (0, 999)):
+        # A minor is served if any of its releases fits: its first and last patch, or a version the spec names.
+        tries = [Version(f"{t.major}.{t.minor}.0"), Version(f"{t.major}.{t.minor}.999")]
+        for s in spec:
+            try:
+                v = Version(s.version.removesuffix(".*"))
+            except ValueError:
+                continue
+            if v.release[:2] == (t.major, t.minor):
+                tries.append(v)
+        if not any(spec.contains(v, prereleases=True) for v in tries):
             out.append(t.python)
     return list(dict.fromkeys(out))
 
@@ -127,6 +138,7 @@ def parse_uv_lock(path: Path) -> Source:
         if kind and "registry" not in src:
             pkg.skip = kind
         else:
+            pkg.registry = src.get("registry")
             files = [f for f in (_filename(w) for w in p.get("wheels", [])) if f]
             if p.get("sdist"):
                 files.append(_filename(p["sdist"]) or f"{p['name']}-{p.get('version')}.tar.gz")
@@ -154,7 +166,7 @@ def parse_pylock(path: Path) -> Source:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     pkgs = []
     for p in data.get("packages", []):
-        pkg = Package(p["name"], p.get("version"), origin=path.name)
+        pkg = Package(p["name"], p.get("version"), origin=path.name, registry=p.get("index"))
         if p.get("marker"):
             pkg.markers = [p["marker"]]
         if any(k in p for k in ("vcs", "directory", "archive")) and "wheels" not in p and "sdist" not in p:
@@ -165,7 +177,8 @@ def parse_pylock(path: Path) -> Source:
                 files.append(_filename(p["sdist"]) or f"{p['name']}-{p.get('version')}.tar.gz")
             pkg.files = files
         pkgs.append(pkg)
-    return Source(path.name, pkgs)
+    requires = data.get("requires-python")
+    return Source(path.name, pkgs, requires_python=requires if isinstance(requires, str) else None)
 
 
 def _poetry_edges(p: dict) -> list[Edge]:

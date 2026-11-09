@@ -15,7 +15,7 @@ from .api import running_python
 from .check import Row, Status, check, explain, has_sdist
 from .dockerfile import DockerfileError, read_dockerfile
 from .pyodide import PyodideLock, PyodideLockError, apply_bundled, check_targets, load_pyodide_lock
-from .pypi import check_index_url, fill_all
+from .pypi import check_index_url, fill_all, recheck_lock
 from .sources import Package, SourceError, load_inputs, pythons_outside_lock
 from .targets import (
     ALIASES,
@@ -595,12 +595,16 @@ def main(argv: list[str] | None = None) -> int:
     if not args.online:
         for s in sources:
             if outside := pythons_outside_lock(s, targets):
-                print(
-                    f"wheelgap: note: {s.label} is locked for Python {s.requires_python}, so it has no wheels for "
-                    f"Python {', '.join(outside)}; checking its packages on PyPI instead",
-                    file=sys.stderr,
+                other, failed = recheck_lock(s.packages)
+                note = (
+                    f"wheelgap: note: {s.label} is locked for Python {s.requires_python}, so it may be missing "
+                    f"wheels for Python {', '.join(outside)}; looked its packages up on the index too"
                 )
-                fill_all(s.packages, refresh=True)
+                if other:
+                    note += f" ({other} from other indexes were left as locked)"
+                if failed:
+                    note += f"; {failed} couldn't be looked up, so for those Pythons they may show false gaps"
+                print(note, file=sys.stderr)
     skipped = [p for p in packages if p.skip]
     rows = [r for r in check(sources, targets) if r.needed]
     if pyodide_lock:

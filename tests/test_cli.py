@@ -557,7 +557,7 @@ def test_lock_for_another_python_is_rechecked_online(capsys, fake_pypi, tmp_path
     (tmp_path / "uv.lock").write_text(LOCK_312_ONLY, encoding="utf-8")
     code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
     assert code == 0, out  # PyPI's cp313 wheel counts; the lock alone would say "source"
-    assert "uv.lock is locked for Python ==3.12.*, so it has no wheels for Python 3.13" in err
+    assert "uv.lock is locked for Python ==3.12.*, so it may be missing wheels for Python 3.13" in err
     assert fake_pypi == ["https://pypi.org/pypi/fastlib/2.0.0/json"]
 
 
@@ -566,3 +566,27 @@ def test_lock_inside_requires_python_stays_offline(capsys, fake_pypi, tmp_path):
     code, _, err = run(capsys, str(tmp_path), "-p", "3.12", "-t", "linux-x86_64")
     assert code == 0 and "note:" not in err
     assert fake_pypi == []
+
+
+def test_failed_recheck_keeps_the_lock_answers(capsys, tmp_path, monkeypatch):
+    import urllib.error
+
+    from wheelgap import pypi
+
+    def offline(url, timeout=20.0):
+        raise urllib.error.URLError("no network")
+
+    monkeypatch.setattr(pypi, "fetch_json", offline)
+    (tmp_path / "uv.lock").write_text(LOCK_312_ONLY, encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.12,3.13", "-t", "linux-x86_64", "--json")
+    rows = {p["name"]: p["results"] for p in json.loads(out)["packages"]}
+    # 3.12 is still answered from the lock; 3.13 falls back to the lock's (possibly incomplete) files.
+    assert rows["fastlib"] == {"3.12 linux-x86_64": "wheel", "3.13 linux-x86_64": "source"}
+    assert "1 couldn't be looked up" in err and code == 1
+
+
+def test_recheck_leaves_packages_from_other_indexes_alone(capsys, fake_pypi, tmp_path):
+    lock = LOCK_312_ONLY.replace('registry = "https://pypi.org/simple"', 'registry = "https://download.example/whl"')
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path), "-p", "3.12,3.13", "-t", "linux-x86_64")
+    assert fake_pypi == [] and "1 from other indexes were left as locked" in err

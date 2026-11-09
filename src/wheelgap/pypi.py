@@ -184,6 +184,29 @@ def fill(pkg: Package) -> Package:
     return pkg
 
 
+PYPI_SIMPLE = "https://pypi.org/simple"
+
+
+def recheck_lock(packages: list[Package]) -> tuple[int, int]:
+    """Add the index's files to lockfile packages whose lock may be missing some (see pythons_outside_lock).
+
+    Only packages the lock says came from PyPI are looked up. The lock's own files are kept, and a package
+    whose lookup fails stays as the lock described it. Returns (packages from other indexes, failed lookups).
+    """
+    locked = [p for p in packages if not p.skip and p.files is not None]
+    todo = [p for p in locked if (p.registry or PYPI_SIMPLE).rstrip("/") == PYPI_SIMPLE]
+    saved = [p.files or [] for p in todo]
+    fill_all(todo, refresh=True)
+    failed = 0
+    for p, lock in zip(todo, saved, strict=True):
+        if p.error:
+            p.files, p.error = lock, None
+            failed += 1
+        else:
+            p.files = list(dict.fromkeys(lock + (p.files or [])))
+    return len(locked) - len(todo), failed
+
+
 def fill_all(packages: list[Package], refresh: bool = False, workers: int = 16) -> None:
     todo = [p for p in packages if not p.skip and (refresh or p.files is None)]
     if not todo:
