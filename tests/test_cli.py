@@ -589,4 +589,4 @@ def test_recheck_leaves_packages_from_other_indexes_alone(capsys, fake_pypi, tmp
     lock = LOCK_312_ONLY.replace('registry = "https://pypi.org/simple"', 'registry = "https://download.example/whl"')
     (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
     code, _, err = run(capsys, str(tmp_path), "-p", "3.12,3.13", "-t", "linux-x86_64")
-    assert fake_pypi == [] and "1 from other indexes were left as locked" in err
+    assert fake_pypi == [] and "1 from other indexes left as locked" in err

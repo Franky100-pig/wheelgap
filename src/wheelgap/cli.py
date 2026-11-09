@@ -598,10 +598,10 @@ def main(argv: list[str] | None = None) -> int:
                 other, failed = recheck_lock(s.packages)
                 note = (
                     f"wheelgap: note: {s.label} is locked for Python {s.requires_python}, so it may be missing "
-                    f"wheels for Python {', '.join(outside)}; looked its packages up on the index too"
+                    f"wheels for Python {', '.join(outside)}; looked its PyPI packages up on the index too"
                 )
                 if other:
-                    note += f" ({other} from other indexes were left as locked)"
+                    note += f" ({other} from other indexes left as locked)"
                 if failed:
                     note += f"; {failed} couldn't be looked up, so for those Pythons they may show false gaps"
                 print(note, file=sys.stderr)

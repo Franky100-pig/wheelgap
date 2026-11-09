@@ -193,7 +193,7 @@ def recheck_lock(packages: list[Package]) -> tuple[int, int]:
     Only packages the lock says came from PyPI are looked up. The lock's own files are kept, and a package
     whose lookup fails stays as the lock described it. Returns (packages from other indexes, failed lookups).
     """
-    locked = [p for p in packages if not p.skip and p.files is not None]
+    locked = [p for p in packages if not p.skip and p.files is not None and p.version]  # pinned: same release
     todo = [p for p in locked if (p.registry or PYPI_SIMPLE).rstrip("/") == PYPI_SIMPLE]
     saved = [p.files or [] for p in todo]
     fill_all(todo, refresh=True)
