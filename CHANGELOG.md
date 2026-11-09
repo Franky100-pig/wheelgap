@@ -4,7 +4,7 @@
 
 ## 0.6.2 (2026-11-09)
 
-More accurate answers: no false gaps from narrowly locked `uv.lock` files, pip's real manylinux floor on ARM and other non-x86 Linux, stricter Dockerfile parsing, and safer fetching.
+More accurate answers: no false gaps from narrowly locked `uv.lock` and `pylock.toml` files, pip's real manylinux floor on ARM and other non-x86 Linux, stricter Dockerfile parsing, and safer fetching.
 
 ### Fixed
 
