@@ -11,6 +11,7 @@ FAKE_INDEX = {
     "winonly": {"311": ["winonly-311-cp313-cp313-win_amd64.whl"]},
     "purewheel": {"3.1": ["purewheel-3.1-py3-none-any.whl"]},
     "nowheels": {"0.9": ["nowheels-0.9.tar.gz"]},
+    "yanked": {"1.0": [{"filename": "yanked-1.0-py3-none-any.whl", "yanked": True}]},
 }
 
 
@@ -38,7 +39,8 @@ def fake_pypi(monkeypatch):
         files = versions.get(version)
         if files is None:
             raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
-        return {"info": {"version": version}, "urls": [{"filename": f} for f in files]}
+        urls = [f if isinstance(f, dict) else {"filename": f} for f in files]
+        return {"info": {"version": version}, "urls": urls}
 
     monkeypatch.setattr(pypi, "fetch_json", fetch_json)
     return calls

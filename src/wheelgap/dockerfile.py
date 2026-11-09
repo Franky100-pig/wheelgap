@@ -8,7 +8,8 @@ from pathlib import Path
 
 # Debian release in the image tag -> its glibc version.
 DEBIAN_GLIBC = {"bullseye": "2.31", "bookworm": "2.36", "trixie": "2.41"}
-ALPINE_MUSL = "1.2"
+ALPINE_MUSL = "1.2"  # Alpine 3.13 and later; 3.12 and earlier ship musl 1.1
+_ALPINE_RE = re.compile(r"^alpine(\d+)\.(\d+)")
 # docker --platform -> wheelgap arch
 ARCHES = {
     "linux/amd64": "x86_64",
@@ -87,8 +88,10 @@ def parse_image(image: str, platform: str | None = None) -> ImageTarget:
     python = f"{m.group(1)}.{m.group(2)}"
     variant = (m.group(3) or "").lower().split("-") if m.group(3) else []
 
-    if any(part.startswith("alpine") for part in variant):
+    if alpine := next((part for part in variant if part.startswith("alpine")), None):
         family, glibc, musl = "musl", None, ALPINE_MUSL
+        if (m := _ALPINE_RE.match(alpine)) and (int(m.group(1)), int(m.group(2))) <= (3, 12):
+            musl = "1.1"
     elif any(part in WINDOWS_VARIANTS for part in variant):
         if platform:
             raise DockerfileError(f"{image}: --platform is not supported for Windows images")

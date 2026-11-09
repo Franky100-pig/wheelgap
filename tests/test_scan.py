@@ -45,8 +45,25 @@ def test_scan_writes_the_tracker_data(fake_pypi, tmp_path, capsys):
 
 def test_scan_reports_lookup_errors(fake_pypi, tmp_path, capsys):
     top = write_top(tmp_path, ["does-not-exist"])
-    main(["--top", "1", "--python", "3.13", "--top-packages", str(top)])
+    main(["--top", "1", "--python", "3.13", "--top-packages", str(top), "--max-error-rate", "1"])
     out, err = capsys.readouterr()
     pkg = json.loads(out)["packages"][0]
     assert pkg["error"] == "not on index" and set(pkg["results"]) == {"unknown"}
     assert "(1 lookup errors)" in err
+
+
+def test_scan_refuses_to_write_when_too_many_lookups_fail(fake_pypi, tmp_path, capsys):
+    top = write_top(tmp_path, ["does-not-exist", "purewheel"])
+    out = tmp_path / "coverage.json"
+    assert main(["--top", "2", "--python", "3.13", "--top-packages", str(top), "--out", str(out)]) == 1
+    assert not out.exists()  # the last good dataset stays in place
+    assert "too many lookup errors (1 of 2)" in capsys.readouterr().err
+    assert (
+        main(
+            ["--top", "2", "--python", "3.13", "--top-packages", str(top), "--out", str(out), "--max-error-rate", "0.5"]
+        )
+        == 0
+    )
+    data = json.loads(out.read_text())
+    assert data["lookup_errors"] == 1
+    assert data["targets"][0]["glibc"] == "2.36" and data["targets"][0]["musl"] == "1.2"

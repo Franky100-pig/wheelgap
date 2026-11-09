@@ -29,6 +29,7 @@ from .targets import (
     TargetError,
     build_targets,
     parse_version_pair,
+    resolve_platform,
 )
 
 EXAMPLES = """\
@@ -40,6 +41,20 @@ examples:
   wheelgap requirements.txt --json         machine-readable output for CI
   wheelgap -t alpine-arm64 --explain       show which wheels were rejected, and why
 """
+
+
+def musl_docker_names(item: str) -> str:
+    """With an Alpine image, `-t linux/arm64` means musl on arm64: Docker names say only the architecture.
+
+    wheelgap's own names (linux-aarch64, musl-aarch64) are left alone, since they name the libc too.
+    """
+    out = []
+    for name in item.split(","):
+        if "/" in name:
+            resolved = resolve_platform(name)
+            name = resolved.replace("linux-", "musl-", 1) if resolved.startswith("linux-") else resolved
+        out.append(name)
+    return ",".join(out)
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -92,12 +107,13 @@ def make_parser() -> argparse.ArgumentParser:
         "--online", action="store_true", help="re-check lockfile packages against PyPI instead of trusting the lockfile"
     )
     p.add_argument("--all", action="store_true", help="show every package, not just the ones with gaps")
-    detail = p.add_mutually_exclusive_group()
-    detail.add_argument(
-        "--explain", action="store_true", help="for each gap, list the wheels that were rejected and why"
-    )
-    detail.add_argument(
-        "-q", "--quiet", action="store_true", help="print only the gap summary and affected package names"
+    p.add_argument("--explain", action="store_true", help="for each gap, list the wheels that were rejected and why")
+    p.add_argument(
+        "-q",
+        "--quiet",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="print only the gap summary and affected package names (--no-quiet overrides quiet = true)",
     )
     p.add_argument("--json", action="store_true", help="print JSON instead of a table")
     p.add_argument("--exit-zero", action="store_true", help="exit 0 even when gaps are found")
@@ -372,16 +388,24 @@ def print_target_list(args: argparse.Namespace) -> None:
     print("Docker platform names like linux/arm64 also work.")
 
 
+def worst_status(row: Row) -> Status:
+    """The status that best describes a gap package: can't install, then unknown, then from source."""
+    for s in (Status.MISSING, Status.UNKNOWN, Status.SOURCE):
+        if s in row.results.values():
+            return s
+    return Status.WHEEL
+
+
 def gap_summary(gaps: list[Row], total: int, style: Style) -> str:
-    source = sum(any(s is Status.SOURCE for s in r.results.values()) for r in gaps)
-    missing = sum(any(s is Status.MISSING for s in r.results.values()) for r in gaps)
+    # Each package is counted once, under its worst status, so the parts always add up to len(gaps).
+    worst = [worst_status(r) for r in gaps]
+    source, missing, unknown = (worst.count(s) for s in (Status.SOURCE, Status.MISSING, Status.UNKNOWN))
     parts = []
     if source:
         parts.append(style.yellow(f"{source} will build from source"))
     if missing:
         parts.append(style.red(f"{missing} can't install at all"))
-    unknown = len(gaps) - source - missing
-    if unknown > 0:
+    if unknown:
         parts.append(style.dim(f"{unknown} unknown"))
     verb = "has" if len(gaps) == 1 else "have"
     return f"{style.bold(f'{len(gaps)} of {total} packages')} {verb} gaps: " + ", ".join(parts) + "."
@@ -401,12 +425,15 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         pyproject = find_pyproject(args.inputs)
         config = load_config(pyproject) if pyproject else {}
-        quiet = args.quiet or config.get("quiet", False)
-        if quiet and args.explain:
-            parser.error("--explain cannot be used with quiet mode (--quiet or quiet = true)")
+        quiet = args.quiet if args.quiet is not None else config.get("quiet", False)
+        # Quiet only changes the text output, so it can't clash with --explain when printing JSON.
+        if quiet and args.explain and not args.json:
+            parser.error("--explain cannot be used with quiet mode (--quiet or quiet = true; --no-quiet turns it off)")
         if args.dockerfile:
             # The image beats pyproject.toml; flags still win.
             image = read_dockerfile(Path(args.dockerfile))
+            if image.platform.startswith("musl-") and args.target:
+                args.target = [musl_docker_names(item) for item in args.target]
             config.update(python=[image.python], targets=[image.platform])
             config.update({k: v for k, v in (("glibc", image.glibc), ("musl", image.musl)) if v})
         targets = build_targets(
@@ -419,9 +446,17 @@ def main(argv: list[str] | None = None) -> int:
         sources = load_inputs(args.inputs or ["."])
         fail_on = args.fail_on or config.get("fail-on", "source")
         pyodide_lock = None
-        if lock_spec := args.pyodide_lock or config.get("pyodide-lock"):
+        if args.pyodide_lock:
+            pyodide_lock = load_pyodide_lock(args.pyodide_lock)
+            check_targets(pyodide_lock, targets)  # asked for explicitly, so a mismatch is an error
+        elif lock_spec := config.get("pyodide-lock"):
+            # A project default: relative to pyproject.toml, and quietly unused on runs with no matching
+            # pyodide target, so it doesn't break `wheelgap -t linux` in the same project.
+            if pyproject and not lock_spec.startswith(("http://", "https://")):
+                lock_spec = str(pyproject.parent / lock_spec)
             pyodide_lock = load_pyodide_lock(lock_spec)
-            check_targets(pyodide_lock, targets)
+            if not any(pyodide_lock.applies_to(t) for t in targets):
+                pyodide_lock = None
     except (TargetError, SourceError, DockerfileError, PyodideLockError, OSError) as e:
         print(f"wheelgap: error: {e}", file=sys.stderr)
         return 2
@@ -451,6 +486,9 @@ def main(argv: list[str] | None = None) -> int:
         if gaps:
             print(gap_summary(gaps, len(rows), style))
             print("gaps: " + ", ".join(r.package.name for r in gaps))
+        for r in rows:
+            if r.package.error:  # say why a package is "unknown", even in quiet mode
+                print(f"wheelgap: could not check {r.package.name}: {r.package.error}", file=sys.stderr)
         return code
 
     pys = ", ".join(dict.fromkeys(t.python for t in targets))

@@ -176,3 +176,21 @@ def test_pyodide_sdist_only_is_missing():
     assert status_for(["a-1.tar.gz"], lin) is Status.SOURCE
     assert status_for(["a-1.tar.gz"], py) is Status.MISSING  # no compiler in the browser
     assert status_for(["a-1-cp313-cp313-pyodide_2025_0_wasm32.whl", "a-1.tar.gz"], py) is Status.WHEEL
+
+
+def test_via_prefers_the_projects_own_dependency_over_a_group():
+    # numpy is a runtime dependency of the project and also listed in the dev group.
+    src = graph({"app": [("numpy", None)], "numpy": []}, root_edges=[("numpy", None, None)], root_groups={0: "dev"})
+    (t,) = build_targets(["3.13"], ["linux-x86_64"])
+    assert via(src, [t], "numpy") == {t: ["app", "numpy"]}
+
+
+def test_via_prefers_a_plain_requirement_over_a_group():
+    src = graph(
+        {"a": [("c", None)], "b": [("c", None)], "c": []},
+        root_edges=[("a", None, None), ("b", None, None)],
+        root_groups={0: "dev"},
+        roots=(),
+    )
+    (t,) = build_targets(["3.13"], ["linux-x86_64"])
+    assert via(src, [t], "c") == {t: ["b", "c"]}

@@ -5,6 +5,22 @@
 - `--explain` shows which dependency pulls in each gap package for `uv.lock` inputs: the shortest path from your project or a dependency group, worked out per target (`via: myapp → uvicorn → uvloop`). `--json --explain` adds a matching `via` object keyed by target, like `rejected`. (#45, thanks [@YSWFelicity](https://github.com/YSWFelicity))
 - `-q` / `--quiet` prints only the gap summary and affected package names, and leaves clean runs silent. Set `quiet = true` in `[tool.wheelgap]` to use it by default. (#48, thanks [@Daiyuanranfeng](https://github.com/Daiyuanranfeng))
 
+
+### Fixed
+
+These came from independent second reviews of recent PRs.
+
+- `--pyodide-lock`: a package whose lookup failed (e.g. a mistyped pin) was reported as bundled and could pass. It's now `unknown`, which fails.
+- `pyodide-lock` in `[tool.wheelgap]` made every run without a matching Pyodide target exit 2. It's now quietly unused on those runs, and a relative path is read from the folder that holds `pyproject.toml`.
+- A release pinned with `==` that has since been yanked was reported as having no files ("can't install"). pip still installs it (PEP 592), so its files now count.
+- `pdm.lock`: packages with extras were listed twice (PDM writes one entry per extras variant). They now count once.
+- The summary line could leave "unknown" packages out of its counts. Each gap package is now counted once, under its worst status.
+- `quiet = true` in `[tool.wheelgap]` made `--json --explain` fail with a usage error. Quiet now only affects text output, `--no-quiet` turns it off for one run, and quiet runs still say why a package is unknown.
+- `--explain`'s `via:` could credit a dependency group for a package that is also a runtime dependency. The project's own dependencies are now preferred.
+- `--dockerfile` with an Alpine image plus `-t linux/arm64` checked glibc wheels. Docker platform names now keep the image's libc (musl).
+- `--dockerfile`: Alpine 3.12 and earlier are checked against musl 1.1, not 1.2.
+- `python -m wheelgap.scan` now refuses to write results when more than 5% of lookups fail (`--max-error-rate`), records `lookup_errors` and each target's glibc/musl/macOS limits, and no longer counts Python 2-only wheels as "pure".
+
 ## 0.4.0 (2026-11-09)
 
 - **Python API**: `wheelgap.make_targets()`, `check_package()`, `check_packages()` and `check_lockfile()`, returning `Result` objects (`.ok`, `.gaps`, `.statuses`, `.to_dict()`), so other tools don't need to go through the CLI.

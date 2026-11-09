@@ -161,3 +161,17 @@ def test_no_lockfile_in_dir(fixtures):
 def test_bad_requirement():
     with pytest.raises(SourceError):
         load_inputs(["not a valid ! spec"])
+
+
+def test_pdm_lock_extras_variants_count_once(tmp_path):
+    # PDM writes one entry per extras variant (seen in PDM's own lockfile for coverage[toml]).
+    (tmp_path / "pdm.lock").write_text(
+        '[[package]]\nname = "coverage"\nversion = "7.13.5"\nmarker = "sys_platform == \'linux\'"\n'
+        'files = [{file = "coverage-7.13.5.tar.gz", hash = "sha256:00"}]\n\n'
+        '[[package]]\nname = "coverage"\nversion = "7.13.5"\nextras = ["toml"]\n'
+        'files = [{file = "coverage-7.13.5.tar.gz", hash = "sha256:00"}]\n',
+        encoding="utf-8",
+    )
+    (src,) = load_inputs([str(tmp_path)])
+    assert [(p.name, p.version) for p in src.packages] == [("coverage", "7.13.5")]
+    assert src.packages[0].markers is None  # the unconditional variant wins

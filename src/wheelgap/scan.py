@@ -72,7 +72,19 @@ def report(
         "generated": datetime.now(UTC).replace(microsecond=0).isoformat(),
         "wheelgap": __version__,
         "top_packages": {"source": source, "last_update": last_update},
-        "targets": [{"label": t.label(True), "python": t.python, "platform": t.platform} for t in targets],
+        "targets": [
+            {
+                "label": t.label(True),
+                "python": t.python,
+                "platform": t.platform,
+                # The limits a wheel had to meet, so the numbers keep their meaning if defaults change.
+                "glibc": ".".join(map(str, t.glibc)),
+                "musl": ".".join(map(str, t.musl)),
+                "macos": ".".join(map(str, t.macos)),
+            }
+            for t in targets
+        ],
+        "lookup_errors": sum(1 for r in results if r.error),
         "summary": summarise(results, targets),
         "packages": [
             {
@@ -96,6 +108,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--top-packages", default=TOP_PACKAGES_URL, metavar="URL_OR_PATH", help="top-pypi-packages JSON")
     p.add_argument("--workers", type=int, default=16, help="parallel index lookups (default: 16)")
     p.add_argument("--out", metavar="PATH", help="write here instead of stdout")
+    p.add_argument(
+        "--max-error-rate",
+        type=float,
+        default=0.05,
+        metavar="FRACTION",
+        help="exit 1 without writing if more than this share of lookups fail (default: 0.05)",
+    )
     args = p.parse_args(argv)
 
     started = time.monotonic()
@@ -104,17 +123,21 @@ def main(argv: list[str] | None = None) -> int:
     results = scan(rows, targets, args.workers)
     data = report(rows, results, targets, args.top_packages, last_update)
 
-    text = json.dumps(data, separators=(",", ":"))
-    if args.out:
-        Path(args.out).write_text(text + "\n", encoding="utf-8")
-    else:
-        print(text)
-    errors = sum(1 for r in results if r.error)
+    errors = data["lookup_errors"]
     took = time.monotonic() - started
     print(
         f"scanned {len(results)} packages x {len(targets)} targets in {took:.0f}s ({errors} lookup errors)",
         file=sys.stderr,
     )
+    if results and errors > args.max_error_rate * len(results):
+        # A PyPI outage would otherwise publish a dataset full of "unknown"; keep the last good one instead.
+        print(f"too many lookup errors ({errors} of {len(results)}); not writing the results", file=sys.stderr)
+        return 1
+    text = json.dumps(data, separators=(",", ":"))
+    if args.out:
+        Path(args.out).write_text(text + "\n", encoding="utf-8")
+    else:
+        print(text)
     return 0
 
 

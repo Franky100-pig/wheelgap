@@ -63,3 +63,22 @@ def test_check_lockfile_respects_markers_and_graph(fixtures):
 def test_default_targets_use_running_python():
     targets = wheelgap.make_targets()
     assert {t.python for t in targets} == {wheelgap.running_python()}
+
+
+def test_pinned_yanked_release_keeps_its_files(fake_pypi):
+    # pip installs a release pinned with == even if it has been yanked (PEP 592).
+    targets = wheelgap.make_targets(python="3.13", platforms="linux")
+    assert wheelgap.check_package("yanked", "1.0", targets).statuses[targets[0]] is Status.WHEEL
+
+
+@pytest.mark.parametrize(
+    ("files", "pure"),
+    [
+        (["x-1-py3-none-any.whl"], True),
+        (["x-1-py2.py3-none-any.whl"], True),
+        (["x-1-py2-none-any.whl", "x-1.tar.gz"], False),  # e.g. futures: Python 2 only
+        (["x-1-cp313-cp313-manylinux_2_17_x86_64.whl"], False),
+    ],
+)
+def test_pure_means_a_python3_wheel_for_every_platform(files, pure):
+    assert wheelgap.check_package("x", "1", wheelgap.make_targets("3.13", "linux"), files=files).pure is pure

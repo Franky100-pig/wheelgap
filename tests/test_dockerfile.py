@@ -99,3 +99,32 @@ def test_cli_bad_dockerfile_exit_2(capsys, fixtures, tmp_path):
     dockerfile.write_text("FROM node:22\n")
     assert main([str(fixtures / "uvproj"), "--dockerfile", str(dockerfile)]) == 2
     assert "only the official python images" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("line", "musl"),
+    [
+        ("python:3.9-alpine3.12", "1.1"),
+        ("python:3.9-alpine3.10", "1.1"),
+        ("python:3.13-alpine3.13", "1.2"),
+        ("python:3.13-alpine", "1.2"),
+    ],
+)
+def test_alpine_musl_version(line, musl):
+    assert parse_from(line).musl == musl  # Alpine 3.12 and earlier ship musl 1.1
+
+
+@pytest.mark.parametrize("platform", ["linux/arm64", "linux/arm64,linux/amd64"])
+def test_cli_docker_platform_names_keep_the_images_libc(capsys, fixtures, tmp_path, platform):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM python:3.13-alpine\n")
+    main([str(fixtures / "uvproj"), "--dockerfile", str(dockerfile), "-t", platform, "--json"])
+    platforms = [t["platform"] for t in json.loads(capsys.readouterr().out)["targets"]]
+    assert all(p.startswith("musl-") for p in platforms)  # used to be linux-aarch64 (glibc)
+
+
+def test_cli_wheelgap_names_still_win_over_the_image(capsys, fixtures, tmp_path):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM python:3.13-alpine\n")
+    main([str(fixtures / "uvproj"), "--dockerfile", str(dockerfile), "-t", "linux-aarch64", "--json"])
+    assert [t["platform"] for t in json.loads(capsys.readouterr().out)["targets"]] == ["linux-aarch64"]

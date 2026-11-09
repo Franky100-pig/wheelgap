@@ -65,8 +65,12 @@ class Result:
 
     @property
     def pure(self) -> bool:
-        """Has a wheel that works everywhere (e.g. py3-none-any)."""
-        return any(any(t.platform == "any" for t in tags) for tags in wheel_tags(list(self.files)))
+        """Has a Python 3 wheel that works on every platform (e.g. py3-none-any, but not py2-none-any)."""
+        return any(
+            t.platform == "any" and t.abi == "none" and t.interpreter.startswith(("py3", "cp3"))
+            for tags in wheel_tags(list(self.files))
+            for t in tags
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {

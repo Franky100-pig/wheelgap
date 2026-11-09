@@ -207,12 +207,25 @@ def reachable(source: Source, target: Target) -> dict[int, Parent]:
         return candidates
 
     parents: dict[int, Parent] = dict.fromkeys(source.roots)
-    queue = deque(source.roots)
-    for k, edge in enumerate(source.root_edges):
-        for j in follow(edge):
-            if j not in parents:
-                parents[j] = source.root_groups.get(k)
-                queue.append(j)
+    queue: deque[int] = deque()
+
+    def visit(j: int, parent: Parent) -> None:
+        if j not in parents:
+            parents[j] = parent
+            queue.append(j)
+
+    # The first level, most telling route first: the project's own dependencies, then top-level
+    # requirements, then dependency groups. The set of installed packages is the same in any order;
+    # this only decides which route `via` names when a package is reachable more than one way, so a
+    # runtime dependency that's also in the dev group isn't reported as "(dev group) → numpy".
+    for i in source.roots:
+        for edge in (source.edges or {}).get(i, []):
+            for j in follow(edge):
+                visit(j, i)
+    grouped = sorted(range(len(source.root_edges)), key=lambda k: k in source.root_groups)
+    for k in grouped:
+        for j in follow(source.root_edges[k]):
+            visit(j, source.root_groups.get(k))
     while queue:
         i = queue.popleft()
         for edge in (source.edges or {}).get(i, []):

@@ -47,9 +47,12 @@ def fill(pkg: Package) -> Package:
     except Exception as e:  # network trouble shouldn't kill the whole report
         pkg.error = f"lookup failed ({type(e).__name__})"
         return pkg
-    if not pkg.version:
+    pinned = bool(pkg.version)
+    if not pinned:
         pkg.version = data.get("info", {}).get("version")
-    pkg.files = [u["filename"] for u in data.get("urls", []) if not u.get("yanked")]
+    # PEP 592: installers ignore yanked files when choosing a version, but still install a release
+    # pinned with ==, so a pinned yanked release keeps its files.
+    pkg.files = [u["filename"] for u in data.get("urls", []) if pinned or not u.get("yanked")]
     return pkg
 
 
