@@ -68,6 +68,12 @@ wheelgap --json > wheelgap.json
 wheelgap -t alpine-arm64 --explain
 ```
 
+In `--json` output, results are keyed by target label: just the platform (`"linux-x86_64"`) when one Python is checked, or Python and platform (`"3.13 linux-x86_64"`) with several. The top-level `targets` list gives each target's `label`, `python` and `platform`, so a script can look the key up instead of building it:
+
+```python
+key = next(t["label"] for t in data["targets"] if t["python"] == "3.13" and t["platform"] == "linux-x86_64")
+```
+
 Projects usually ship to the same platforms, so you can write the defaults down once in `pyproject.toml` (next to the lockfile, or in the current directory). Command-line flags still win.
 
 ```toml
