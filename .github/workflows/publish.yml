@@ -4,27 +4,28 @@ name: Publish to PyPI
 #   1. https://pypi.org/manage/account/publishing/ -> add a pending publisher:
 #      project "wheelgap", owner "wheelgap", repo "wheelgap", workflow "publish.yml", environment "pypi"
 #   2. Repo Settings -> Variables -> add PYPI_PUBLISH = true
-#   3. Run this workflow (Actions tab -> Publish to PyPI -> Run workflow), or publish a release.
+#   3. Publish a GitHub release with a v* tag.
+# Hardening: only v* release tags publish (no manual runs from arbitrary branches), every action is
+# pinned to a commit, and the "pypi" environment should require a reviewer (repo settings).
 
 on:
   release:
     types: [published]
-  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   build:
-    if: vars.PYPI_PUBLISH == 'true'
+    if: vars.PYPI_PUBLISH == 'true' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v10.3.3
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - run: uv build
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist
           path: dist/
@@ -36,8 +37,8 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
