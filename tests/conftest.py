@@ -12,6 +12,7 @@ FAKE_INDEX = {
     "purewheel": {"3.1": ["purewheel-3.1-py3-none-any.whl"]},
     "nowheels": {"0.9": ["nowheels-0.9.tar.gz"]},
     "yanked": {"1.0": [{"filename": "yanked-1.0-py3-none-any.whl", "yanked": True}]},
+    "halfyanked": {"2.0": [{"filename": "halfyanked-2.0-py3-none-any.whl", "yanked": True}, "halfyanked-2.0.tar.gz"]},
 }
 
 

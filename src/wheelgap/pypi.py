@@ -50,9 +50,11 @@ def fill(pkg: Package) -> Package:
     pinned = bool(pkg.version)
     if not pinned:
         pkg.version = data.get("info", {}).get("version")
-    # PEP 592: installers ignore yanked files when choosing a version, but still install a release
-    # pinned with ==, so a pinned yanked release keeps its files.
-    pkg.files = [u["filename"] for u in data.get("urls", []) if pinned or not u.get("yanked")]
+    urls = data.get("urls", [])
+    # PEP 592: installers skip yanked files, except for a release pinned with == whose files are all
+    # yanked (as pip does), so only then do the yanked files count.
+    all_yanked = bool(urls) and all(u.get("yanked") for u in urls)
+    pkg.files = [u["filename"] for u in urls if not u.get("yanked") or (pinned and all_yanked)]
     return pkg
 
 

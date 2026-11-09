@@ -82,3 +82,9 @@ def test_pinned_yanked_release_keeps_its_files(fake_pypi):
 )
 def test_pure_means_a_python3_wheel_for_every_platform(files, pure):
     assert wheelgap.check_package("x", "1", wheelgap.make_targets("3.13", "linux"), files=files).pure is pure
+
+
+def test_pinned_release_ignores_yanked_files_when_others_remain(fake_pypi):
+    # pip only falls back to yanked files when every file of the pinned release is yanked.
+    targets = wheelgap.make_targets(python="3.13", platforms="linux")
+    assert wheelgap.check_package("halfyanked", "2.0", targets).statuses[targets[0]] is Status.SOURCE

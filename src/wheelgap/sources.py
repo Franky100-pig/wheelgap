@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -214,6 +215,9 @@ def requirement_to_package(text: str, origin: str) -> Package:
     return Package(req.name, _pinned_version(req), origin=origin, markers=markers)
 
 
+_NAMED_URL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\s*(\[[^\]]*\])?\s*@\s")
+
+
 def parse_requirements(path: Path, _seen: set[Path] | None = None) -> Source:
     seen = _seen if _seen is not None else set()
     path = path.resolve()
@@ -240,8 +244,11 @@ def parse_requirements(path: Path, _seen: set[Path] | None = None) -> Source:
         if line.startswith((".", "/")):
             pkgs.append(Package(line, None, skip="path", origin=path.name))
             continue
-        if "://" in line and "@" not in line:
-            pkgs.append(Package(line, None, skip="url", origin=path.name))
+        if "://" in line and not _NAMED_URL_RE.match(line):
+            # A bare URL (git+ssh://git@github.com/org/repo.git#egg=foo): never from the index.
+            # "name @ url" lines are left to Requirement, which knows the name and markers.
+            name = line.split("#egg=", 1)[1].split("&")[0] if "#egg=" in line else line
+            pkgs.append(Package(name, None, skip="url", origin=path.name))
             continue
         pkgs.append(requirement_to_package(line, path.name))
     return Source(path.name, pkgs)
