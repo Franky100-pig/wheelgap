@@ -19,7 +19,7 @@ from pathlib import Path
 
 from .check import Row, Status, check, status_for, wheel_tags
 from .pypi import fill_all
-from .sources import Package, Source, find_lockfile, load_file
+from .sources import Package, Source, find_lockfile, load_file, pythons_outside_lock
 from .targets import (
     DEFAULT_ANDROID_API,
     DEFAULT_GLIBC,
@@ -148,11 +148,12 @@ def check_lockfile(
 ) -> list[Result]:
     """Check every package a lockfile (or a project directory) installs on at least one target.
 
-    Environment markers and the uv.lock dependency graph are respected, as in the CLI.
+    Environment markers and the uv.lock dependency graph are respected, as in the CLI. A uv.lock whose
+    requires-python leaves out a target's Python has no wheels for it, so its packages are looked up online.
     """
     targets = list(targets) if targets is not None else make_targets()
     p = Path(path)
     source: Source = load_file(find_lockfile(p) if p.is_dir() else p)
-    fill_all(source.packages, refresh=online)
+    fill_all(source.packages, refresh=online or bool(pythons_outside_lock(source, targets)))
     rows: list[Row] = [r for r in check([source], targets) if r.needed]
     return [_result(r.package, dict(r.results)) for r in rows]

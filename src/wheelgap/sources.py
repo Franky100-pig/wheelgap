@@ -5,12 +5,19 @@ from __future__ import annotations
 import json
 import re
 import tomllib
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlparse
 
 from packaging.requirements import InvalidRequirement, Requirement
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
+from packaging.version import Version
+
+if TYPE_CHECKING:
+    from .targets import Target
 
 LOCKFILES = (
     "uv.lock",
@@ -64,6 +71,27 @@ class Source:
     root_edges: list[Edge] = field(default_factory=list)
     # Index into root_edges -> name of the dependency group it comes from, e.g. {0: "dev"}.
     root_groups: dict[int, str] = field(default_factory=dict)
+    # uv.lock only: the project's requires-python. uv keeps only the wheels that can serve it.
+    requires_python: str | None = None
+
+
+def pythons_outside_lock(source: Source, targets: Iterable[Target]) -> list[str]:
+    """Target Pythons the lockfile's requires-python leaves out, e.g. ['3.14t'] for `==3.13.*`.
+
+    uv drops the wheels for those Pythons from uv.lock, so its file lists can't answer for them.
+    """
+    if not source.requires_python:
+        return []
+    try:
+        spec = SpecifierSet(source.requires_python)
+    except InvalidSpecifier:
+        return []
+    out = []
+    for t in targets:
+        # Any patch release of that minor counts (>=3.11.4 still serves 3.11).
+        if not any(spec.contains(Version(f"{t.major}.{t.minor}.{patch}"), prereleases=True) for patch in (0, 999)):
+            out.append(t.python)
+    return list(dict.fromkeys(out))
 
 
 def _filename(entry: dict) -> str | None:
@@ -117,6 +145,8 @@ def parse_uv_lock(path: Path) -> Source:
     source.root_edges.extend((d["name"], None, d.get("marker")) for d in manifest.get("requirements", []))
     if not source.roots and not source.root_edges:
         source.edges = None  # no idea where the graph starts; treat every package as needed
+    if isinstance(data.get("requires-python"), str):
+        source.requires_python = data["requires-python"]
     return source
 
 

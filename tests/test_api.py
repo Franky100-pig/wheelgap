@@ -108,3 +108,21 @@ def test_pinned_release_ignores_yanked_files_when_others_remain(fake_pypi):
     # pip only falls back to yanked files when every file of the pinned release is yanked.
     targets = wheelgap.make_targets(python="3.13", platforms="linux")
     assert wheelgap.check_package("halfyanked", "2.0", targets).statuses[targets[0]] is Status.SOURCE
+
+
+# requires-python ==3.12.*, so uv kept only fastlib's cp312 wheel; PyPI (fake_pypi) has a cp313 one.
+LOCK_312_ONLY = (
+    'version = 1\nrequires-python = "==3.12.*"\n\n'
+    '[[package]]\nname = "app"\nversion = "0"\nsource = { editable = "." }\ndependencies = [{ name = "fastlib" }]\n\n'
+    '[[package]]\nname = "fastlib"\nversion = "2.0.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+    'sdist = { url = "https://files.pythonhosted.org/p/fastlib-2.0.0.tar.gz" }\n'
+    'wheels = [{ url = "https://files.pythonhosted.org/p/fastlib-2.0.0-cp312-cp312-manylinux_2_17_x86_64.whl" }]\n'
+)
+
+
+def test_check_lockfile_rechecks_a_lock_for_another_python(fake_pypi, tmp_path):
+    (tmp_path / "uv.lock").write_text(LOCK_312_ONLY, encoding="utf-8")
+    targets = wheelgap.make_targets(python="3.13", platforms="linux-x86_64")
+    (result,) = wheelgap.check_lockfile(tmp_path, targets)
+    assert result.name == "fastlib" and result.statuses == {targets[0]: Status.WHEEL}
+    assert fake_pypi == ["https://pypi.org/pypi/fastlib/2.0.0/json"]

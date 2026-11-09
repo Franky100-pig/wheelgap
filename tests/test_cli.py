@@ -541,3 +541,28 @@ def test_markdown_lookup_errors_and_empty_names(capsys, fake_pypi, tmp_path):
     assert any(
         ln.startswith('Skipped 1 non-index package: `""`') or '`""`' in ln for ln in lines if ln.startswith("Skipped")
     )
+
+
+# requires-python ==3.12.*, so uv kept only fastlib's cp312 wheel; PyPI (fake_pypi) has a cp313 one.
+LOCK_312_ONLY = (
+    'version = 1\nrequires-python = "==3.12.*"\n\n'
+    '[[package]]\nname = "app"\nversion = "0"\nsource = { editable = "." }\ndependencies = [{ name = "fastlib" }]\n\n'
+    '[[package]]\nname = "fastlib"\nversion = "2.0.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+    'sdist = { url = "https://files.pythonhosted.org/p/fastlib-2.0.0.tar.gz" }\n'
+    'wheels = [{ url = "https://files.pythonhosted.org/p/fastlib-2.0.0-cp312-cp312-manylinux_2_17_x86_64.whl" }]\n'
+)
+
+
+def test_lock_for_another_python_is_rechecked_online(capsys, fake_pypi, tmp_path):
+    (tmp_path / "uv.lock").write_text(LOCK_312_ONLY, encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 0, out  # PyPI's cp313 wheel counts; the lock alone would say "source"
+    assert "uv.lock is locked for Python ==3.12.*, so it has no wheels for Python 3.13" in err
+    assert fake_pypi == ["https://pypi.org/pypi/fastlib/2.0.0/json"]
+
+
+def test_lock_inside_requires_python_stays_offline(capsys, fake_pypi, tmp_path):
+    (tmp_path / "uv.lock").write_text(LOCK_312_ONLY, encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path), "-p", "3.12", "-t", "linux-x86_64")
+    assert code == 0 and "note:" not in err
+    assert fake_pypi == []

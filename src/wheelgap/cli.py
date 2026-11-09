@@ -16,7 +16,7 @@ from .check import Row, Status, check, explain, has_sdist
 from .dockerfile import DockerfileError, read_dockerfile
 from .pyodide import PyodideLock, PyodideLockError, apply_bundled, check_targets, load_pyodide_lock
 from .pypi import check_index_url, fill_all
-from .sources import Package, SourceError, load_inputs
+from .sources import Package, SourceError, load_inputs, pythons_outside_lock
 from .targets import (
     ALIASES,
     DEFAULT_ANDROID_API,
@@ -592,6 +592,15 @@ def main(argv: list[str] | None = None) -> int:
 
     packages = [p for s in sources for p in s.packages]
     fill_all(packages, refresh=args.online)
+    if not args.online:
+        for s in sources:
+            if outside := pythons_outside_lock(s, targets):
+                print(
+                    f"wheelgap: note: {s.label} is locked for Python {s.requires_python}, so it has no wheels for "
+                    f"Python {', '.join(outside)}; checking its packages on PyPI instead",
+                    file=sys.stderr,
+                )
+                fill_all(s.packages, refresh=True)
     skipped = [p for p in packages if p.skip]
     rows = [r for r in check(sources, targets) if r.needed]
     if pyodide_lock:
