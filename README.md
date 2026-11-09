@@ -147,7 +147,7 @@ Docker platform names also work with `-t`, for example `-t linux/amd64,linux/arm
 
 ```yaml
 - uses: actions/checkout@v7
-- uses: wheelgap/wheelgap@v0.6.0
+- uses: wheelgap/wheelgap@v0.6.1
   with:
     args: uv.lock -p 3.13 -t linux-x86_64,linux-aarch64
 ```
@@ -161,7 +161,7 @@ Outside the Action, `--markdown` prints the same report as Markdown, for a job s
 ```yaml
 repos:
   - repo: https://github.com/wheelgap/wheelgap
-    rev: v0.6.0
+    rev: v0.6.1
     hooks:
       - id: wheelgap
 ```
