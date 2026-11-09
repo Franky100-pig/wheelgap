@@ -33,7 +33,7 @@ uv run wheelgap numpy -t all     # try it
    uv run --group dev mypy
    uv run --group dev pytest
    ```
-3. Open a PR and put `Closes #123` in the description, so the issue closes when it's merged.
+3. Open a PR. Put `Closes #123` in the description if it finishes the issue, so the issue closes when it's merged, or `Part of #123` if it's one step of a bigger issue.
 
 The PR template has a short checklist:
 
