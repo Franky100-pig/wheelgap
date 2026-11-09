@@ -4,7 +4,7 @@
 
 ## 0.6.3 (2026-11-09)
 
-`--dockerfile` now reads Dockerfiles the way Docker does, down to whitespace, line endings, tags and stage names, so it errors where Docker would instead of guessing. The coverage scanner adds Python 3.15 and 3.15t.
+`--dockerfile` now reads Dockerfiles the way Docker does, down to whitespace, line endings, tags and stage names, so it errors where Docker would instead of guessing. The coverage scanner adds Python 3.15 and 3.15t, and `--list-targets` shows the glibc 2.17 manylinux floor outside x86.
 
 - The coverage scanner checks Python 3.15 and free-threaded 3.15t by default, alongside 3.13, 3.14 and 3.14t. (#117, thanks [@moelomda](https://github.com/moelomda))
 - `--dockerfile` accepts quoted `--platform` values such as `FROM --platform="linux/arm64" python:3.13` (and rejects an unterminated quote). (#101, thanks [@Mr45401](https://github.com/Mr45401))
