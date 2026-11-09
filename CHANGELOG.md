@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.0 (2026-11-09)
+
 - Skip non-index Mercurial, Subversion and Bazaar dependencies (`hg`, `svn`, `bzr`) in `Pipfile.lock`, `pdm.lock` and `poetry.lock` instead of looking them up on PyPI. (#58, thanks [@chiragjangiir](https://github.com/chiragjangiir))
 - `--explain` shows which dependency pulls in each gap package for `uv.lock` inputs: the shortest path from your project or a dependency group, worked out per target (`via: myapp → uvicorn → uvloop`). `--json --explain` adds a matching `via` object keyed by target, like `rejected`. (#45, thanks [@YSWFelicity](https://github.com/YSWFelicity))
 - `-q` / `--quiet` prints only the gap summary and affected package names, and leaves clean runs silent. Set `quiet = true` in `[tool.wheelgap]` to use it by default. (#48, thanks [@Daiyuanranfeng](https://github.com/Daiyuanranfeng))
@@ -19,7 +21,6 @@ These came from independent second reviews of recent PRs, and a full audit of th
 - **PyPI lookups:** odd index responses give "unknown" instead of crashing; retries back off and honour `Retry-After`, retry dropped connections and skip permanent errors; an empty `WHEELGAP_INDEX_URL` means PyPI, and a `/simple` URL is a clear error; a missing pinned version says so ("version 1.0 not on index").
 - **requirements.txt:** `-rfile` without a space, `--hash` with a space, comments after a tab, and `name@url` without spaces are all read correctly.
 - **Output:** UTF-8 on Windows CI (no more "?" for ✓), `.python-version` files with a BOM, `--list-targets` uses the limits from `[tool.wheelgap]`, legacy `manylinux2014` wheels get the right `--explain` reason, more sdist formats are recognised, and `--macos 15` means 15.0.
-
 - `--pyodide-lock`: a package whose lookup failed (e.g. a mistyped pin) was reported as bundled and could pass. It's now `unknown`, which fails.
 - `pyodide-lock` in `[tool.wheelgap]` made every run without a matching Pyodide target exit 2. It's now quietly unused on those runs, and a relative path is read from the folder that holds `pyproject.toml`.
 - A release pinned with `==` whose files have all been yanked was reported as having no files ("can't install"). pip still installs it (PEP 592), so its files now count.
@@ -31,6 +32,10 @@ These came from independent second reviews of recent PRs, and a full audit of th
 - `--dockerfile`: Alpine 3.12 and earlier are checked against musl 1.1, not 1.2.
 - `requirements.txt`: a bare VCS URL containing `@` (`git+ssh://git@github.com/...`) aborted the whole run. It's now skipped like other URLs.
 - `python -m wheelgap.scan` now refuses to write results when more than 5% of lookups fail (`--max-error-rate`), records `lookup_errors` and each target's glibc/musl/macOS limits, and no longer counts Python 2-only wheels as "pure".
+
+### Security
+
+- Every GitHub Action used by wheelgap's own workflows is pinned to a full commit SHA, with Dependabot keeping the pins current, and PyPI releases now publish only from a `v*` tag through a protected environment. (#64)
 
 ## 0.4.0 (2026-11-09)
 
