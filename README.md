@@ -224,7 +224,7 @@ Contributions welcome. Issues labelled [good first issue](https://github.com/whe
 
 ## Maintainer
 
-wheelgap is created and maintained by [@patrickballard](https://github.com/patrickballard), with help from [its contributors](https://github.com/wheelgap/wheelgap/graphs/contributors).
+wheelgap is created and maintained by [@patrickballard](https://github.com/patrickballard), with a lot of help from [its contributors](https://github.com/wheelgap/wheelgap/graphs/contributors). Thank you, all of you!
 
 ## License
 
