@@ -36,11 +36,16 @@ jobs:
         if: failure()
         shell: bash
         run: |
+          [ -f pytest.log ] || exit 0  # failed before pytest ran: the log says why
           {
             echo "### Failed tests (${{ matrix.os }}, Python ${{ matrix.python }})"
             echo
             echo '```'
-            sed -n '/short test summary info/,$p' pytest.log | tail -n 60
+            if grep -q 'short test summary info' pytest.log; then
+              sed -n '/short test summary info/,$p' pytest.log | tail -n 60
+            else
+              tail -n 60 pytest.log
+            fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
