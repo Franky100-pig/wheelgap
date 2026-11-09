@@ -2,12 +2,19 @@
 
 ## Unreleased
 
-- The scanner rejects invalid arguments before fetching data and lists each Python target once. Package checks require at least one target, and empty Python input to `make_targets()` uses the running interpreter. (#78, thanks [@Daiyuanranfeng](https://github.com/Daiyuanranfeng))
-- `--dockerfile` follows named stages: with `FROM python:3.13-alpine AS base` and later `FROM base AS runtime`, the final stage is checked as `python:3.13-alpine`, through any chain of stages, keeping the platform that stage was built for (as Docker does). A name that's neither an earlier stage nor a python image gets a clear error. Line continuations now follow Docker's rules (blank and comment lines inside one, `# escape=`), and Python `from ... import` lines in heredocs are no longer mistaken for `FROM`. (#10)
-- iOS and Android targets (PEP 730 / PEP 738): `ios-arm64`, `ios-simulator-arm64`, `ios-simulator-x86_64`, `android-arm64` and `android-x86_64`, all at once with `-t mobile`. `--ios` and `--android-api` (or `ios` and `android-api` in `[tool.wheelgap]`) set the minimum versions, 13.0 and API level 24 by default. Like Pyodide, mobile installs only use wheels, and they need Python 3.13+. Out-of-range versions for `--glibc`, `--musl`, `--macos` and `--ios` (e.g. `2.3000000`, which never finished) are now errors. (#11)
-- `--markdown` prints the report as Markdown, and the GitHub Action now writes it to the run's summary page (`summary: false` turns that off). The step still passes or fails on the normal run. (#7)
-- New Linux targets for 32-bit ARM (`linux-armv7l`, e.g. Raspberry Pi OS), `ppc64le`, `s390x` and `riscv64`, each with a `musl-*` twin for Alpine, and their Docker names (`linux/arm/v7` and so on) in `-t` and `--dockerfile`. Plain `linux_armv7l` wheels, which PyPI allows for the Raspberry Pi, count on `linux-armv7l` as they do for pip, but not on `musl-armv7l`: they're glibc builds. `-t all` still means the eight common platforms; `-t everything` adds these. (#8)
+## 0.6.0 (2026-11-09)
+
+New targets for phones and more Linux hardware, and a job summary for the GitHub Action.
+
+- iOS and Android targets (PEP 730 / PEP 738): `ios-arm64`, `ios-simulator-arm64`, `ios-simulator-x86_64`, `android-arm64` and `android-x86_64`, all at once with `-t mobile`. `--ios` and `--android-api` (or `ios` and `android-api` in `[tool.wheelgap]`) set the minimum versions, 13.0 and API level 24 by default. Like Pyodide, mobile installs only use wheels, and they need Python 3.13+. Out-of-range versions for `--glibc`, `--musl`, `--macos` and `--ios` (e.g. `2.3000000`, which never finished) are now errors. (#77)
+- New Linux targets for 32-bit ARM (`linux-armv7l`, e.g. Raspberry Pi OS), `ppc64le`, `s390x` and `riscv64`, each with a `musl-*` twin for Alpine, and their Docker names (`linux/arm/v7` and so on) in `-t` and `--dockerfile`. Plain `linux_armv7l` wheels, which PyPI allows for the Raspberry Pi, count on `linux-armv7l` as they do for pip, but not on `musl-armv7l`: they're glibc builds. `-t all` still means the eight common platforms; `-t everything` adds these. (#72)
+- `--markdown` prints the report as Markdown, and the GitHub Action now writes it to the run's summary page (`summary: false` turns that off). The step still passes or fails on the normal run. (#74)
+- `--dockerfile` follows named stages: with `FROM python:3.13-alpine AS base` and later `FROM base AS runtime`, the final stage is checked as `python:3.13-alpine`, through any chain of stages, keeping the platform that stage was built for (as Docker does). A name that's neither an earlier stage nor a python image gets a clear error. Line continuations now follow Docker's rules (blank and comment lines inside one, `# escape=`), and Python `from ... import` lines in heredocs are no longer mistaken for `FROM`. (#73)
 - Read package files from the `[metadata.files]` table in older `pdm.lock` files (PDM before 2.8) instead of looking them up on PyPI. (#67, thanks [@nxxis](https://github.com/nxxis))
+
+### Fixed
+
+- The scanner rejects invalid arguments before fetching data and lists each Python target once. Package checks require at least one target, and empty Python input to `make_targets()` uses the running interpreter. (#78, thanks [@Daiyuanranfeng](https://github.com/Daiyuanranfeng))
 
 ## 0.5.0 (2026-11-09)
 
