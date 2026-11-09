@@ -114,7 +114,7 @@ def make_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--pyodide-lock",
-        metavar="PATH_OR_URL",
+        metavar="PATH_OR_HTTPS_URL",
         help="a Pyodide release's pyodide-lock.json: packages Pyodide ships itself count as available on -t pyodide",
     )
     p.add_argument(

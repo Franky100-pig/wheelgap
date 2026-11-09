@@ -133,7 +133,7 @@ Run `wheelgap --list-targets` to see target aliases and compatibility limits, or
 
 **iOS and Android** (PEP 730 and PEP 738, Python 3.13+) are checked with `-t mobile` or by name, for apps built with tools like BeeWare's Briefcase. Mobile dependencies are installed by a cross-platform pip run that can only use wheels, so a package with only an sdist shows as `✗ missing`. `--ios` and `--android-api` (or `ios = "15.0"` and `android-api = 28` in `[tool.wheelgap]`) set your app's minimum iOS version and Android API level. wheelgap checks PyPI only: Briefcase and Chaquopy also install from their own package repositories (BeeWare's on anaconda.org, and chaquo.com), which have mobile builds of packages like numpy, so a `✗ missing` there may still install.
 
-**Pyodide (Python in the browser)** only installs wheels: there's no compiler, so a package with only an sdist shows as `✗ missing`, not `● source`. Pyodide wheels are tied to one ABI per Python version and don't work across them. Pyodide also ships its own builds of many popular packages (numpy, pydantic-core and others) that aren't on PyPI. Point `--pyodide-lock` at the release's `pyodide-lock.json` (a path or URL, also `pyodide-lock = "..."` in `[tool.wheelgap]`) and those count as `✓ bundled`, with a note when Pyodide's version differs from the one you pinned:
+**Pyodide (Python in the browser)** only installs wheels: there's no compiler, so a package with only an sdist shows as `✗ missing`, not `● source`. Pyodide wheels are tied to one ABI per Python version and don't work across them. Pyodide also ships its own builds of many popular packages (numpy, pydantic-core and others) that aren't on PyPI. Point `--pyodide-lock` at the release's `pyodide-lock.json` (a path or `https://` URL, also `pyodide-lock = "..."` in `[tool.wheelgap]`) and those count as `✓ bundled`, with a note when Pyodide's version differs from the one you pinned:
 
 ```bash
 wheelgap -p 3.12 -t pyodide --pyodide-lock https://cdn.jsdelivr.net/pyodide/v0.27.7/full/pyodide-lock.json
@@ -166,7 +166,7 @@ repos:
       - id: wheelgap
 ```
 
-The hook runs when `uv.lock`, `poetry.lock`, `pdm.lock`, `pylock.toml`, `Pipfile.lock` or a `requirements*.txt` file changes. Put your targets in `[tool.wheelgap]` in `pyproject.toml` so the hook checks the right platforms. Pass extra options with `args:`, for example `args: [--fail-on, missing]`.
+The hook runs when `uv.lock`, `poetry.lock`, `pdm.lock`, `pylock.toml`, `Pipfile.lock`, or a `requirements*.txt` or `requirements*.lock` file changes. Put your targets in `[tool.wheelgap]` in `pyproject.toml` so the hook checks the right platforms. Pass extra options with `args:`, for example `args: [--fail-on, missing]`.
 
 ### From Python
 
