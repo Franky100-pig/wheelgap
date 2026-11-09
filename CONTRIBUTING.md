@@ -18,8 +18,7 @@ uv run wheelgap numpy -t all     # try it
 ## Picking something to work on
 
 - Issues labelled [`good first issue`](https://github.com/wheelgap/wheelgap/labels/good%20first%20issue) are scoped to be doable in an evening, and each one says which files to touch and what to test. [`help wanted`](https://github.com/wheelgap/wheelgap/labels/help%20wanted) issues are bigger.
-- **The first PR wins.** Comments like "I'd like to take this" are welcome, but they don't reserve an issue: the first pull request opened for an issue is the one we review and merge. So open yours early (a draft is fine), and check the issue for an existing PR before you start.
-- If there's no PR after about two weeks, the issue is free for someone else. Life happens, and that's fine; just comment if you're still on it.
+- **Opening a PR is how you take an issue.** Comments like "I'd like to take this" are welcome, but they don't reserve anything: the first pull request opened for an issue is the one we review and merge, and a later one for the same issue is closed with a pointer to another issue. So check for an existing PR before you start, and open yours early (a draft is fine).
 - **Want to add something that isn't an issue yet?** Post it in [Discussions → Ideas](https://github.com/wheelgap/wheelgap/discussions/categories/ideas) first, so we can agree it fits before you spend time on it. Small fixes (typos, docs, obvious bugs) can go straight to a PR.
 
 ## Making a pull request
