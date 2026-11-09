@@ -4,7 +4,7 @@
 
 ## 0.7.0 (2026-11-09)
 
-Accept known gaps without hiding them: `--ignore NAME`, or `ignore = [...]` in `[tool.wheelgap]`, takes a package out of the table, the counts and the exit code, and lists it as ignored in every output format. Also new: a [recipes page](docs/recipes.md) and [AGENTS.md](AGENTS.md) for coding agents.
+Accept known gaps without hiding them: `--ignore NAME`, or `ignore = [...]` in `[tool.wheelgap]`, takes a package out of the table, the counts and the exit code, and lists it as ignored in every output format. Also new: a [recipes page](https://github.com/wheelgap/wheelgap/blob/main/docs/recipes.md) (#123, thanks [@moelomda](https://github.com/moelomda)) and [AGENTS.md](https://github.com/wheelgap/wheelgap/blob/main/AGENTS.md) for coding agents working on wheelgap.
 
 - `--ignore NAME` accepts known package gaps without failing CI, and lists ignored packages in text, JSON and Markdown reports. Repeat the flag or separate names with commas. (#119, thanks [@moelomda](https://github.com/moelomda))
 - Set `ignore = ["psycopg2"]` in `[tool.wheelgap]` to ignore accepted gaps by default. Command-line `--ignore` flags replace this list. (#122, thanks [@moelomda](https://github.com/moelomda))
