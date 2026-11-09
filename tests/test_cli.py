@@ -249,8 +249,8 @@ def test_list_targets_json_includes_every_platform_and_alias(capsys):
     assert "glibc <= 2.36" in by_name["linux-x86_64"]["accepts"]
     assert "macOS <= 14.0" in by_name["macos-arm64"]["accepts"]
     assert by_name["pyodide"]["accepts"] == "pyodide wasm32, Python 3.11, 3.12, 3.13, 3.14 (not in -t all)"
-    assert by_name["linux-s390x"]["accepts"] == "manylinux s390x, glibc <= 2.36 (not in -t all)"
-    assert by_name["linux-aarch64"]["accepts"] == "manylinux aarch64, glibc <= 2.36"
+    assert by_name["linux-s390x"]["accepts"] == "manylinux s390x, glibc 2.17 to 2.36 (not in -t all)"
+    assert by_name["linux-aarch64"]["accepts"] == "manylinux aarch64, glibc 2.17 to 2.36"
 
 
 def test_list_targets_respects_compatibility_overrides(capsys):
@@ -262,7 +262,7 @@ def test_list_targets_respects_compatibility_overrides(capsys):
     code, out, err = run(capsys, *flags, "--json")
     assert code == 0 and not err
     by_name = {row["name"]: row["accepts"] for row in json.loads(out)}
-    assert "glibc <= 2.28" in by_name["linux-aarch64"]
+    assert "glibc <= 2.28" in by_name["linux-x86_64"] and "glibc 2.17 to 2.28" in by_name["linux-aarch64"]
     assert "musl <= 1.1" in by_name["musl-aarch64"]
     assert "macOS <= 13.0" in by_name["macos-x86_64"]
 
@@ -590,3 +590,24 @@ def test_recheck_leaves_packages_from_other_indexes_alone(capsys, fake_pypi, tmp
     (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
     code, _, err = run(capsys, str(tmp_path), "-p", "3.12,3.13", "-t", "linux-x86_64")
     assert fake_pypi == [] and "1 from other indexes left as locked" in err
+
+
+def test_list_targets_shows_the_manylinux_floor_outside_x86(capsys):
+    code, out, _ = run(capsys, "--list-targets", "--json", "--glibc", "2.12")
+    by_name = {row["name"]: row["accepts"] for row in json.loads(out)}
+    assert by_name["linux-x86_64"] == "manylinux x86_64, glibc <= 2.12"
+    assert by_name["linux-aarch64"] == "manylinux aarch64, none below glibc 2.17"
+
+
+def test_quiet_hides_the_lock_note_unless_lookups_failed(capsys, fake_pypi, tmp_path):
+    (tmp_path / "uv.lock").write_text(LOCK_312_ONLY, encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "-q")
+    assert code == 0 and err == ""
+    assert fake_pypi == ["https://pypi.org/pypi/fastlib/2.0.0/json"]  # still re-checked, just quietly
+
+
+@pytest.mark.parametrize("name", ["Pipfile.lock"])
+def test_lockfile_that_is_not_a_json_object_is_a_clear_error(capsys, tmp_path, name):
+    (tmp_path / name).write_text("[]", encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path / name), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2 and "not a Pipfile.lock (expected a JSON object)" in err

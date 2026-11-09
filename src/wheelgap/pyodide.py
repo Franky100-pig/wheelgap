@@ -35,6 +35,8 @@ class PyodideLock:
 
 
 def parse_pyodide_lock(data: dict, source: str) -> PyodideLock:
+    if not isinstance(data, dict):
+        raise PyodideLockError(f"{source}: not a pyodide-lock.json (expected a JSON object)")
     info = data.get("info")
     packages = data.get("packages")
     if not isinstance(info, dict) or not isinstance(packages, dict):

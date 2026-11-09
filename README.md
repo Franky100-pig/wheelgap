@@ -113,18 +113,20 @@ Use `-q` / `--quiet` (or `quiet = true` in `[tool.wheelgap]`) to show only the g
 
 Run `wheelgap --list-targets` to see target aliases and compatibility limits, or add `--json` for a machine-readable list.
 
+Only x86 Linux takes `manylinux` wheels older than glibc 2.17: every other architecture's first manylinux was `manylinux2014` (glibc 2.17), so pip accepts nothing older there, and neither does wheelgap.
+
 | name | aliases | wheel tags it accepts |
 | --- | --- | --- |
 | `linux-x86_64` | `linux`, `linux-amd64`, `linux/amd64` | `manylinux_2_*_x86_64` up to `--glibc` (default 2.36), legacy `manylinux2014`/`2010`/`1` |
-| `linux-aarch64` | `linux-arm64`, `linux/arm64`, `linux/arm64/v8` | `manylinux_2_*_aarch64` |
+| `linux-aarch64` | `linux-arm64`, `linux/arm64`, `linux/arm64/v8` | `manylinux_2_*_aarch64` from 2.17 up to `--glibc`, legacy `manylinux2014` |
 | `musl-x86_64` | `alpine`, `musl` | `musllinux_1_*_x86_64` up to `--musl` (default 1.2) |
 | `musl-aarch64` | `alpine-arm64` | `musllinux_1_*_aarch64` |
 | `macos-arm64` | `macos`, `mac` | `macosx_*_arm64` and `universal2` up to `--macos` (default 14.0) |
 | `macos-x86_64` | `macos-intel` | `macosx_*_x86_64` and `universal2` |
 | `win-amd64` | `windows`, `win` | `win_amd64` |
 | `win-arm64` | `windows-arm64` | `win_arm64` |
-| `linux-armv7l` | `linux-arm`, `linux-armv7`, `linux/arm/v7` | `manylinux_2_*_armv7l` (32-bit ARM, e.g. Raspberry Pi OS), legacy `manylinux2014`, and plain `linux_armv7l` (which PyPI allows for the Pi) |
-| `linux-ppc64le`, `linux-s390x`, `linux-riscv64` | `linux/ppc64le`, `linux/s390x`, `linux/riscv64` | `manylinux_2_*` for that arch (`riscv64` has no legacy `manylinux2014` tag) |
+| `linux-armv7l` | `linux-arm`, `linux-armv7`, `linux/arm/v7` | `manylinux_2_*_armv7l` from 2.17 (32-bit ARM, e.g. Raspberry Pi OS), legacy `manylinux2014`, and plain `linux_armv7l` (which PyPI allows for the Pi) |
+| `linux-ppc64le`, `linux-s390x`, `linux-riscv64` | `linux/ppc64le`, `linux/s390x`, `linux/riscv64` | `manylinux_2_*` from 2.17 for that arch (`riscv64` has no legacy `manylinux2014` tag) |
 | `musl-armv7l`, `musl-ppc64le`, `musl-s390x`, `musl-riscv64` | `alpine-armv7` | `musllinux_1_*` for that arch (pip would also take a plain `linux_armv7l` wheel on Alpine, but it's a glibc build, so wheelgap doesn't count it) |
 | `pyodide` | `wasm`, `wasm32`, `emscripten` | Pyodide's ABI for that Python: `pyodide_2024_0` (3.12), `pyodide_2025_0` / `pyemscripten_2025_0` (3.13), `pyemscripten_2026_0` (3.14) |
 | `ios-arm64` | `ios`, `iphoneos` | `ios_*_arm64_iphoneos` up to `--ios` (default 13.0) |

@@ -26,6 +26,8 @@ from .targets import (
     DEFAULT_MUSL,
     DEFAULT_PLATFORMS,
     EXTRA_ARCHES,
+    MANYLINUX_FLOOR,
+    MANYLINUX_X86_ARCHES,
     PLATFORMS,
     PYODIDE_PLATFORMS,
     Target,
@@ -402,10 +404,20 @@ def print_target_list(args: argparse.Namespace, config: dict) -> None:
     api = parse_api_level(args.android_api or config.get("android-api", DEFAULT_ANDROID_API))
     limits["android"] = f", API level <= {api} (wheels only; -t mobile, not in -t all)"
 
-    rows = [
-        (name, aliases[name], f"{family} {arch}{limits.get(family, '')}{' (not in -t all)' * (arch in EXTRA_ARCHES)}")
-        for name, (family, arch) in PLATFORMS.items()
-    ]
+    glibc = parse_version_pair(versions["manylinux"][1], "glibc")
+    if glibc[0] == MANYLINUX_FLOOR[0]:  # pip's 2.17 floor outside x86 (no manylinux before manylinux2014)
+        floor = ".".join(map(str, MANYLINUX_FLOOR))
+        floored = (
+            f", glibc {floor} to {glibc[0]}.{glibc[1]}" if glibc >= MANYLINUX_FLOOR else f", none below glibc {floor}"
+        )
+    else:
+        floored = limits["manylinux"]
+
+    def accepted(family: str, arch: str) -> str:
+        limit = floored if family == "manylinux" and arch not in MANYLINUX_X86_ARCHES else limits.get(family, "")
+        return f"{family} {arch}{limit}{' (not in -t all)' * (arch in EXTRA_ARCHES)}"
+
+    rows = [(name, aliases[name], accepted(family, arch)) for name, (family, arch) in PLATFORMS.items()]
     if args.json:
         print(
             json.dumps(
@@ -604,7 +616,8 @@ def main(argv: list[str] | None = None) -> int:
                     note += f" ({other} from other indexes left as locked)"
                 if failed:
                     note += f"; {failed} couldn't be looked up, so for those Pythons they may show false gaps"
-                print(note, file=sys.stderr)
+                if failed or not quiet:  # quiet runs stay quiet unless the answer may be wrong
+                    print(note, file=sys.stderr)
     skipped = [p for p in packages if p.skip]
     rows = [r for r in check(sources, targets) if r.needed]
     if pyodide_lock:

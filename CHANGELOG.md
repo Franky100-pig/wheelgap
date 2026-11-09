@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `--list-targets` shows the glibc 2.17 floor for non-x86 Linux targets (e.g. `glibc 2.17 to 2.36` for `linux-aarch64`), and the README targets table says so too. A `Pipfile.lock` or `pyodide-lock.json` that isn't a JSON object is now a clear error instead of an `AttributeError`, and `-q` no longer prints the lock note added in 0.6.2 unless a lookup failed. (#99)
+
 ## 0.6.2 (2026-11-09)
 
 More accurate answers: no false gaps from narrowly locked `uv.lock` and `pylock.toml` files, pip's real manylinux floor on ARM and other non-x86 Linux, stricter Dockerfile parsing, and safer fetching.

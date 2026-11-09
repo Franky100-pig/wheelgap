@@ -211,3 +211,10 @@ def test_lock_from_pyproject_for_another_python_is_an_error(capsys, fake_pypi, l
 def test_lock_covering_only_some_pyodide_targets_warns(capsys, fake_pypi, lock):
     code, out, err = run(capsys, "fastlib==2.0.0", "-p", "3.12,3.13", "-t", "pyodide", "--pyodide-lock", lock)
     assert "pyodide results for Python 3.12 don't include packages that Pyodide bundles" in err
+
+
+def test_lock_that_is_not_a_json_object(tmp_path):
+    bad = tmp_path / "pyodide-lock.json"
+    bad.write_text("[]")
+    with pytest.raises(PyodideLockError, match="not a pyodide-lock.json"):
+        load_pyodide_lock(str(bad))
