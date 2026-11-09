@@ -136,7 +136,7 @@ def parse_poetry_lock(path: Path) -> Source:
         elif isinstance(markers, dict):
             pkg.markers = [m for m in markers.values() if isinstance(m, str)] or None
         src_type = p.get("source", {}).get("type")
-        if src_type in ("git", "directory", "file", "url"):
+        if src_type in ("git", "hg", "svn", "bzr", "directory", "file", "url"):
             pkg.skip = src_type
         else:
             entries = p.get("files")
@@ -170,7 +170,7 @@ def parse_pdm_lock(path: Path) -> Source:
         pkg = Package(p["name"], p.get("version"), origin=path.name)
         if p.get("marker"):
             pkg.markers = [p["marker"]]
-        src_type = next((k for k in ("git", "path", "url", "file") if k in p), None)
+        src_type = next((k for k in ("git", "hg", "svn", "bzr", "path", "url", "file") if k in p), None)
         if src_type:
             pkg.skip = src_type
         elif "files" in p:
@@ -190,7 +190,7 @@ def parse_pipfile_lock(path: Path) -> Source:
             pkg = Package(name, version.removeprefix("==") if version else None, origin=path.name)
             if p.get("markers"):
                 pkg.markers = [p["markers"]]
-            pkg.skip = next((kind for kind in ("git", "path", "file") if kind in p), None)
+            pkg.skip = next((kind for kind in ("git", "hg", "svn", "bzr", "path", "file") if kind in p), None)
             if pkg.skip is None and p.get("editable"):
                 pkg.skip = "editable"
             _add_once(pkgs, seen, pkg)

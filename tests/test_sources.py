@@ -193,3 +193,51 @@ def test_requirements_bare_vcs_urls_are_skipped(tmp_path):
     assert got["https://example.com/pkgs/baz-1.0.tar.gz"] == ("url", None)
     assert got["named"] == ("url", None)
     assert got["requests"] == (None, "2.32.3")
+
+
+def test_pipfile_lock_vcs_skipped(tmp_path):
+    path = tmp_path / "Pipfile.lock"
+    lock = {
+        "default": {
+            "hgpkg": {"hg": "https://hg.example.com/repo"},
+            "svnpkg": {"svn": "svn://svn.example.com/repo"},
+            "bzrpkg": {"bzr": "lp:mybranch"},
+        }
+    }
+    path.write_text(json.dumps(lock), encoding="utf-8")
+    (src,) = load_inputs([str(path)])
+    pkgs = by_name(src)
+    assert pkgs["hgpkg"].skip == "hg"
+    assert pkgs["svnpkg"].skip == "svn"
+    assert pkgs["bzrpkg"].skip == "bzr"
+
+
+def test_pdm_lock_vcs_skipped(tmp_path):
+    path = tmp_path / "pdm.lock"
+    lock = (
+        'version = "4.5"\n\n'
+        '[[package]]\nname = "hgpkg"\nversion = "0.1"\nhg = "https://hg.example.com/repo"\n\n'
+        '[[package]]\nname = "svnpkg"\nversion = "0.1"\nsvn = "svn://svn.example.com/repo"\n\n'
+        '[[package]]\nname = "bzrpkg"\nversion = "0.1"\nbzr = "lp:mybranch"\n'
+    )
+    path.write_text(lock, encoding="utf-8")
+    (src,) = load_inputs([str(path)])
+    pkgs = by_name(src)
+    assert pkgs["hgpkg"].skip == "hg"
+    assert pkgs["svnpkg"].skip == "svn"
+    assert pkgs["bzrpkg"].skip == "bzr"
+
+
+def test_poetry_lock_vcs_skipped(tmp_path):
+    path = tmp_path / "poetry.lock"
+    lock = (
+        '[[package]]\nname = "hgpkg"\nversion = "0.1"\n[package.source]\ntype = "hg"\n\n'
+        '[[package]]\nname = "svnpkg"\nversion = "0.1"\n[package.source]\ntype = "svn"\n\n'
+        '[[package]]\nname = "bzrpkg"\nversion = "0.1"\n[package.source]\ntype = "bzr"\n'
+    )
+    path.write_text(lock, encoding="utf-8")
+    (src,) = load_inputs([str(path)])
+    pkgs = by_name(src)
+    assert pkgs["hgpkg"].skip == "hg"
+    assert pkgs["svnpkg"].skip == "svn"
+    assert pkgs["bzrpkg"].skip == "bzr"
