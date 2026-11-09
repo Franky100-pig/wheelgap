@@ -11,9 +11,21 @@ FAKE_INDEX = {
     "winonly": {"311": ["winonly-311-cp313-cp313-win_amd64.whl"]},
     "purewheel": {"3.1": ["purewheel-3.1-py3-none-any.whl"]},
     "nowheels": {"0.9": ["nowheels-0.9.tar.gz"]},
+    "ranged": {
+        "1.5": ["ranged-1.5-py3-none-any.whl"],
+        "1.9": ["ranged-1.9.tar.gz"],
+        "2.0": ["ranged-2.0-py3-none-any.whl"],
+    },
     "yanked": {"1.0": [{"filename": "yanked-1.0-py3-none-any.whl", "yanked": True}]},
     "halfyanked": {"2.0": [{"filename": "halfyanked-2.0-py3-none-any.whl", "yanked": True}, "halfyanked-2.0.tar.gz"]},
 }
+
+
+@pytest.fixture(autouse=True)
+def clean_env(monkeypatch):
+    """Tests shouldn't depend on the developer's colour or index settings."""
+    for name in ("NO_COLOR", "FORCE_COLOR", "WHEELGAP_INDEX_URL"):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture
@@ -40,8 +52,14 @@ def fake_pypi(monkeypatch):
         files = versions.get(version)
         if files is None:
             raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
-        urls = [f if isinstance(f, dict) else {"filename": f} for f in files]
-        return {"info": {"version": version}, "urls": urls}
+
+        def entries(fs):
+            return [f if isinstance(f, dict) else {"filename": f} for f in fs]
+
+        data = {"info": {"version": version}, "urls": entries(files)}
+        if len(parts) == 1:  # the project endpoint lists every release, like PyPI
+            data["releases"] = {v: entries(fs) for v, fs in versions.items()}
+        return data
 
     monkeypatch.setattr(pypi, "fetch_json", fetch_json)
     return calls

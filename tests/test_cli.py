@@ -387,3 +387,35 @@ def test_quiet_still_says_why_a_package_is_unknown(capsys, fake_pypi):
     assert code == 1
     assert "1 unknown" in out
     assert "could not check does-not-exist: not on index" in err
+
+
+def test_python_version_file_with_a_bom(capsys, fixtures, tmp_path):
+    (tmp_path / "uv.lock").write_bytes((fixtures / "uvproj" / "uv.lock").read_bytes())
+    (tmp_path / ".python-version").write_text("﻿3.12\n", encoding="utf-8")  # as Notepad saves it
+    code, out, err = run(capsys, str(tmp_path), "-t", "win-amd64", "--json")
+    assert not err and [t["python"] for t in json.loads(out)["targets"]] == ["3.12"]
+
+
+def test_list_targets_uses_pyproject_limits(capsys, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text('[tool.wheelgap]\nglibc = "2.17"\n', encoding="utf-8")
+    code, out, _ = run(capsys, "--list-targets")
+    assert code == 0 and "glibc <= 2.17" in out
+
+
+def test_simple_index_url_exits_2(capsys, monkeypatch):
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://pypi.org/simple")
+    code, _, err = run(capsys, "requests==2.32.3", "-t", "linux")
+    assert code == 2 and "needs the JSON API" in err
+
+
+def test_output_is_utf8_on_a_cp1252_pipe(monkeypatch, capsys):
+    import io
+    import sys as _sys
+
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+    monkeypatch.setattr(_sys, "stdout", stream)
+    assert main(["--list-targets"]) == 0
+    stream.flush()
+    assert stream.encoding.lower().replace("-", "") == "utf8"

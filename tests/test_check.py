@@ -156,7 +156,7 @@ def test_requirements_against_fake_index(fixtures, fake_pypi):
 def test_lookup_errors_are_unknown(fake_pypi):
     pkgs = [Package("doesnotexist", "1.0"), Package("fastlib", "9.9")]
     fill_all(pkgs)
-    assert [p.error for p in pkgs] == ["not on index", "not on index"]
+    assert [p.error for p in pkgs] == ["not on index", "version 9.9 not on index"]
     (t,) = build_targets(["3.13"], ["linux-x86_64"])
     rows = check([Source("x", pkgs)], [t])
     assert [r.results[t] for r in rows] == [Status.UNKNOWN, Status.UNKNOWN]
@@ -194,3 +194,62 @@ def test_via_prefers_a_plain_requirement_over_a_group():
     )
     (t,) = build_targets(["3.13"], ["linux-x86_64"])
     assert via(src, [t], "c") == {t: ["b", "c"]}
+
+
+def test_markers_wheelgap_cannot_know_count_as_needed():
+    (t,) = build_targets(["3.13"], ["linux-x86_64"])
+    # uv writes [tool.uv] conflicts as extra == '...' terms; installers know the OS release, we don't.
+    for marker in ("extra == 'extra-7-proj-cu124'", "platform_release >= '20.0'", "'docs' in dependency_groups"):
+        assert marker_holds(marker, t), marker
+    assert not marker_holds("sys_platform == 'win32'", t)
+
+
+def test_more_sdist_formats():
+    (t,) = build_targets(["3.13"], ["linux-x86_64"])
+    assert status_for(["foo-1.0.tar"], t) is Status.SOURCE
+    assert status_for(["foo-1.0.tar.lz"], t) is Status.SOURCE
+
+
+def test_yanked_files_count_only_when_every_usable_file_is_yanked():
+    lin, win = build_targets(["3.13"], ["linux-x86_64", "win-amd64"])
+    files = ["foo-2.0-cp313-cp313-manylinux_2_17_x86_64.whl", "foo-2.0-cp313-cp313-win_amd64.whl"]
+    yanked = frozenset({files[0]})
+    # Only the Linux wheel is yanked: pip on Linux has nothing else, so it installs the yanked wheel.
+    assert status_for(files, lin, yanked=yanked) is Status.WHEEL
+    assert status_for(files + ["foo-2.0.tar.gz"], lin, yanked=yanked) is Status.SOURCE  # a live sdist wins
+    assert status_for(files, win, yanked=yanked) is Status.WHEEL
+
+
+def test_unknowable_markers_still_respect_the_platform_part():
+    lin, mac, win = build_targets(["3.13"], ["linux-x86_64", "macos-arm64", "win-amd64"])
+    cpu = "sys_platform != 'darwin' and extra == 'extra-7-proj-cpu'"  # uv conflicts (torch cpu/cu124)
+    assert marker_holds(cpu, lin) and not marker_holds(cpu, mac)
+    cuda = "sys_platform == 'win32' and 'cuda' in extras"  # pylock.toml
+    assert marker_holds(cuda, win) and not marker_holds(cuda, lin)
+    pyobjc = "sys_platform == 'darwin' and platform_release >= '20.0'"
+    assert marker_holds(pyobjc, mac) and not marker_holds(pyobjc, lin)
+
+
+def test_three_valued_markers_from_the_review():
+    lin, mac = build_targets(["3.13"], ["linux-x86_64", "macos-arm64"])
+    for marker, on_linux, on_mac in [
+        ("'cuda' in extras and 'cpu' not in extras", True, True),  # conflicting extras: unknown, so needed
+        ("platform_release >= '20' and platform_release < '23'", True, True),
+        ("sys_platform == 'linux' and 'microsoft' in platform_release", True, False),  # WSL check
+        ("extra == 'a' and extra == 'b'", True, True),
+        ("sys_platform == 'darwin' and extra == 'gpu' or python_version < '3.9'", False, True),
+        ("(sys_platform == 'win32' or extra == 'x') and python_version >= '3.10'", True, True),
+        ("sys_platform == 'win32' and python_version >= '3.10'", False, False),
+    ]:
+        assert marker_holds(marker, lin) is on_linux, (marker, "linux")
+        assert marker_holds(marker, mac) is on_mac, (marker, "mac")
+
+
+def test_marker_values_with_quotes_are_not_misread(monkeypatch):
+    from packaging._parser import Value
+
+    # packaging before 26.3 always re-serialised values in double quotes; wheelgap must not rely on
+    # serialize() picking the right quotes, or this marker reads as "x" and "win32" and turns False.
+    monkeypatch.setattr(Value, "serialize", lambda self: f'"{self.value}"')
+    (lin,) = build_targets(["3.13"], ["linux-x86_64"])
+    assert marker_holds("""sys_platform != 'x" and sys_platform == "win32'""", lin)

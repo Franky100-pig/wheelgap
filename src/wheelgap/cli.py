@@ -15,7 +15,7 @@ from .api import running_python
 from .check import Row, Status, check, explain, has_sdist
 from .dockerfile import DockerfileError, read_dockerfile
 from .pyodide import PyodideLock, PyodideLockError, apply_bundled, check_targets, load_pyodide_lock
-from .pypi import fill_all
+from .pypi import check_index_url, fill_all
 from .sources import SourceError, load_inputs
 from .targets import (
     ALIASES,
@@ -159,7 +159,7 @@ def read_python_version(folder: Path) -> list[str]:
     if not path.is_file():
         return []
     versions = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8-sig").splitlines():  # -sig: Windows editors add a BOM
         entry = line.split("#", 1)[0].strip()
         if not entry:
             continue
@@ -351,15 +351,15 @@ def report_json(
     )
 
 
-def print_target_list(args: argparse.Namespace) -> None:
+def print_target_list(args: argparse.Namespace, config: dict) -> None:
     aliases: dict[str, list[str]] = {name: [] for name in PLATFORMS}
     for alias, name in ALIASES.items():
         aliases[name].append(alias)
 
     versions = {
-        "manylinux": ("glibc", args.glibc or DEFAULT_GLIBC),
-        "musllinux": ("musl", args.musl or DEFAULT_MUSL),
-        "macos": ("macOS", args.macos or DEFAULT_MACOS),
+        "manylinux": ("glibc", args.glibc or config.get("glibc", DEFAULT_GLIBC)),
+        "musllinux": ("musl", args.musl or config.get("musl", DEFAULT_MUSL)),
+        "macos": ("macOS", args.macos or config.get("macos", DEFAULT_MACOS)),
     }
     limits = {}
     for family, (label, version) in versions.items():
@@ -416,12 +416,19 @@ def main(argv: list[str] | None = None) -> int:
         # Don't crash printing ✓ to a non-UTF-8 pipe (e.g. Windows cp1252).
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure:
-            reconfigure(errors="replace")
+            # Windows pipes (CI logs) default to cp1252, which would turn ✓ into "?"; write UTF-8 instead.
+            # A console (isatty) already handles Unicode, and PYTHONIOENCODING is the user's choice.
+            encoding = (getattr(stream, "encoding", "") or "").lower().replace("-", "")
+            if encoding != "utf8" and not stream.isatty() and not os.environ.get("PYTHONIOENCODING"):
+                reconfigure(encoding="utf-8", errors="replace")
+            else:
+                reconfigure(errors="replace")
     parser = make_parser()
     args = parser.parse_args(argv)
     try:
         if args.list_targets:
-            print_target_list(args)
+            pyproject = find_pyproject(args.inputs)
+            print_target_list(args, load_config(pyproject) if pyproject else {})
             return 0
         pyproject = find_pyproject(args.inputs)
         config = load_config(pyproject) if pyproject else {}
@@ -443,6 +450,7 @@ def main(argv: list[str] | None = None) -> int:
             args.musl or config.get("musl", DEFAULT_MUSL),
             args.macos or config.get("macos", DEFAULT_MACOS),
         )
+        check_index_url()
         sources = load_inputs(args.inputs or ["."])
         fail_on = args.fail_on or config.get("fail-on", "source")
         pyodide_lock = None

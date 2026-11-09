@@ -36,7 +36,7 @@ def test_rejection_reasons():
         "built for cp312-cp312, not CPython 3.13"
     )
     assert rejection("x-1-cp312-abi3-manylinux_2_17_x86_64.whl", target("3.14t")) == (
-        "abi3 wheels can't be used on free-threaded Python"
+        "abi3 wheels can't be used on free-threaded Python (only abi3t ones can)"
     )
     assert rejection("x-1-cp313-cp313-win_amd64.whl", target()) == "win_amd64 doesn't match linux-x86_64"
     assert rejection("x-1-py3-none-any.whl", target()) is None
@@ -141,3 +141,13 @@ def test_json_explain_no_via_without_a_graph(capsys, fixtures):
     macpkg = next(p for p in data["packages"] if p["name"] == "macpkg")
     assert macpkg["rejected"] == {"macos-arm64": []}
     assert macpkg["via"] == {}  # no dependency graph, so no target has a path
+
+
+def test_explain_abi3t_and_legacy_manylinux():
+    assert rejection("x-1.0-cp315-abi3.abi3t-manylinux_2_28_x86_64.whl", target("3.14t")) == (
+        "abi3t wheels need CPython 3.15+ (free-threaded)"
+    )
+    (old,) = build_targets(["3.13"], ["linux-x86_64"], glibc="2.12")
+    assert rejection("x-1-cp313-cp313-manylinux2014_x86_64.whl", old) == (
+        "manylinux2014_x86_64 needs glibc 2.17, newer than 2.12 (--glibc)"
+    )

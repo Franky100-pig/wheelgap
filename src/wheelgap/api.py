@@ -100,7 +100,9 @@ def check_packages(
     for p in pkgs:
         p.origin = "api"
     fill_all(pkgs, workers=workers)
-    return [_result(p, {t: status_for(None if p.error else p.files, t) for t in targets}) for p in pkgs]
+    return [
+        _result(p, {t: status_for(None if p.error else p.files, t, yanked=p.yanked) for t in targets}) for p in pkgs
+    ]
 
 
 def check_package(

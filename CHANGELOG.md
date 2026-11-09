@@ -8,7 +8,17 @@
 
 ### Fixed
 
-These came from independent second reviews of recent PRs.
+These came from independent second reviews of recent PRs, and a full audit of the codebase.
+
+- **Version ranges are respected.** `numpy>=1.26,<2` (or `~=`, `==1.26.*`) used to check the latest release (numpy 2.x). wheelgap now checks the newest release that matches the range (not yet narrowed by each release's `requires-python`).
+- **uv.lock:** dependencies behind `[tool.uv] conflicts` (encoded as `extra == '...'` markers) were dropped as never installed, and path dependencies were treated as roots, so their dependencies counted everywhere. Markers with parts wheelgap can't know (extras, groups, `platform_release`, `platform_version`) now hold if they could hold for some value of those parts, while the platform and Python parts still apply. Poetry 1.x graphs also handle dependency cycles and version ranges on edges.
+- **poetry.lock:** Poetry 1.x locks (lock-version < 2.1) keep markers only on dependency edges, so Windows-only packages such as pywin32 were reported missing on Linux. They're now walked like uv.lock. Dict markers that leave out an always-installed group, and packages with no files recorded, are handled too.
+- **Free-threaded 3.15t `abi3t` wheels** (PEP 803) need `packaging` 26.3, which is now the minimum. `--explain` says when an `abi3t` wheel needs a newer CPython.
+- **Python 3.7** targets use CPython's `cp37m` ABI, so their wheels are recognised.
+- **Yanked files** of a pinned release count only when every file a target could use is yanked, as pip does.
+- **PyPI lookups:** odd index responses give "unknown" instead of crashing; retries back off and honour `Retry-After`, retry dropped connections and skip permanent errors; an empty `WHEELGAP_INDEX_URL` means PyPI, and a `/simple` URL is a clear error; a missing pinned version says so ("version 1.0 not on index").
+- **requirements.txt:** `-rfile` without a space, `--hash` with a space, comments after a tab, and `name@url` without spaces are all read correctly.
+- **Output:** UTF-8 on Windows CI (no more "?" for ✓), `.python-version` files with a BOM, `--list-targets` uses the limits from `[tool.wheelgap]`, legacy `manylinux2014` wheels get the right `--explain` reason, more sdist formats are recognised, and `--macos 15` means 15.0.
 
 - `--pyodide-lock`: a package whose lookup failed (e.g. a mistyped pin) was reported as bundled and could pass. It's now `unknown`, which fails.
 - `pyodide-lock` in `[tool.wheelgap]` made every run without a matching Pyodide target exit 2. It's now quietly unused on those runs, and a relative path is read from the folder that holds `pyproject.toml`.

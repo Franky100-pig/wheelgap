@@ -7,9 +7,17 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from packaging.markers import InvalidMarker, Marker, UndefinedComparison, UndefinedEnvironmentName
+from packaging.markers import InvalidMarker, Marker
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.tags import Tag
 from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
+from packaging.version import InvalidVersion
+
+try:  # packaging's parsed-marker node types (private, so guarded: without them every comparison is unknown)
+    from packaging._parser import Value as _Value
+    from packaging._parser import Variable as _Variable
+except ImportError:  # pragma: no cover
+    _Value = _Variable = None  # type: ignore[assignment,misc]
 
 from .sources import Edge, Package, Source
 from .targets import PLATFORMS, Target
@@ -24,7 +32,20 @@ class Status(StrEnum):
     BUNDLED = "bundled"  # no wheel on the index, but Pyodide ships its own build (--pyodide-lock)
 
 
-SDIST_SUFFIXES = (".tar.gz", ".zip", ".tar.bz2", ".tgz", ".tar.xz")
+# The archive formats pip accepts as source distributions.
+SDIST_SUFFIXES = (
+    ".tar.gz",
+    ".zip",
+    ".tar.bz2",
+    ".tgz",
+    ".tar.xz",
+    ".tar",
+    ".tbz",
+    ".txz",
+    ".tlz",
+    ".tar.lz",
+    ".tar.lzma",
+)
 
 
 @dataclass
@@ -64,9 +85,25 @@ def has_sdist(files: list[str]) -> bool:
     return any(f.endswith(SDIST_SUFFIXES) for f in files)
 
 
-def status_for(files: list[str] | None, target: Target, _wheels: list[frozenset[Tag]] | None = None) -> Status:
+def _installable(files: list[str], target: Target) -> bool:
+    return any(target.accepts(t) for t in wheel_tags(files)) or (has_sdist(files) and target.builds_sdists)
+
+
+def status_for(
+    files: list[str] | None,
+    target: Target,
+    _wheels: list[frozenset[Tag]] | None = None,
+    yanked: frozenset[str] = frozenset(),
+) -> Status:
     if files is None:
         return Status.UNKNOWN
+    if yanked:
+        # `yanked` is only non-empty for a release pinned with ==. Like pip, ignore its yanked files
+        # unless every file this target could use is yanked; then pip installs them anyway (PEP 592).
+        live = [f for f in files if f not in yanked]
+        if _installable(live, target):
+            files = live
+        _wheels = None
     wheels = _wheels if _wheels is not None else wheel_tags(files)
     if any(target.accepts(t) for t in wheels):
         return Status.WHEEL
@@ -74,6 +111,7 @@ def status_for(files: list[str] | None, target: Target, _wheels: list[frozenset[
 
 
 _PLAT_RE = re.compile(r"^(manylinux|musllinux|macosx)_(\d+)_(\d+)_(.+)$")
+_LEGACY_GLIBC = {"manylinux1": (2, 5), "manylinux2010": (2, 12), "manylinux2014": (2, 17)}
 _LIBC = {"manylinux": "glibc", "musllinux": "musl", "macosx": "macOS"}
 
 
@@ -88,7 +126,8 @@ def _platform_reason(plat: str, target: Target) -> str:
     if m:
         kind, major, minor, wheel_arch = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
     elif plat.startswith("manylinux") and "_" in plat:  # manylinux2014_aarch64 and friends
-        kind, major, minor, wheel_arch = "manylinux", 0, 0, plat.split("_", 1)[1]
+        legacy, wheel_arch = plat.split("_", 1)
+        kind, (major, minor) = "manylinux", _LEGACY_GLIBC.get(legacy, (0, 0))
     else:
         return f"{plat} doesn't match {target.platform}"
     same_arch = wheel_arch == arch or (kind == "macosx" and wheel_arch == "universal2")
@@ -115,8 +154,13 @@ def rejection(filename: str, target: Target) -> str | None:
         return None
     platforms = sorted({t.platform for t in wheel})
     if "any" in platforms or set(platforms) & set(target.platform_tags()):
-        if target.freethreaded and any(t.abi == "abi3" for t in wheel):
-            return "abi3 wheels can't be used on free-threaded Python"
+        if target.freethreaded:
+            stable = [t for t in wheel if t.abi == "abi3t"]
+            if stable:  # PEP 803: the free-threaded stable ABI, cpXY-abi3t works on CPython X.Y+ only
+                minors = [int(t.interpreter[3:]) for t in stable if t.interpreter[3:].isdigit()]
+                return f"abi3t wheels need CPython 3.{min(minors)}+ (free-threaded)" if minors else "abi3t wheel"
+            if any(t.abi == "abi3" for t in wheel):
+                return "abi3 wheels can't be used on free-threaded Python (only abi3t ones can)"
         built = ", ".join(sorted({f"{t.interpreter}-{t.abi}" for t in wheel}))
         return f"built for {built}, not CPython {target.python}"
     # Name the tag closest to the target: same arch first, and the modern manylinux_2_17_* form
@@ -166,6 +210,68 @@ def explain(files: list[str], target: Target) -> list[tuple[str, str]]:
 _marker_cache: dict[str, Marker | None] = {}
 
 
+# Marker variables wheelgap can't know for a target: which extras or dependency groups get requested
+# (uv writes its [tool.uv] conflicts as extra == '...' terms) and the OS release/version of the machine
+# that installs. A comparison on one of them is "unknown", combined with the known parts in three-valued
+# logic: "sys_platform != 'darwin' and extra == 'cpu'" is unknown on Linux (so the package counts) and
+# false on macOS (so it doesn't). Only a definite False hides a package.
+_UNKNOWABLE = frozenset({"extra", "extras", "dependency_groups", "platform_release", "platform_version"})
+_atom_cache: dict[tuple[str, Target], bool | None] = {}
+
+
+def _quote(text: str) -> str | None:
+    if '"' not in text:
+        return f'"{text}"'
+    return f"'{text}'" if "'" not in text else None  # both kinds of quote: can't re-serialise safely
+
+
+def _atom(node: tuple, target: Target) -> bool | None:
+    """One comparison: True/False, or None when it involves something we can't know."""
+    if _Variable is None or _Value is None:
+        return None  # packaging's internals changed: treat every comparison as unknown (never hide)
+    parts: list[str] = []
+    names: set[str] = set()
+    for n in node:
+        if isinstance(n, _Variable):
+            names.add(n.value)
+            parts.append(n.value)
+        elif isinstance(n, _Value):
+            quoted = _quote(n.value)
+            if quoted is None:
+                return None
+            parts.append(quoted)
+        else:
+            parts.append(str(n.value))  # the operator
+    if not names or names & _UNKNOWABLE:
+        return None
+    text = " ".join(parts)
+    key = (text, target)
+    if key not in _atom_cache:
+        try:
+            _atom_cache[key] = Marker(text).evaluate(target.marker_env)
+        except Exception:  # undefined names, odd comparisons: unknown rather than a confident answer
+            _atom_cache[key] = None
+    return _atom_cache[key]
+
+
+def _evaluate3(markers: list, target: Target) -> bool | None:
+    """Kleene evaluation of packaging's parsed marker list: `and` binds tighter than `or`."""
+    groups: list[list[bool | None]] = [[]]
+    for item in markers:
+        if item == "or":
+            groups.append([])
+        elif item == "and":
+            continue
+        elif isinstance(item, list):
+            groups[-1].append(_evaluate3(item, target))
+        else:
+            groups[-1].append(_atom(item, target))
+    results: list[bool | None] = []
+    for group in groups:
+        results.append(False if False in group else None if None in group else True)
+    return True if True in results else None if None in results else False
+
+
 def marker_holds(marker: str | None, target: Target) -> bool:
     if not marker:
         return True
@@ -178,8 +284,8 @@ def marker_holds(marker: str | None, target: Target) -> bool:
     if m is None:
         return True  # can't parse it: assume the package is needed rather than hide a gap
     try:
-        return m.evaluate(target.marker_env)
-    except (UndefinedComparison, UndefinedEnvironmentName):
+        return _evaluate3(m._markers, target) is not False
+    except Exception:  # packaging changed its internals: count it as needed rather than hide a gap
         return True
 
 
@@ -203,7 +309,16 @@ def reachable(source: Source, target: Target) -> dict[int, Parent]:
             return []
         candidates = by_name.get(canonicalize_name(name), [])
         if version is not None:
-            candidates = [i for i in candidates if source.packages[i].version == version] or candidates
+            # uv edges carry an exact version; Poetry edges a range (numpy = ">=1.26").
+            exact = [i for i in candidates if source.packages[i].version == version]
+            if exact:
+                return exact
+            try:
+                spec = SpecifierSet(version)
+                ranged = [i for i in candidates if _in_range(source.packages[i].version, spec)]
+            except InvalidSpecifier:  # Poetry's "*" or "^1.2": no narrowing
+                ranged = []
+            candidates = ranged or candidates
         return candidates
 
     parents: dict[int, Parent] = dict.fromkeys(source.roots)
@@ -248,6 +363,13 @@ def dependency_path(source: Source, parents: dict[int, Parent], i: int) -> list[
     return path[::-1]
 
 
+def _in_range(version: str | None, spec: SpecifierSet) -> bool:
+    try:
+        return version is not None and spec.contains(version, prereleases=True)
+    except InvalidVersion:
+        return False
+
+
 def applies(pkg: Package, target: Target) -> bool:
     return pkg.markers is None or any(marker_holds(m, target) for m in pkg.markers)
 
@@ -264,7 +386,7 @@ def check(sources: list[Source], targets: list[Target]) -> list[Row]:
             row = Row(pkg)
             for t in targets:
                 needed = i in installed[t] if installed is not None else applies(pkg, t)
-                row.results[t] = status_for(files, t, wheels) if needed else Status.NOT_NEEDED
+                row.results[t] = status_for(files, t, wheels, pkg.yanked) if needed else Status.NOT_NEEDED
                 if needed and installed is not None:
                     row.via[t] = dependency_path(source, installed[t], i)
             rows.append(row)

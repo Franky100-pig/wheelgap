@@ -120,7 +120,8 @@ def parse_python(spec: str) -> tuple[int, int, bool]:
 
 def parse_version_pair(spec: str, what: str) -> tuple[int, int]:
     try:
-        major, minor = (int(p) for p in spec.split(".")[:2])
+        parts = spec.strip().split(".")
+        major, minor = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0  # "15" means 15.0
     except ValueError:
         raise TargetError(f"can't parse {what} version {spec!r} (expected e.g. 2.36)") from None
     return major, minor
@@ -201,7 +202,8 @@ class Target:
     def tags(self) -> frozenset[Tag]:
         version = (self.major, self.minor)
         interp = f"cp{self.major}{self.minor}"
-        abi = interp + ("t" if self.freethreaded else "")
+        # CPython 3.7 and older built "m" (pymalloc) ABIs: cp37-cp37m.
+        abi = interp + ("t" if self.freethreaded else "m" if (self.major, self.minor) < (3, 8) else "")
         plats = self.platform_tags()
         supported = set(tags.cpython_tags(version, [abi], plats))
         supported.update(tags.compatible_tags(version, interp, plats))

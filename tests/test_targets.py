@@ -168,3 +168,21 @@ def test_pyodide_unknown_python_and_free_threading():
 def test_all_does_not_include_pyodide():
     assert "pyodide" not in [t.platform for t in build_targets(["3.13"], ["all"])]
     assert len(build_targets(["3.13"], ["all"])) == 8
+
+
+def test_python_37_uses_the_m_abi():
+    # CPython 3.7 and older built pymalloc ("m") ABIs, so numpy's cp37-cp37m wheels install there.
+    assert accepts(t("linux-x86_64", "3.7"), "numpy-1.21.6-cp37-cp37m-manylinux_2_12_x86_64.manylinux2010_x86_64.whl")
+    assert not accepts(t("linux-x86_64", "3.8"), "x-1-cp38-cp38m-manylinux_2_17_x86_64.whl")
+
+
+def test_abi3t_wheels_on_free_threaded_315():
+    wheel = "x-1.0-cp315-abi3.abi3t-manylinux_2_28_x86_64.whl"
+    assert accepts(t("linux-x86_64", "3.15t"), wheel)  # needs packaging >= 26.3 (PEP 803)
+    assert not accepts(t("linux-x86_64", "3.14t"), wheel)
+    assert not accepts(t("linux-x86_64", "3.15t"), "x-1.0-cp312-abi3-manylinux_2_28_x86_64.whl")
+
+
+def test_version_floors_accept_a_major_only():
+    (target,) = build_targets(["3.13"], ["macos"], macos="15")
+    assert target.macos == (15, 0)

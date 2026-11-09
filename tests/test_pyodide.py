@@ -153,3 +153,8 @@ def test_lock_from_pyproject_for_another_python_is_an_error(capsys, fake_pypi, l
     (tmp_path / "pyproject.toml").write_text(f'[tool.wheelgap]\npyodide-lock = "{lock}"\n'.replace("\\", "/"))
     code, _, err = run(capsys, "fastlib==2.0.0", "-p", "3.12", "-t", "pyodide")
     assert code == 2 and "is for Python 3.13" in err  # rather than silently calling bundled packages missing
+
+
+def test_lock_covering_only_some_pyodide_targets_warns(capsys, fake_pypi, lock):
+    code, out, err = run(capsys, "fastlib==2.0.0", "-p", "3.12,3.13", "-t", "pyodide", "--pyodide-lock", lock)
+    assert "pyodide results for Python 3.12 don't include packages that Pyodide bundles" in err
