@@ -18,7 +18,7 @@ from .api import running_python
 from .check import Row, Status, check, explain, has_sdist, marker_holds
 from .dockerfile import DockerfileError, read_dockerfile
 from .pyodide import PyodideLock, PyodideLockError, apply_bundled, check_targets, load_pyodide_lock
-from .pypi import check_index_url, fill_all, is_pypi, keeps_locked_files, recheck_lock
+from .pypi import check_index_url, fill_all, is_pypi, keeps_locked_files, recheck_lock, split_credentials
 from .sources import Package, Source, SourceError, load_inputs, pythons_outside_lock
 from .targets import (
     ALIASES,
@@ -164,6 +164,13 @@ def make_parser() -> argparse.ArgumentParser:
         choices=FAIL_ON,
         help="exit 1 on any gap ('source', the default) or only when a package can't install ('missing')",
     )
+    p.add_argument(
+        "--index-url",
+        metavar="URL",
+        help="look packages up in this simple index (PEP 691 JSON) instead of PyPI's JSON API "
+        "(lockfiles that list their files are still read offline unless --online); "
+        "credentials can go in the URL (https://user:token@host/simple)",
+    )
     p.add_argument("--color", choices=["auto", "always", "never"], default="auto")
     p.add_argument("--list-targets", action="store_true", help="list platforms, aliases and compatibility limits")
     p.add_argument("-V", "--version", action="version", version=f"wheelgap {__version__}")
@@ -172,7 +179,7 @@ def make_parser() -> argparse.ArgumentParser:
 
 FAIL_ON = ("source", "missing")
 LIST_KEYS = ("python", "targets", "ignore")
-STR_KEYS = ("glibc", "musl", "macos", "ios", "android-api", "fail-on", "distro", "pyodide-lock")
+STR_KEYS = ("glibc", "musl", "macos", "ios", "android-api", "fail-on", "distro", "pyodide-lock", "index-url")
 
 
 def project_dir(inputs: list[str]) -> Path:
@@ -724,7 +731,16 @@ def main(argv: list[str] | None = None) -> int:
             args.ios or config.get("ios", DEFAULT_IOS),
             args.android_api or config.get("android-api", DEFAULT_ANDROID_API),
         )
-        check_index_url()
+        index_url = args.index_url if args.index_url is not None else config.get("index-url")
+        if index_url is not None:
+            _, auth = split_credentials(index_url)
+            if auth is not None and args.index_url is None:
+                raise SourceError(
+                    "[tool.wheelgap] index-url must not contain credentials: "
+                    "pass the URL with --index-url from a CI secret instead"
+                )
+        else:
+            check_index_url()  # WHEELGAP_INDEX_URL only matters for the JSON API
         sources = load_inputs(args.inputs or ["."])
         if args.offline:
             require_offline(sources)
@@ -752,7 +768,7 @@ def main(argv: list[str] | None = None) -> int:
         return input_error_json(e) if args.json else 2
 
     packages = [p for s in sources for p in s.packages]
-    other_index = fill_all(packages, refresh=args.online, python=single_python(targets))
+    other_index = fill_all(packages, refresh=args.online, python=single_python(targets), simple_index=index_url)
     if args.online and other_index and not quiet:
         print(
             f"wheelgap: note: --online looks up PyPI packages only; kept the locked files of {other_index} "
@@ -775,7 +791,7 @@ def main(argv: list[str] | None = None) -> int:
                 if not other:
                     continue
             else:
-                other, failed = recheck_lock(s.packages)
+                other, failed = recheck_lock(s.packages, simple_index=index_url)
             note = (
                 f"wheelgap: note: {s.label} is locked for Python {s.requires_python}, so it may be missing "
                 f"wheels for Python {', '.join(outside)}; looked its PyPI packages up on the index too"
