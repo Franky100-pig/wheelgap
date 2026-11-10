@@ -39,7 +39,7 @@ Run either one in a project directory. It finds `uv.lock`, `pylock.toml`, `poetr
 
 ## Usage
 
-See the [recipes](https://github.com/wheelgap/wheelgap/blob/main/docs/recipes.md) for a free-threading readiness report you can use in scripts.
+See the [recipes](https://github.com/wheelgap/wheelgap/blob/main/docs/recipes.md) for multi-arch images, monorepos with several lockfiles, and a free-threading readiness report you can use in scripts.
 
 ```bash
 # Will my Alpine ARM image compile anything?
