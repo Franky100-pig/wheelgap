@@ -117,6 +117,8 @@ def check_packages(
     Each package is a name ("numpy", the latest release) or a (name, version) pair.
     """
     targets = _package_targets(targets)
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
     pkgs = [Package(p, None) if isinstance(p, str) else Package(p[0], p[1]) for p in packages]
     for p in pkgs:
         p.origin = "api"
@@ -153,7 +155,7 @@ def check_lockfile(
     requires-python leaves out a target's Python may be missing wheels for it, so its PyPI packages are also
     looked up on the index (keeping the lock's files if a lookup fails).
     """
-    targets = list(targets) if targets is not None else make_targets()
+    targets = _package_targets(targets)
     p = Path(path)
     source: Source = load_file(find_lockfile(p) if p.is_dir() else p)
     fill_all(source.packages, refresh=online, python=single_python(targets))

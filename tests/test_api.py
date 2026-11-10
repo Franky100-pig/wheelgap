@@ -29,13 +29,22 @@ def test_make_targets_empty_python_keeps_other_options():
     assert wheelgap.make_targets(python="", **kwargs) == wheelgap.make_targets(**kwargs)
 
 
-def test_package_checks_reject_empty_targets_before_lookup(fake_pypi):
+def test_package_checks_reject_empty_targets_before_lookup(fake_pypi, fixtures):
     with pytest.raises(ValueError, match="at least one target"):
         wheelgap.check_packages(["purewheel"], targets=[])
     with pytest.raises(ValueError, match="at least one target"):
         wheelgap.check_package("purewheel", targets=[])
     with pytest.raises(ValueError, match="at least one target"):
         wheelgap.check_package("purewheel", targets=[], files=["purewheel-1.0-py3-none-any.whl"])
+    with pytest.raises(ValueError, match="at least one target"):
+        wheelgap.check_lockfile(fixtures / "uvproj", targets=[])
+    assert not fake_pypi
+
+
+@pytest.mark.parametrize("packages", [["purewheel"], []])
+def test_check_packages_rejects_non_positive_workers_before_lookup(fake_pypi, packages):
+    with pytest.raises(ValueError, match="workers must be at least 1"):
+        wheelgap.check_packages(packages, workers=0)
     assert not fake_pypi
 
 
