@@ -29,6 +29,7 @@ uvx wheelgap@latest -p 3.13 -t linux-aarch64,musl-aarch64 --json
 - **`results`** maps a target label to `wheel`, `source`, `missing`, `unknown`, `n/a` (the package isn't installed on that target, per its markers) or `bundled` (shipped by Pyodide, with `--pyodide-lock`). Labels come from `targets[].label`: the platform alone with one Python, `"3.13 linux-x86_64"` with several.
 - **`unknown`** means a lookup failed; the package's `error` field says why. Never report it as fine.
 - **`skipped`** lists packages that weren't checked (editable, git, path), so don't claim every dependency was covered.
+- **Installation scope:** by default, `uv.lock` checks conservatively include extras and development groups. Compare a reported gap with the deployment's actual `uv sync` options before treating it as a deployment failure.
 - **Why:** `--explain` adds each rejected wheel and the reason (`rejected`), and for `uv.lock` the dependency path that pulls the package in (`via`).
 
 ## What to tell the user

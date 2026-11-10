@@ -9,4 +9,5 @@ alwaysApply: false
 - Read `summary.with_gaps` and each package's `results` (target label from `targets[].label` → `wheel`, `source`, `missing`, `unknown`, `n/a` or `bundled`), not just the exit code (`0`/`1` gaps/`2` bad input). `skipped` lists packages that weren't checked.
 - Treat `unknown` as a failed lookup (see the package's `error`), not as fine. `--explain` adds why each wheel was rejected (`rejected`) and, for `uv.lock`, which dependency pulls it in (`via`).
 - Suggest fixes: pin a version that has the wheel, use a `-slim` base instead of Alpine, or add build dependencies deliberately. Accept a known gap with `--ignore NAME` (or `ignore = [...]` in `[tool.wheelgap]`), never by hiding it.
+- By default, `uv.lock` checks conservatively include extras and development groups. Compare a reported gap with the deployment's actual `uv sync` options before treating it as a deployment failure.
 - wheelgap reports wheel availability only, not free-threading safety.
