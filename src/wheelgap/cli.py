@@ -169,6 +169,11 @@ def make_parser() -> argparse.ArgumentParser:
         "--online", action="store_true", help="re-check lockfile packages against PyPI instead of trusting the lockfile"
     )
     p.add_argument("--offline", action="store_true", help="never contact an index; fail if an input needs one")
+    p.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="don't read or save the 24-hour cache of pinned package lookups",
+    )
     p.add_argument("--all", action="store_true", help="show every package, not just the ones with gaps")
     p.add_argument("--explain", action="store_true", help="for each gap, list the wheels that were rejected and why")
     p.add_argument(
@@ -907,7 +912,11 @@ def main(argv: list[str] | None = None) -> int:
                     f"workspace members outside it aren't checked: {', '.join(unchecked)}",
                     file=sys.stderr,
                 )
-    other_index = fill_all(packages, refresh=args.online, python=single_python(targets), simple_index=index_url)
+    # --online asks the index again but saves the answer, so a plain run afterwards doesn't go back to an older one.
+    cached = {"read_cache": not (args.no_cache or args.online), "write_cache": not args.no_cache}
+    other_index = fill_all(
+        packages, refresh=args.online, python=single_python(targets), simple_index=index_url, **cached
+    )
     if args.online and other_index and not quiet:
         print(
             f"wheelgap: note: --online looks up PyPI packages only; kept the locked files of {other_index} "
@@ -930,7 +939,7 @@ def main(argv: list[str] | None = None) -> int:
                 if not other:
                     continue
             else:
-                other, failed = recheck_lock(needed, simple_index=index_url)
+                other, failed = recheck_lock(needed, simple_index=index_url, **cached)
             note = (
                 f"wheelgap: note: {s.label} is locked for Python {s.requires_python}, so it may be missing "
                 f"wheels for Python {', '.join(outside)}; looked its PyPI packages up on the index too"

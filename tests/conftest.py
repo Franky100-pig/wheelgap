@@ -32,6 +32,16 @@ def clean_env(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def lookup_cache(monkeypatch, tmp_path_factory) -> Path:
+    """Each test gets an empty cache of its own, so no test reads or writes the developer's real one."""
+    from wheelgap import cache
+
+    folder = tmp_path_factory.mktemp("cache")
+    monkeypatch.setattr(cache, "cache_dir", lambda: folder)
+    return folder
+
+
 @pytest.fixture
 def fixtures() -> Path:
     return FIXTURES

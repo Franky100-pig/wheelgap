@@ -1024,6 +1024,14 @@ def test_lock_for_another_python_is_rechecked_online(capsys, fake_pypi, tmp_path
     assert fake_pypi == ["https://pypi.org/pypi/fastlib/2.0.0/json"]
 
 
+def test_lock_recheck_uses_the_lookup_cache(capsys, fake_pypi, tmp_path):
+    (tmp_path / "uv.lock").write_text(LOCK_312_ONLY, encoding="utf-8")
+    for _ in range(2):
+        code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+        assert code == 0, out
+    assert fake_pypi == ["https://pypi.org/pypi/fastlib/2.0.0/json"]  # the second run's re-check was cached
+
+
 def test_lock_inside_requires_python_stays_offline(capsys, fake_pypi, tmp_path):
     (tmp_path / "uv.lock").write_text(LOCK_312_ONLY, encoding="utf-8")
     code, _, err = run(capsys, str(tmp_path), "-p", "3.12", "-t", "linux-x86_64")

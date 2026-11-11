@@ -25,7 +25,7 @@ from packaging.utils import (
 )
 from packaging.version import InvalidVersion, Version
 
-from . import __version__
+from . import __version__, cache
 from .sources import Package, SourceError
 
 DEFAULT_INDEX = "https://pypi.org/pypi"
@@ -302,13 +302,16 @@ def _not_found(base: str, name: str, version: str | None) -> str:
     return "not on index"
 
 
-def fill(pkg: Package, python: str | None = None) -> Package:
+def fill(pkg: Package, python: str | None = None, read_cache: bool = False, write_cache: bool = False) -> Package:
     base = index_url()
     name = quote(pkg.key)
     pinned = bool(pkg.version)
     url = f"{base}/{name}/{quote(pkg.version or '')}/json" if pinned else f"{base}/{name}/json"
+    # Only a pinned release is cached: the latest release, or a range's pick, can change at any upload.
+    key = (base, pkg.key, pkg.version) if pkg.version else None
+    cached = cache.load_files(*key) if key and read_cache else None
     try:
-        data = fetch_json(url)
+        data = {"urls": cached} if cached is not None else fetch_json(url)
     except urllib.error.HTTPError as e:
         pkg.error = _not_found(base, name, pkg.version) if e.code == 404 else f"HTTP {e.code}"
         return pkg
@@ -339,6 +342,10 @@ def fill(pkg: Package, python: str | None = None) -> Package:
         else:
             names = [u["filename"] for u in urls if not u.get("yanked")]
         pkg.files = names
+        # Only a fresh answer that parsed and listed its files: a body with no "urls" ({}) reads as no files,
+        # and caching that would turn a bad response into a day of false "missing" answers.
+        if key and write_cache and cached is None and isinstance(data.get("urls"), list):
+            cache.save_files(*key, urls)
     except (ValueError, TypeError, KeyError, AttributeError):
         pkg.error = "unexpected response from the index"
     return pkg
@@ -357,7 +364,9 @@ def keeps_locked_files(p: Package) -> bool:
     return not p.skip and p.files is not None and not is_pypi(p.registry)
 
 
-def recheck_lock(packages: list[Package], simple_index: str | None = None) -> tuple[int, int]:
+def recheck_lock(
+    packages: list[Package], simple_index: str | None = None, read_cache: bool = False, write_cache: bool = False
+) -> tuple[int, int]:
     """Add the index's files to lockfile packages whose lock may be missing some (see pythons_outside_lock).
 
     Only packages the lock says came from PyPI are looked up. The lock's own files are kept, and a package
@@ -366,7 +375,7 @@ def recheck_lock(packages: list[Package], simple_index: str | None = None) -> tu
     locked = [p for p in packages if not p.skip and p.files is not None and p.version]  # pinned: same release
     todo = [p for p in locked if is_pypi(p.registry)]
     saved = [p.files or [] for p in todo]
-    fill_all(todo, refresh=True, simple_index=simple_index)
+    fill_all(todo, refresh=True, simple_index=simple_index, read_cache=read_cache, write_cache=write_cache)
     failed = 0
     for p, lock in zip(todo, saved, strict=True):
         if p.error:
@@ -383,13 +392,17 @@ def fill_all(
     workers: int = 16,
     python: str | None = None,
     simple_index: str | None = None,
+    read_cache: bool = False,
+    write_cache: bool = False,
 ) -> int:
     """Look packages up on PyPI. A package the lock says came from another index is never looked up: PyPI doesn't
     know it. With refresh (--online) it keeps its locked files; with no files (an old poetry.lock) it is skipped as
     a private index. `python` limits range resolution to releases supporting that interpreter.
     With `simple_index` (--index-url), lookups go to that PEP 691 simple index instead of PyPI's JSON API.
+    `read_cache` and `write_cache` read pinned JSON API lookups from, and save them to, the on-disk cache (see
+    cache.py); simple-index lookups never use it.
     Returns how many kept their locked files for that reason."""
-    fn = partial(fill, python=python)
+    fn = partial(fill, python=python, read_cache=read_cache, write_cache=write_cache)
     if simple_index is not None:
         base, auth = split_credentials(simple_index)  # validate first: a bad URL fails before any lookup
         fn = partial(fill_simple, base=base, auth=auth, python=python)
