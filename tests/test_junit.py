@@ -198,3 +198,18 @@ def test_junit_suite_names_include_the_python_when_there_are_several():
     assert [s.get("name") for s in suites] == ["3.13 linux-x86_64", "3.14t linux-x86_64"]
     # classname matches the suite, so dashboards keep the two Pythons apart.
     assert [s.find("testcase").get("classname") for s in suites] == ["3.13 linux-x86_64", "3.14t linux-x86_64"]
+
+
+def test_junit_ignored_target_is_skipped_not_failed(capsys, fixtures, tmp_path):
+    report = tmp_path / "report.xml"
+    args = [str(fixtures / "armgap"), "-p", "3.13", "-t", "linux-aarch64,musl-aarch64", "--junit", str(report)]
+    code, _, err = run(capsys, *args, "--ignore", "armlib:musl-aarch64,newglibc:linux-aarch64")
+    assert code == 1, err  # newglibc is still missing on musl-aarch64
+    suites = _suites(report)
+    musl = _case(suites["musl-aarch64"], "armlib")
+    assert musl.find("failure") is None
+    assert musl.find("skipped").get("message") == "ignored"
+    assert _case(suites["linux-aarch64"], "armlib").find("skipped") is None  # a wheel on an ignored target passes
+    assert _case(suites["linux-aarch64"], "newglibc").find("skipped").get("message") == "ignored"
+    assert _case(suites["musl-aarch64"], "newglibc").find("failure").get("message") == "missing"
+    assert (suites["musl-aarch64"].get("failures"), suites["musl-aarch64"].get("skipped")) == ("1", "1")

@@ -56,6 +56,23 @@
             "description": "Package names excluded by --ignore or ignore = [...] in [tool.wheelgap].",
             "items": {"type": "string"}
         },
+        "ignored_targets": {
+            "type": "array",
+            "description": "Present from the release after 0.8.0 on (older versions don't write it): packages ignored on some targets only, by --ignore NAME:TARGET or the same form in ignore = [...]. They stay in packages with their real results, but a gap on these platforms doesn't count towards with_gaps or the exit code. Lists only checked platforms, and no package that is also in ignored.",
+            "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "platforms"],
+                "properties": {
+                    "name": {"type": "string", "description": "Package name as written in the input."},
+                    "platforms": {
+                        "type": "array",
+                        "description": "Platform names (as in targets[].platform), for every Python checked on them.",
+                        "items": {"type": "string"}
+                    }
+                }
+            }
+        },
         "summary": {
             "type": "object",
             "additionalProperties": false,
@@ -65,11 +82,11 @@
                 "with_gaps": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "Packages whose results include source, missing or unknown."
+                    "description": "Packages whose results include source, missing or unknown, not counting the platforms in ignored_targets."
                 },
                 "per_target": {
                     "type": "object",
-                    "description": "Gap counts for every checked target, keyed by target label, with zeros for a target without gaps (including when only one target is checked). Present from the release after 0.8.0 on; older versions leave it out.",
+                    "description": "Gap counts for every checked target, keyed by target label, with zeros for a target without gaps (including when only one target is checked). A package's cell on a platform ignored_targets lists for it isn't counted. Present from the release after 0.8.0 on; older versions leave it out.",
                     "additionalProperties": {
                         "type": "object",
                         "additionalProperties": false,
@@ -105,7 +122,7 @@
                 },
                 "rejected": {
                     "type": "object",
-                    "description": "Present with --explain: rejected wheels and reasons, keyed by target label, only for targets whose result is source or missing.",
+                    "description": "Present with --explain: rejected wheels and reasons, keyed by target label, only for targets whose result is source or missing and that ignored_targets doesn't list for this package.",
                     "additionalProperties": {
                         "type": "array",
                         "items": {

@@ -29,8 +29,9 @@ def junit_xml(rows: list[Row], targets: list[Target], fail_on: str) -> str:
     """One testsuite per target, one testcase per package.
 
     A cell is a failure when its status fails the run (`missing`, `unknown`,
-    and `source` unless `--fail-on missing`). `n/a` is skipped. Other statuses
-    (wheel, bundled, and source with `--fail-on missing`) are passes.
+    and `source` unless `--fail-on missing`). `n/a` is skipped, and so is a
+    cell that would fail on a target `--ignore NAME:TARGET` ignores. Other
+    statuses (wheel, bundled, and source with `--fail-on missing`) are passes.
 
     Dashboards key a test on classname + name, so each name appears once per
     suite: a package locked at several versions gets the version in its name,
@@ -60,6 +61,8 @@ def junit_xml(rows: list[Row], targets: list[Target], fail_on: str) -> str:
                 names[ident] = name
             if status is Status.NOT_NEEDED:
                 cell: tuple[str | None, str | None] = (None, "n/a")
+            elif _cell_fails(status, fail_on) and target in row.ignored:
+                cell = (None, "ignored")  # --ignore NAME:TARGET: accepted, so not a failure
             elif _cell_fails(status, fail_on):
                 cell = (status.value, None)
             else:

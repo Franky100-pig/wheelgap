@@ -1397,6 +1397,278 @@ def test_ignore_config_rejects_invalid_types(capsys, fixtures, tmp_path, value):
     assert "[tool.wheelgap] ignore must be a list of strings" in err
 
 
+# #142: --ignore NAME:TARGET. In armgap, armlib builds from source on musl-aarch64 only; newglibc is missing everywhere.
+ARMGAP_TWO = ("-p", "3.13", "-t", "linux-aarch64,musl-aarch64")
+
+
+@pytest.mark.parametrize("target", ["musl-aarch64", "alpine-arm64", "MUSL_ARM64"])
+def test_ignore_on_one_target_text(capsys, fixtures, target):
+    args = (str(fixtures / "armgap"), *ARMGAP_TWO, "--color", "never", "--all", "--explain")
+    code, out, err = run(capsys, *args, "--ignore", f"ArmLib:{target},newglibc")
+    assert code == 0 and not err
+    assert "ignored: armlib (musl-aarch64), newglibc" in out
+    assert "● source (ignored)" in out  # the cell is still shown, marked as accepted
+    assert "armlib 1.4.0 on" not in out  # and not explained as a gap
+    # A clean run that only passes because of the ignore doesn't claim a wheel everywhere.
+    assert "✓ The 1 package has a wheel for every one of 2 targets, apart from 1 ignored gap." in out
+
+
+def test_ignore_on_one_target_keeps_other_targets(capsys, fixtures):
+    args = (str(fixtures / "armgap"), *ARMGAP_TWO, "--color", "never", "--explain")
+    code, out, err = run(capsys, *args, "--ignore", "newglibc:musl-aarch64")
+    assert code == 1 and not err
+    assert "ignored: newglibc (musl-aarch64)" in out
+    # Per-target counts leave the ignored cell out; newglibc still counts on linux-aarch64.
+    assert "linux-aarch64  1 missing\n" in out
+    assert "musl-aarch64   1 from source\n" in out
+    assert "2 of 2 packages have gaps: 1 will build from source, 1 can't install at all." in out
+    assert "newglibc 2.0 on linux-aarch64:" in out
+    assert "newglibc 2.0 on musl-aarch64:" not in out
+    assert "armlib 1.4.0 on musl-aarch64:" in out
+    # Markdown and --json count per target the same way.
+    code, out, _ = run(capsys, str(fixtures / "armgap"), *ARMGAP_TWO, "--markdown", "--ignore", "newglibc:musl-aarch64")
+    assert code == 1
+    assert "- linux-aarch64: 1 missing\n- musl-aarch64: 1 from source\n" in out
+    code, out, _ = run(capsys, str(fixtures / "armgap"), *ARMGAP_TWO, "--json", "--ignore", "newglibc:musl-aarch64")
+    assert json.loads(out)["summary"]["per_target"] == {
+        "linux-aarch64": {"source": 0, "missing": 1, "unknown": 0},
+        "musl-aarch64": {"source": 1, "missing": 0, "unknown": 0},
+    }
+
+
+def test_ignore_on_one_target_json(capsys, fixtures):
+    args = (str(fixtures / "armgap"), *ARMGAP_TWO, "--json", "--explain")
+    code, out, err = run(capsys, *args, "--ignore", "armlib:musl-aarch64,newglibc:linux-aarch64")
+    assert code == 1 and not err
+    data = json.loads(out)
+    _assert_matches_output_schema(data)
+    assert data["ignored"] == []  # still whole-package names only
+    assert data["ignored_targets"] == [
+        {"name": "armlib", "platforms": ["musl-aarch64"]},
+        {"name": "newglibc", "platforms": ["linux-aarch64"]},
+    ]
+    packages = {p["name"]: p for p in data["packages"]}
+    assert packages["armlib"]["results"] == {"linux-aarch64": "wheel", "musl-aarch64": "source"}  # real statuses
+    assert packages["armlib"]["rejected"] == {}
+    assert list(packages["newglibc"]["rejected"]) == ["musl-aarch64"]
+    assert data["summary"] == {
+        "packages": 2,
+        "with_gaps": 1,
+        # Only newglibc's musl cell counts: armlib's musl source build and newglibc on linux-aarch64 are ignored.
+        "per_target": {
+            "linux-aarch64": {"source": 0, "missing": 0, "unknown": 0},
+            "musl-aarch64": {"source": 0, "missing": 1, "unknown": 0},
+        },
+    }
+
+
+def test_ignore_on_one_target_markdown(capsys, fixtures):
+    args = (str(fixtures / "armgap"), *ARMGAP_TWO, "--markdown", "--all", "--explain")
+    code, out, err = run(capsys, *args, "--ignore", "armlib:musl-aarch64,NewGlibc")
+    assert code == 0 and not err
+    assert "Ignored: `armlib` (musl-aarch64), `newglibc`" in out
+    assert "| armlib | 1.4.0 | ✓ | ● source (ignored) |" in out
+    assert out.startswith("### wheelgap: every package has a wheel for all 2 targets, apart from 1 ignored gap\n")
+    assert "Why (rejected wheels)" not in out
+
+
+@pytest.mark.parametrize("output", ["--markdown", "--color=never"])
+def test_ignore_on_one_target_hidden_and_clean_lines(capsys, fixtures, output):
+    # newglibc's gaps (missing on both targets) are ignored where it's checked; armlib's musl gap still counts.
+    args = (str(fixtures / "armgap"), *ARMGAP_TWO, output, "--ignore", "newglibc:linux-aarch64,newglibc:musl-aarch64")
+    code, out, err = run(capsys, *args)
+    assert code == 1 and not err
+    assert "1 package with only ignored gaps hidden" in out
+    assert "with wheels for every target" not in out
+    # Both gaps ignored and no --all: nothing is hidden as wheel-only, and the clean line says what was ignored.
+    code, out, err = run(capsys, *args[:-1], "newglibc:all,armlib:musl-aarch64")
+    assert code == 0 and not err
+    if output == "--markdown":
+        assert "### wheelgap: every package has a wheel for all 2 targets, apart from 3 ignored gaps\n" in out
+    else:
+        assert "✓ All 2 packages have a wheel for every one of 2 targets, apart from 3 ignored gaps." in out
+
+
+def test_ignored_missing_with_counted_source_passes_fail_on_missing(capsys, fixtures):
+    # puresdist and nativeext build from source on Linux (counted) and are missing on iOS (ignored), so
+    # --fail-on missing passes and the summary names only the source builds. purewheel has a wheel on iOS.
+    ignore = "puresdist:ios-arm64,nativeext:ios-arm64,fastlib:ios-arm64,purewheel:ios-arm64"
+    args = (str(fixtures / "uvproj"), "-p", "3.13", "-t", "linux-x86_64,ios-arm64", "--color", "never", "--all")
+    code, out, err = run(capsys, *args, "--ignore", ignore, "--fail-on", "missing")
+    assert code == 0, err
+    assert "2 of 5 packages have gaps: 2 will build from source." in out
+    assert "can't install" not in out
+    assert "Source builds are allowed (--fail-on missing), so this run passes." in out
+    assert "purewheel  3.1      ✓             ✓\n" in out  # a wheel on an ignored target isn't marked
+    assert "puresdist  1.0      ● source      ✗ missing (ignored)\n" in out
+
+
+def test_cell_marks_only_ignored_gaps():
+    from wheelgap.check import Row
+    from wheelgap.sources import Package
+    from wheelgap.targets import build_targets
+
+    lin, ios = build_targets(["3.13"], ["linux-x86_64", "ios-arm64"])
+    row = Row(Package("a", "1"), {lin: Status.UNKNOWN, ios: Status.UNKNOWN}, ignored=frozenset({ios}))
+    assert cli.cell(row, ios) == ("? unknown (ignored)", "dim")
+    assert cli.cell(row, lin) == ("? unknown", "dim")
+    row = Row(Package("a", "1"), {lin: Status.SOURCE, ios: Status.WHEEL}, ignored=frozenset({ios}))
+    assert cli.cell(row, ios) == ("✓", "green")
+    assert cli.cell(row, lin) == ("● source", "yellow")
+
+
+def test_hidden_line_counts_wheels_and_ignored_gaps_apart():
+    from wheelgap.check import Row
+    from wheelgap.sources import Package
+    from wheelgap.targets import build_targets
+
+    lin, musl = build_targets(["3.13"], ["linux-aarch64", "musl-aarch64"])
+    clean = Row(Package("a", "1"), {lin: Status.WHEEL, musl: Status.WHEEL})
+    accepted = Row(Package("b", "1"), {lin: Status.WHEEL, musl: Status.SOURCE}, ignored=frozenset({musl}))
+    wheel_on_ignored = Row(Package("c", "1"), {lin: Status.WHEEL, musl: Status.WHEEL}, ignored=frozenset({musl}))
+    assert cli.hidden_line([clean]) == "1 package with wheels for every target hidden"
+    assert cli.hidden_line([clean, wheel_on_ignored]) == "2 packages with wheels for every target hidden"
+    assert cli.hidden_line([accepted, accepted]) == "2 packages with only ignored gaps hidden"
+    assert cli.hidden_line([clean, clean, accepted]) == (
+        "2 packages with wheels for every target and 1 with only ignored gaps hidden"
+    )
+
+
+def test_ignore_on_one_target_quiet(capsys, fixtures):
+    args = (str(fixtures / "armgap"), *ARMGAP_TWO, "-q", "--color", "never")
+    assert run(capsys, *args, "--ignore", "armlib:musl-aarch64,newglibc") == (
+        0,
+        "ignored: armlib (musl-aarch64), newglibc\n",
+        "",
+    )
+    code, out, err = run(capsys, *args, "--ignore", "armlib:linux-aarch64,newglibc")
+    assert code == 1 and not err
+    assert out.splitlines() == [
+        "1 of 1 package has gaps: 1 will build from source.",
+        "gaps: armlib",
+        "ignored: armlib (linux-aarch64), newglibc",
+    ]
+
+
+@pytest.mark.parametrize(
+    "extra, code",
+    [
+        (("-t", "linux-aarch64", "--ignore", "newglibc:linux-aarch64"), 0),
+        (("-t", "linux-aarch64", "--ignore", "newglibc:linux/arm64"), 0),  # a Docker platform name, as -t takes
+        (("-t", "linux-aarch64,musl-aarch64", "--ignore", "newglibc:linux-aarch64"), 1),
+        (("-t", "linux-aarch64,musl-aarch64", "--ignore", "newglibc:linux-aarch64", "--fail-on", "missing"), 1),
+        (("-t", "linux-aarch64,musl-aarch64", "--ignore", "newglibc:linux-aarch64", "--exit-zero"), 0),
+        (("-t", "linux-aarch64,musl-aarch64", "--ignore", "newglibc:all"), 1),  # armlib still builds from source
+        (("-t", "linux-aarch64,musl-aarch64", "--ignore", "newglibc:all", "--fail-on", "missing"), 0),
+        (("-t", "linux-aarch64,musl-aarch64", "--ignore", "newglibc:all,armlib:musl"), 1),  # musl-x86_64
+        (("-t", "linux-aarch64", "--ignore", "newglibc:musl-aarch64"), 1),
+        # A platform is ignored for every Python checked on it.
+        (("-p", "3.14", "-t", "musl-aarch64", "--ignore", "newglibc,armlib:musl-aarch64"), 0),
+        # A plain name still wins over a per-target entry for the same package.
+        (("-t", "linux-aarch64,musl-aarch64", "--ignore", "newglibc:linux-aarch64,newglibc,armlib:musl-aarch64"), 0),
+    ],
+)
+def test_ignore_on_one_target_exit_code(capsys, fixtures, extra, code):
+    assert run(capsys, str(fixtures / "armgap"), "-p", "3.13", *extra, "--json")[0] == code
+
+
+def test_ignore_on_one_target_config_matches_cli(capsys, fixtures, tmp_path):
+    (tmp_path / "uv.lock").write_bytes((fixtures / "armgap" / "uv.lock").read_bytes())
+    args = (str(tmp_path), *ARMGAP_TWO, "--json")
+    expected = run(capsys, *args, "--ignore", "armlib:musl-aarch64,newglibc")
+    (tmp_path / "pyproject.toml").write_text('[tool.wheelgap]\nignore = ["armlib:musl-aarch64", "newglibc"]\n')
+    assert run(capsys, *args) == expected
+    assert expected[0] == 0 and json.loads(expected[1])["ignored_targets"] == [
+        {"name": "armlib", "platforms": ["musl-aarch64"]}
+    ]
+
+
+@pytest.mark.parametrize(
+    "value, message",
+    [
+        ("armlib:linux-aarch46", "--ignore 'armlib:linux-aarch46': unknown target 'linux-aarch46'; did you mean"),
+        ("armlib:", "--ignore 'armlib:': expected NAME or NAME:TARGET"),
+        (":musl-aarch64", "--ignore ':musl-aarch64': expected NAME or NAME:TARGET"),
+    ],
+)
+@pytest.mark.parametrize("output", ["--color=never", "--json"])
+def test_ignore_unknown_target_is_an_error(capsys, fixtures, value, message, output):
+    code, out, err = run(capsys, str(fixtures / "armgap"), *ARMGAP_TWO, "--ignore", value, output)
+    assert code == 2
+    assert f"wheelgap: error: {message}" in err
+    if output == "--json":
+        assert json.loads(out)["error"]["type"] == "TargetError"
+    else:
+        assert not out
+
+
+@pytest.mark.parametrize(
+    "value, entry",
+    [
+        ("psycopg2:linux,musl", "musl"),
+        ("armlib:linux-aarch64, MUSL-ARM64", "MUSL-ARM64"),
+        ("armlib:linux-aarch64,newglibc,linux/amd64", "linux/amd64"),
+        ("armlib:linux-aarch64,all", "all"),
+    ],
+)
+def test_ignore_second_target_after_comma_is_an_error(capsys, fixtures, tmp_path, value, entry):
+    # Split on commas first, the last entry would be a plain package name: ignored everywhere, silently.
+    code, out, err = run(capsys, str(fixtures / "armgap"), *ARMGAP_TWO, "--ignore", value)
+    assert code == 2 and not out
+    assert f"wheelgap: error: --ignore {value!r}: {entry!r} is a target, but each NAME:TARGET takes one target" in err
+    (tmp_path / "uv.lock").write_bytes((fixtures / "armgap" / "uv.lock").read_bytes())
+    (tmp_path / "pyproject.toml").write_text(f"[tool.wheelgap]\nignore = [{json.dumps(value)}]\n")
+    code, _, err = run(capsys, str(tmp_path), *ARMGAP_TWO)
+    assert code == 2 and f"ignore in [tool.wheelgap] {value!r}: {entry!r} is a target" in err
+
+
+@pytest.mark.parametrize(
+    "ignore",
+    [
+        ("musl-aarch64,newglibc:linux-aarch64",),  # a target-like name before any NAME:TARGET is a package name
+        ("newglibc:linux-aarch64", "musl-aarch64"),  # and so is one in its own --ignore value
+        ("newglibc:linux-aarch64,armlib",),  # a package name after NAME:TARGET is fine
+    ],
+)
+def test_ignore_target_like_names_outside_a_target_list(capsys, fixtures, ignore):
+    args = [str(fixtures / "armgap"), *ARMGAP_TWO, "--json"]
+    for value in ignore:
+        args += ["--ignore", value]
+    code, out, err = run(capsys, *args)
+    assert code in (0, 1) and "error" not in json.loads(out)
+
+
+def test_ignore_unknown_target_in_config_is_an_error(capsys, fixtures, tmp_path):
+    (tmp_path / "uv.lock").write_bytes((fixtures / "armgap" / "uv.lock").read_bytes())
+    (tmp_path / "pyproject.toml").write_text('[tool.wheelgap]\nignore = ["armlib:solaris"]\n')
+    code, out, err = run(capsys, str(tmp_path), *ARMGAP_TWO)
+    assert code == 2 and not out
+    assert "wheelgap: error: ignore in [tool.wheelgap] 'armlib:solaris': unknown target 'solaris'" in err
+
+
+def test_ignore_unchecked_target_prints_note(capsys, fixtures):
+    args = (str(fixtures / "armgap"), *ARMGAP_TWO, "--json")
+    plain = run(capsys, *args)
+    code, out, err = run(capsys, *args, "--ignore", "armlib:win-amd64,nosuchpkg:musl-aarch64")
+    assert (code, out) == plain[:2]  # nothing on the checked targets is ignored, so nothing is reported
+    assert json.loads(out)["ignored_targets"] == []
+    assert "wheelgap: note: --ignore matches no package: nosuchpkg:musl-aarch64\n" in err
+    assert "wheelgap: note: --ignore matches no checked target: armlib:win-amd64\n" in err
+    _, _, err = run(capsys, *args, "--ignore", "armlib:win-amd64", "-q")
+    assert err == ""
+
+
+def test_ignore_on_one_target_with_alpine_dockerfile(capsys, fixtures, tmp_path):
+    (tmp_path / "uv.lock").write_bytes((fixtures / "armgap" / "uv.lock").read_bytes())
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM --platform=linux/arm64 python:3.13-alpine\n")
+    # With an Alpine image, linux/arm64 means musl-aarch64, for -t and for --ignore alike.
+    args = (str(tmp_path), "--dockerfile", str(dockerfile), "--json")
+    code, out, err = run(capsys, *args, "--ignore", "armlib:linux/arm64,newglibc")
+    assert code == 0 and not err
+    assert json.loads(out)["ignored_targets"] == [{"name": "armlib", "platforms": ["musl-aarch64"]}]
+
+
 # #114: a uv.lock package the lock says came from a private index, whose only locked wheel is a Windows one.
 PRIVATE_UV_LOCK = (
     'version = 1\nrequires-python = ">=3.12"\n\n'
@@ -1654,7 +1926,7 @@ def _assert_matches_output_schema(data):
     statuses = set(schema["$defs"]["status"]["enum"])
     assert statuses == {s.value for s in Status}
     assert isinstance(data, dict)
-    for key in ("version", "sources", "targets", "packages", "skipped", "ignored", "summary"):
+    for key in ("version", "sources", "targets", "packages", "skipped", "ignored", "ignored_targets", "summary"):
         assert key in data
     assert isinstance(data["version"], str) and data["version"]
     assert isinstance(data["sources"], list) and all(isinstance(s, str) for s in data["sources"])
@@ -1664,6 +1936,12 @@ def _assert_matches_output_schema(data):
         assert set(t) == {"label", "python", "platform"}
         assert all(isinstance(t[k], str) and t[k] for k in t)
         labels.append(t["label"])
+    ignored_on = {}
+    for item in data["ignored_targets"]:
+        assert set(item) == {"name", "platforms"} and item["platforms"]
+        assert item["name"] not in data["ignored"]
+        assert set(item["platforms"]) <= {t["platform"] for t in data["targets"]}
+        ignored_on[item["name"]] = {t["label"] for t in data["targets"] if t["platform"] in item["platforms"]}
     assert len(labels) == len(set(labels))
     for pkg in data["packages"]:
         assert {"name", "version", "error", "results"} <= set(pkg)
@@ -1702,15 +1980,25 @@ def _assert_matches_output_schema(data):
     assert set(summary) == {"packages", "with_gaps", "per_target"}
     assert summary["packages"] == len(data["packages"])
     assert isinstance(summary["with_gaps"], int) and 0 <= summary["with_gaps"] <= summary["packages"]
-    # with_gaps counts packages that are not all wheel/n/a/bundled
+    # with_gaps counts packages that are not all wheel/n/a/bundled, leaving out the targets ignored for them
     expected = sum(
-        1 for pkg in data["packages"] if any(s in {"source", "missing", "unknown"} for s in pkg["results"].values())
+        1
+        for pkg in data["packages"]
+        if any(
+            s in {"source", "missing", "unknown"}
+            for label, s in pkg["results"].items()
+            if label not in ignored_on.get(pkg["name"], set())
+        )
     )
     assert summary["with_gaps"] == expected
-    # per_target counts each target's gap cells, for every target (zeros included)
+    # per_target counts each target's gap cells, for every target (zeros included), leaving out ignored cells
     assert summary["per_target"] == {
         label: {
-            s: sum(pkg["results"][label] == s for pkg in data["packages"]) for s in ("source", "missing", "unknown")
+            s: sum(
+                pkg["results"][label] == s and label not in ignored_on.get(pkg["name"], set())
+                for pkg in data["packages"]
+            )
+            for s in ("source", "missing", "unknown")
         }
         for label in labels
     }
@@ -1724,6 +2012,8 @@ def test_json_output_matches_schema(capsys, fixtures):
         [str(fixtures / "uvproj"), "-p", "3.13,3.14t", "-t", "win-amd64", "--json"],
         [str(fixtures / "armgap"), "-p", "3.13", "-t", "musl-aarch64", "--json", "--explain"],
         [str(fixtures / "uvproj"), "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--json", "--ignore", "winonly"],
+        [str(fixtures / "armgap"), "-p", "3.13,3.14", "-t", "linux-aarch64,musl-aarch64", "--json", "--explain"]
+        + ["--ignore", "armlib:musl-aarch64,newglibc:linux-aarch64"],
     ]
     for args in cases:
         code, out, err = run(capsys, *args)
@@ -1733,7 +2023,7 @@ def test_json_output_matches_schema(capsys, fixtures):
         _assert_matches_output_schema(data)
         if "--explain" in args:
             assert all("rejected" in pkg and "via" in pkg for pkg in data["packages"])
-        if "--ignore" in args:
+        if "winonly" in args:
             assert "winonly" in data["ignored"]
             assert all(pkg["name"] != "winonly" for pkg in data["packages"])
 
@@ -1758,11 +2048,14 @@ def test_output_schema_rejects_other_shapes():
         "packages": [package],
         "skipped": [],
         "ignored": [],
+        "ignored_targets": [{"name": "x", "platforms": ["linux-x86_64"]}],
         "summary": {"packages": 1, "with_gaps": 0, "per_target": {}},
     }
     _check_schema(good, schema, schema)
-    # Released versions (0.8.0 and older) have no per_target, and the schema on main must still accept their output.
+    # Released versions (0.8.0 and older) have no per_target or ignored_targets, and the schema on main must still
+    # accept their output.
     _check_schema(good | {"summary": {"packages": 1, "with_gaps": 0}}, schema, schema)
+    _check_schema({k: v for k, v in good.items() if k != "ignored_targets"}, schema, schema)
     _check_schema(
         good | {"summary": good["summary"] | {"per_target": {"win-arm64": {"source": 1, "missing": 0, "unknown": 0}}}},
         schema,
@@ -1775,6 +2068,8 @@ def test_output_schema_rejects_other_shapes():
         good | {"packages": [package | {"bundled": {}}]},  # the bundled version is a string
         good | {"summary": {"packages": True, "with_gaps": 0, "per_target": {}}},  # not an integer
         good | {"summary": good["summary"] | {"per_target": {"win-arm64": {"source": 1}}}},  # every count is there
+        good | {"ignored_targets": [{"name": "x", "platforms": "linux-x86_64"}]},  # platforms is a list
+        good | {"ignored": [{"name": "x", "platforms": ["linux-x86_64"]}]},  # ignored stays a list of names
     ):
         with pytest.raises(AssertionError):
             _check_schema(bad, schema, schema)
