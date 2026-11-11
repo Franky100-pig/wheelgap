@@ -344,7 +344,7 @@ def test_extra_linux_arches(arch):
     assert not accepts(glibc, f"x-1-cp313-cp313-musllinux_1_2_{arch}.whl")
     assert accepts(musl, f"x-1-cp313-cp313-musllinux_1_2_{arch}.whl")
     assert not accepts(musl, "x-1-cp313-cp313-musllinux_1_2_aarch64.whl")
-    if arch == "i686":  # depends on the host, not the image: see test_platform_machine_is_unknown_on_32bit_x86
+    if arch in ("i686", "armv7l"):  # depends on the host: see test_platform_machine_is_unknown_on_32bit_x86 / _arm
         assert glibc.unknown_markers == musl.unknown_markers == {"platform_machine"}
     else:
         assert glibc.marker_env["platform_machine"] == arch

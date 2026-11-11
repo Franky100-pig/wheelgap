@@ -260,7 +260,7 @@ _marker_cache: dict[str, Marker | None] = {}
 # that installs. A comparison on one of them is "unknown", combined with the known parts in three-valued
 # logic: "sys_platform != 'darwin' and extra == 'cpu'" is unknown on Linux (so the package counts) and
 # false on macOS (so it doesn't). Only a definite False hides a package. Target.unknown_markers adds
-# platform_machine on 32-bit x86, where it depends on the machine rather than the Python.
+# platform_machine on 32-bit x86 and Arm, where it depends on the machine rather than the Python.
 _UNKNOWABLE = frozenset({"extra", "extras", "dependency_groups", "platform_release", "platform_version"})
 _atom_cache: dict[tuple[str, Target], bool | None] = {}
 

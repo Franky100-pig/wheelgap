@@ -223,6 +223,21 @@ def test_platform_machine_is_unknown_on_32bit_x86():
     assert not marker_holds("platform_machine == 'x86'", amd64)
 
 
+def test_platform_machine_is_unknown_on_32bit_arm():
+    glibc, musl = build_targets(["3.13"], ["linux-armv7l", "musl-armv7l"])
+    # Raspberry Pi OS 32-bit on a 64-bit kernel, or a linux/arm/v7 container on an arm64 host, reports aarch64.
+    assert marker_holds('platform_machine == "aarch64"', glibc) and marker_holds('platform_machine == "aarch64"', musl)
+    assert marker_holds("platform_machine == 'armv7l'", glibc)
+    # The rest of the marker still decides.
+    assert not marker_holds("sys_platform == 'win32' and platform_machine == 'aarch64'", glibc)
+    assert not marker_holds("sys_platform == 'win32' and platform_machine == 'aarch64'", musl)
+    # 64-bit-only userlands keep their own value.
+    ppc, s390x = build_targets(["3.13"], ["linux-ppc64le", "linux-s390x"])
+    assert not marker_holds("platform_machine == 'aarch64'", ppc) and not marker_holds(
+        "platform_machine == 'x86_64'", s390x
+    )
+
+
 def test_more_sdist_formats():
     (t,) = build_targets(["3.13"], ["linux-x86_64"])
     assert status_for(["foo-1.0.tar"], t) is Status.SOURCE
