@@ -200,6 +200,18 @@ def check_lockfile(
     online=True and offline=True cannot be combined.
     pyodide_locks work as in check_packages(), and are checked before the lockfile is read.
     """
+    return _check_lockfile(path, targets, online=online, offline=offline, pyodide_locks=pyodide_locks)[0]
+
+
+def _check_lockfile(
+    path: str | Path,
+    targets: Sequence[Target] | None,
+    *,
+    online: bool,
+    offline: bool,
+    pyodide_locks: Iterable[PyodideLock] = (),
+) -> tuple[list[Result], Source]:
+    """check_lockfile(), also returning the loaded source (diff.py needs its skipped packages)."""
     targets = _package_targets(targets)
     pyodide_locks = tuple(pyodide_locks)
     if online and offline:
@@ -213,4 +225,4 @@ def check_lockfile(
     if not online and not offline and pythons_outside_lock(source, targets):
         recheck_lock(source.packages)
     rows: list[Row] = [r for r in check([source], targets) if r.needed]
-    return [_result(r.package, dict(r.results), pyodide_locks) for r in rows]
+    return [_result(r.package, dict(r.results), pyodide_locks) for r in rows], source

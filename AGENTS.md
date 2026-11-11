@@ -37,6 +37,7 @@ uv run --group dev pytest
 | `offline.py` | `--offline`, `offline = true` and `check_lockfile(..., offline=True)`: refuse inputs that would need an index lookup |
 | `pyodide.py` | `--pyodide-lock`: packages Pyodide ships itself |
 | `scan.py` | `python -m wheelgap.scan`: the data behind the [coverage tracker](https://wheelgap.github.io/tracker/) |
+| `diff.py` | `python -m wheelgap.diff OLD NEW`: packages that got worse between two lockfiles, and new packages with gaps |
 
 ## Tests
 

@@ -32,6 +32,17 @@ class Status(StrEnum):
     BUNDLED = "bundled"  # no wheel on the index, but Pyodide ships its own build (--pyodide-lock)
 
 
+# How each status is shown in text output, and its colour.
+CELL = {
+    Status.WHEEL: ("✓", "green"),
+    Status.SOURCE: ("● source", "yellow"),
+    Status.MISSING: ("✗ missing", "red"),
+    Status.UNKNOWN: ("? unknown", "dim"),
+    Status.NOT_NEEDED: ("–", "dim"),
+    Status.BUNDLED: ("✓ bundled", "green"),
+}
+
+
 # The archive formats pip accepts as source distributions.
 SDIST_SUFFIXES = (
     ".tar.gz",

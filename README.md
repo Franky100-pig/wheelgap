@@ -312,6 +312,14 @@ This checks the latest release of the most-downloaded packages (from [top-pypi-p
 
 Add `--pyodide-lock PATH_OR_URL` once per Pyodide release (each is for one Python) to count the packages Pyodide ships itself as `bundled` on that Python's `pyodide` target; the per-target `summary` counts them too, and `pyodide_locks` in the JSON lists the locks used. Pyodide targets with no lock get a note on stderr.
 
+### Comparing two lockfiles
+
+```bash
+python -m wheelgap.diff old/uv.lock uv.lock -p 3.13 -t linux-aarch64,musl-aarch64
+```
+
+This checks both lockfiles and lists the packages that got worse on a target (a wheel that became a source build, say) and the new packages with gaps, so a dependency bump that drops a platform fails CI. It exits 1 if there are any, 0 if not, and 2 on bad input. A package that can no longer be checked counts as worse: `unknown`, or now installed from git, a path, a URL or a private index (a new one of those counts as a new gap). Packages are matched by name, so a requirements-file path with no name (`./pkg`, or `-e ./pkg` without `#egg=`) shows up as a new package rather than as the one it replaced. The same `-p` and `-t` apply to both lockfiles, and `[tool.wheelgap]` and `.python-version` aren't read yet, so pass them explicitly. It's a module entry point for now; `wheelgap diff` will follow.
+
 ### With an AI coding agent
 
 wheelgap ships a **`check-wheels` skill** that teaches coding agents to run it, read its JSON and suggest fixes. It follows the open [Agent Skills](https://agentskills.io/) format.
