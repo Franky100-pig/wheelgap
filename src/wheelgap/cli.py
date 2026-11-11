@@ -39,6 +39,7 @@ from .sources import (
     UvSelection,
     load_inputs,
     pythons_outside_lock,
+    select_pyproject_extras,
     select_uv_dependencies,
     uv_selected_roots,
 )
@@ -119,7 +120,7 @@ def make_parser() -> argparse.ArgumentParser:
         metavar="INPUT",
         help=(
             "uv.lock, pylock.toml, poetry.lock, Pipfile.lock, requirements.txt, "
-            "a directory, or package specs (default: .)"
+            "pyproject.toml (direct dependencies), a directory, or package specs (default: .)"
         ),
     )
     p.add_argument(
@@ -166,8 +167,13 @@ def make_parser() -> argparse.ArgumentParser:
         metavar="PATH_OR_HTTPS_URL",
         help="a Pyodide release's pyodide-lock.json: packages Pyodide ships itself count as available on -t pyodide",
     )
-    p.add_argument("--extra", action="append", metavar="NAME", help="include a uv project extra (repeatable)")
-    p.add_argument("--all-extras", action="store_true", help="include every uv project extra")
+    p.add_argument(
+        "--extra",
+        action="append",
+        metavar="NAME",
+        help="include a uv project extra, or a pyproject.toml optional-dependencies group (repeatable)",
+    )
+    p.add_argument("--all-extras", action="store_true", help="include every uv project extra (or pyproject.toml extra)")
     p.add_argument("--group", action="append", metavar="NAME", help="include a uv dependency group (repeatable)")
     p.add_argument("--no-dev", action="store_true", help="exclude the default uv dev group")
     p.add_argument(
@@ -933,9 +939,23 @@ def main(argv: list[str] | None = None) -> int:
         if args.no_dev and args.group is None and group_names is not None:
             group_names = [name for name in group_names if canonicalize_name(name) != "dev"]
         from_cli = args.extra is not None or args.group is not None or args.all_extras or args.no_dev
-        if from_cli or args.only_group or extra_names is not None or group_names is not None:
+        # pyproject.toml inputs take --extra / --all-extras for [project] optional-dependencies. Configured
+        # extras stay uv.lock-only, and [dependency-groups] isn't read.
+        pyproject_sources = [s for s in sources if s.pyproject_extras is not None]
+        lock_sources = [s for s in sources if s.pyproject_extras is None]
+        if pyproject_sources:
+            if args.group is not None or args.only_group or args.no_dev:
+                raise SourceError(
+                    "--group, --only-group and --no-dev don't apply to pyproject.toml: "
+                    "[dependency-groups] isn't read, only [project] dependencies and --extra groups"
+                )
+            for source in pyproject_sources:
+                select_pyproject_extras(source, args.extra or [], args.all_extras)
+        if (from_cli or args.only_group or extra_names is not None or group_names is not None) and (
+            lock_sources or not pyproject_sources
+        ):
             select_uv_dependencies(
-                sources,
+                lock_sources,
                 UvSelection(
                     extras=frozenset(canonicalize_name(name) for name in extra_names or []),
                     all_extras=args.all_extras,
@@ -976,6 +996,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if not quiet:
         note_unpinned_requirements(sources)
+    for source in sources:
+        if source.pyproject_extras is not None:  # always: this answer differs from a lockfile's
+            print(
+                f"wheelgap: note: {source.label} lists direct dependencies only; "
+                "their own dependencies aren't checked (use a lockfile for that), and ranges were checked at "
+                "the newest matching release",
+                file=sys.stderr,
+            )
 
     needed_by_source = [selected_packages(source, targets) for source in sources]
     packages = [package for needed in needed_by_source for package in needed]

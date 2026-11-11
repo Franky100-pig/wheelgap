@@ -179,8 +179,8 @@ project extras are included only when requested. `--no-dev` removes `dev`, while
 excludes project dependencies and default groups. Combine `--only-group` with `--group` to add more
 groups, but not with `--extra`/`--all-extras`. An explicit `dev` group conflicts with `--no-dev`.
 Unknown extra/group names are errors. Command-line selectors need a `uv.lock` input, or for groups a Poetry 2.x
-`poetry.lock` (see below); configured `groups` apply to `uv.lock` and Poetry 2.x `poetry.lock` inputs, and
-configured `extras` only to `uv.lock` inputs.
+`poetry.lock`, or for `--extra`/`--all-extras` a `pyproject.toml` (see below); configured `groups` apply to
+`uv.lock` and Poetry 2.x `poetry.lock` inputs, and configured `extras` only to `uv.lock` inputs.
 
 `poetry.lock` (Poetry 2.x) inputs accept `--group`, `--only-group` and `--no-dev` with Poetry's meanings, and
 configured `groups` apply to them too. `main` and every group not marked `optional = true` in
@@ -207,8 +207,32 @@ including local workspace dependencies, rather than enabling every extra of ever
 Unresolved marker conditions (including uv's synthetic conflict markers and unknown OS releases)
 remain conservative: wheelgap can still report a possible gap rather than silently hide one.
 Selection itself needs no network. Index refreshes (`--online`, or a target outside the lockfile's
-`requires-python`) only look up packages in the selected graph. Configured `extras` and `groups` only apply to `uv.lock` inputs; other inputs
-are checked as usual.
+`requires-python`) only look up packages in the selected graph. Configured `extras` only apply to `uv.lock` inputs, and configured `groups` to `uv.lock` and Poetry 2.x
+`poetry.lock` inputs; other inputs are checked as usual.
+
+### Check a library's direct dependencies
+
+Libraries usually don't commit a lockfile. Pass the library's `pyproject.toml` to check the
+dependencies it declares in `[project] dependencies`:
+
+```bash
+wheelgap pyproject.toml -t win-arm64 -t pyodide
+# Add [project.optional-dependencies] groups
+wheelgap pyproject.toml --extra test
+wheelgap pyproject.toml --all-extras
+```
+
+Each requirement is read like a line of a requirements file, so ranges and bare names use the newest
+matching release and markers are respected. With several `-p` versions, that release isn't filtered by
+`Requires-Python` ([#84](https://github.com/wheelgap/wheelgap/issues/84)), so ranges and bare names can
+show false gaps. Only direct dependencies are checked: their own dependencies aren't, and wheelgap always
+prints a note saying so. Use a lockfile for the full picture.
+`[dependency-groups]` isn't read yet, so `--group`, `--only-group` and `--no-dev` are errors here, and a
+`dependencies` listed in `[project] dynamic` is an input error (exit 2), as are dynamic
+`optional-dependencies` with `--extra`/`--all-extras` and Poetry dependencies kept in
+`[tool.poetry.dependencies]` (check `poetry.lock` instead). `wheelgap .` in a directory with no lockfile
+doesn't switch to `pyproject.toml` on its own; the error suggests it. `check_lockfile()` and
+`python -m wheelgap.diff` don't read `pyproject.toml`.
 
 ### Targets
 
@@ -357,7 +381,7 @@ Contributing to wheelgap with an agent? See [AGENTS.md](https://github.com/wheel
 - **`Pipfile.lock`** reads `default`, `develop` and any custom package categories (such as `docs` or `tests`) and looks up distribution filenames on PyPI for their pinned versions. Environment markers are preserved; Git, path, file and editable dependencies are skipped as non-index packages. Packages pinned to an `index` that isn't PyPI are skipped too (`private index`), so their names aren't sent to pypi.org. A PyPI mirror counts as a private index here, since wheelgap can't tell it apart from an internal one, unless `WHEELGAP_INDEX_URL` points at the JSON API of that same index (for a source `https://mirror.example.com/simple`, set `WHEELGAP_INDEX_URL=https://mirror.example.com/pypi`): then those packages are looked up there, on the index the lock already names. It must be the same repository, not just the same host: `<repo>/simple` matches `<repo>/pypi` with the same scheme, host and port, so another repository on the same Artifactory or Nexus server stays skipped. The index has to serve PyPI's JSON API, including pinned versions (`<WHEELGAP_INDEX_URL>/<name>/<version>/json`); on a mirror that only serves the simple API, such as the Tsinghua or Aliyun mirrors, those packages come back as lookup errors like `not on index` instead. `--index-url` lookups don't use this.
 - **Environment markers are respected.** A `pywin32 ; sys_platform == 'win32'` dependency won't show up as a Linux gap. For `uv.lock` the dependency graph is walked per target, so transitive platform-specific packages are handled too. On `win32`, `linux-i686` and `musl-i686` a `platform_machine` comparison counts as unknown, so the package is still checked. `platform_machine` reports the machine, not the Python: 32-bit Python on 64-bit Windows says `AMD64` and a `linux/386` container on an x86_64 host says `x86_64`.
 - `--online` re-checks lockfile packages against PyPI. Packages the lock says came from another index keep their locked files, so their names are never sent to PyPI. Use it when a project has uploaded new wheels for an existing version since you locked, or if your `uv.lock` was generated with `environments` restrictions. A `uv.lock` or `pylock.toml` whose `requires-python` leaves out a target's Python (say `==3.13.*`, checked with `-p 3.14t`) may be missing wheels for it, because uv only keeps the wheels that can serve `requires-python`. Without `--online`, wheelgap then also looks up its PyPI packages on the index, keeps the lock's own files if a lookup fails, and prints a note (with `-q`, only when some packages couldn't be re-checked).
-- `--offline` never contacts an index, for CI and coding agents without network. Inputs that need a lookup (requirements files, `Pipfile.lock`, package names, lockfile entries with no file list) make it exit 2 with an error naming the packages, so use a lockfile instead. A `--pyodide-lock` URL is refused too: pass a downloaded copy. The `requires-python` re-check above is skipped, with a note that those Pythons may show false gaps. It can't be combined with `--online`. Set `offline = true` in `[tool.wheelgap]` to make it the project default; `--online` on the command line overrides it for one run.
+- `--offline` never contacts an index, for CI and coding agents without network. Inputs that need a lookup (requirements files, `pyproject.toml`, `Pipfile.lock`, package names, lockfile entries with no file list) make it exit 2 with an error naming the packages, so use a lockfile instead. A `--pyodide-lock` URL is refused too: pass a downloaded copy. The `requires-python` re-check above is skipped, with a note that those Pythons may show false gaps. It can't be combined with `--online`. Set `offline = true` in `[tool.wheelgap]` to make it the project default; `--online` on the command line overrides it for one run.
 - **Cache:** lookups of a pinned version (`name==1.2.3`) are saved for 24 hours, so a repeat run needn't ask PyPI again. They're kept in `wheelgap/pinned-v1` inside `~/.cache` on Linux (or `$XDG_CACHE_HOME`), `~/Library/Caches` on macOS and `%LOCALAPPDATA%` on Windows. Each entry holds only the release's file names and yanked flags, named by a hash of the index URL (without any credentials in it), the package and the version; on Linux and macOS, wheelgap creates the folder and its entries readable by you only. `--online` always asks the index again and saves the fresh answer, so later runs use it; `--no-cache` neither reads nor saves the cache for one run. Unpinned names, version ranges and `--index-url` lookups aren't cached, and neither are lookups from the Python API.
 - **Private indexes:** `--index-url URL` (or `index-url` in `[tool.wheelgap]`) sends the PyPI lookups described above to a simple index that serves the JSON form (PEP 691) instead. The URL must be https (plain http only for localhost). Credentials can go in the URL passed to `--index-url` (`https://user:token@host/simple`) and never appear in output; in CI, `--index-url "$PRIVATE_INDEX"` keeps them out of your repo. They're refused in `[tool.wheelgap]`, since `pyproject.toml` is committed. An index that only serves HTML (PEP 503) gets a clear error.
 

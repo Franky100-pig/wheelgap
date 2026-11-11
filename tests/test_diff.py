@@ -268,12 +268,14 @@ def test_worse(old, new, expected):
         (["{tmp}/missing.txt", "{new}"], "missing.txt"),
         (["{tmp}/empty", "{new}"], "no lockfile found"),
         (["{tmp}/notes.md", "{new}"], "SourceError: don't know how to read"),
+        (["{tmp}/pyproject.toml", "{new}"], "pyproject.toml: a pyproject.toml lists direct dependencies only"),
         (["{new}", "{new}", "-t", "linux-aarch46"], "TargetError: "),
         (["{new}", "{new}", "-p", "three"], "can't parse Python version"),
     ],
 )
 def test_diff_bad_input_exits_2(fake_pypi, tmp_path, capsys, args, message):
     (tmp_path / "notes.md").write_text("hi\n")
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\ndependencies = ["purewheel==3.1"]\n')
     (tmp_path / "empty").mkdir()
     new = tmp_path / "requirements.txt"
     new.write_text("purewheel==3.1\n")
