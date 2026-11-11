@@ -4,6 +4,7 @@ import pytest
 
 import wheelgap
 from wheelgap import Status
+from wheelgap.sources import SourceError
 
 
 def test_make_targets_takes_cli_style_names():
@@ -135,3 +136,34 @@ def test_check_lockfile_rechecks_a_lock_for_another_python(fake_pypi, tmp_path):
     (result,) = wheelgap.check_lockfile(tmp_path, targets)
     assert result.name == "fastlib" and result.statuses == {targets[0]: Status.WHEEL}
     assert fake_pypi == ["https://pypi.org/pypi/fastlib/2.0.0/json"]
+
+
+def test_check_lockfile_offline_uses_locked_files(fake_pypi, fixtures):
+    targets = wheelgap.make_targets(python="3.13", platforms="linux-x86_64")
+    results = wheelgap.check_lockfile(fixtures / "uvproj", targets, offline=True)
+    assert results
+    assert not fake_pypi
+
+
+def test_check_lockfile_offline_skips_other_python_recheck(fake_pypi, tmp_path):
+    (tmp_path / "uv.lock").write_text(LOCK_312_ONLY, encoding="utf-8")
+    targets = wheelgap.make_targets(python="3.13", platforms="linux-x86_64")
+    (result,) = wheelgap.check_lockfile(tmp_path, targets, offline=True)
+    assert result.statuses == {targets[0]: Status.SOURCE}
+    assert not fake_pypi
+
+
+@pytest.mark.parametrize("kind", ["requirements.txt", "poetry.lock"])
+def test_check_lockfile_offline_refuses_missing_files(fake_pypi, tmp_path, kind):
+    text = "purewheel==3.1\n" if kind == "requirements.txt" else ('[[package]]\nname = "purewheel"\nversion = "3.1"\n')
+    path = tmp_path / kind
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(SourceError, match="needs the index.*purewheel"):
+        wheelgap.check_lockfile(path, offline=True)
+    assert not fake_pypi
+
+
+def test_check_lockfile_rejects_online_and_offline_before_loading(fake_pypi, tmp_path):
+    with pytest.raises(ValueError, match="online.*offline"):
+        wheelgap.check_lockfile(tmp_path / "absent.lock", online=True, offline=True)
+    assert not fake_pypi

@@ -18,8 +18,9 @@ from .api import running_python
 from .check import Row, Status, check, explain, has_sdist, marker_holds, reachable
 from .dockerfile import DockerfileError, read_dockerfile
 from .junit import write_junit
+from .offline import require_offline, undo_offline
 from .pyodide import PyodideLock, PyodideLockError, apply_bundled, check_targets, load_pyodide_lock
-from .pypi import check_index_url, fill_all, is_pypi, keeps_locked_files, recheck_lock, split_credentials
+from .pypi import check_index_url, fill_all, keeps_locked_files, recheck_lock, split_credentials
 from .sources import (
     Package,
     Source,
@@ -676,32 +677,10 @@ def selected_packages(source: Source, targets: list[Target]) -> list[Package]:
     return [package for index, package in enumerate(source.packages) if index in selected]
 
 
-def _undo_offline(how: str) -> str:
-    """How to turn offline mode off: drop the flag, or override the config key for one run."""
-    return "drop --offline" if how == "--offline" else "pass --online for this run"
-
-
-def require_offline(sources: list[Source], how: str = "--offline") -> None:
-    """--offline: raise SourceError if an input has packages that can only be answered by looking them up."""
-    problems = []
-    for s in sources:
-        # A private-index package with no files is skipped by fill_all, not looked up, so it doesn't count.
-        need = [p.name for p in s.packages if not p.skip and not p.error and p.files is None and is_pypi(p.registry)]
-        if need:
-            names = ", ".join(need[:3]) + (", …" if len(need) > 3 else "")
-            problems.append(
-                f"{s.label} needs the index for {len(need)} package{'s' if len(need) != 1 else ''} ({names})"
-            )
-    if problems:
-        raise SourceError(
-            f"{how}: {'; '.join(problems)}; use a lockfile that lists each package's files, or {_undo_offline(how)}"
-        )
-
-
 def refuse_pyodide_url(spec: str, how: str = "--offline") -> None:
     """--offline: a pyodide-lock.json URL would be downloaded, so ask for a local copy instead."""
     if "://" in spec:
-        raise PyodideLockError(f"{how}: {spec} would be downloaded; save it and pass its path, or {_undo_offline(how)}")
+        raise PyodideLockError(f"{how}: {spec} would be downloaded; save it and pass its path, or {undo_offline(how)}")
 
 
 def main(argv: list[str] | None = None) -> int:

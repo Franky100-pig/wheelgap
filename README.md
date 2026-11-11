@@ -294,6 +294,8 @@ for r in wheelgap.check_lockfile("uv.lock", targets):  # markers and the uv grap
     print(r.name, r.version, [t.platform for t in r.gaps])
 ```
 
+`check_lockfile(..., offline=True)` never contacts an index: it raises `wheelgap.sources.SourceError` if an input has no locked file list and skips the re-check for Python versions outside the lock's `requires-python` (so those versions may show false gaps). It cannot be combined with `online=True`.
+
 `check_packages([...])` checks many packages in parallel, and `check_package(..., files=[...])` works offline from filenames you already have.
 
 ### Scanning the top PyPI packages

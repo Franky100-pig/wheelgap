@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .check import Row, Status, check, status_for, wheel_tags
+from .offline import require_offline
 from .pypi import fill_all, recheck_lock
 from .sources import Package, Source, find_lockfile, load_file, pythons_outside_lock
 from .targets import (
@@ -148,18 +149,26 @@ def check_lockfile(
     targets: Sequence[Target] | None = None,
     *,
     online: bool = False,
+    offline: bool = False,
 ) -> list[Result]:
     """Check every package a lockfile (or a project directory) installs on at least one target.
 
     Environment markers and the uv.lock dependency graph are respected, as in the CLI. A uv.lock whose
     requires-python leaves out a target's Python may be missing wheels for it, so its PyPI packages are also
     looked up on the index (keeping the lock's files if a lookup fails).
+    With offline=True, only locked files are used: inputs needing an index lookup raise SourceError, and the
+    other-Python recheck is skipped. Locked files may therefore omit wheels for those Python versions.
+    online=True and offline=True cannot be combined.
     """
     targets = _package_targets(targets)
+    if online and offline:
+        raise ValueError("online=True and offline=True cannot be combined")
     p = Path(path)
     source: Source = load_file(find_lockfile(p) if p.is_dir() else p)
+    if offline:
+        require_offline([source], "offline=True", undo="set offline=False")
     fill_all(source.packages, refresh=online, python=single_python(targets))
-    if not online and pythons_outside_lock(source, targets):
+    if not online and not offline and pythons_outside_lock(source, targets):
         recheck_lock(source.packages)
     rows: list[Row] = [r for r in check([source], targets) if r.needed]
     return [_result(r.package, dict(r.results)) for r in rows]
