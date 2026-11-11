@@ -90,7 +90,7 @@ def test_batches_reply_with_a_list():
 def test_tools_list_has_valid_schemas():
     (_, reply) = run(init(), {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     tools = {t["name"]: t for t in reply["result"]["tools"]}
-    assert set(tools) == {"check_package", "check_lockfile", "list_targets"}
+    assert set(tools) == {"check_package", "check_lockfile", "check_dockerfile", "list_targets"}
     for tool in tools.values():
         assert tool["inputSchema"]["type"] == "object"
         assert tool["annotations"]["readOnlyHint"] is True
@@ -302,6 +302,71 @@ def test_check_lockfile_errors(fake_pypi, tmp_path, monkeypatch, arguments, mess
     assert reply["result"]["isError"] is True
     if message:
         assert message in reply["result"]["content"][0]["text"]
+
+
+def dockerfile_project(tmp_path, fixtures, text: str):
+    (tmp_path / "uv.lock").write_bytes((fixtures / "uvproj" / "uv.lock").read_bytes())
+    (tmp_path / "Dockerfile").write_text(text, encoding="utf-8")
+    return tmp_path / "Dockerfile"
+
+
+def test_check_dockerfile_alpine_image_gives_musl_targets(fake_pypi, tmp_path, fixtures):
+    dockerfile = dockerfile_project(tmp_path, fixtures, "FROM python:3.12 AS build\nFROM python:3.13-alpine\n")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile)))
+    data = reply["result"]["structuredContent"]
+    assert data["image"] == {"python": "3.13", "platform": "musl-x86_64", "glibc": None, "musl": "1.2"}
+    assert data["targets"] == ["3.13 musl-x86_64"]
+    assert data["path"] == str(tmp_path.resolve())  # default: the Dockerfile's folder
+    assert {g["name"] for g in data["gaps"]} >= {"nativeext", "puresdist"}
+    assert {s["name"] for s in data["skipped"]} == {"demo", "gitdep"}
+
+
+def test_check_dockerfile_matches_the_cli(fake_pypi, tmp_path, fixtures, capsys):
+    from wheelgap import cli
+
+    dockerfile = dockerfile_project(tmp_path, fixtures, "FROM --platform=linux/arm64 python:3.13-slim\n")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile), path=str(tmp_path / "uv.lock")))
+    data = reply["result"]["structuredContent"]
+    assert data["image"]["platform"] == "linux-aarch64" and data["image"]["musl"] is None
+    capsys.readouterr()
+    cli.main(["--json", f"--dockerfile={dockerfile}", str(tmp_path / "uv.lock")])
+    expected = json.loads(capsys.readouterr().out)
+    assert data["targets"] == [f"{t['python']} {t['platform']}" for t in expected["targets"]]
+    assert data["packages"] == expected["summary"]["packages"]
+
+
+def test_check_dockerfile_targets_override_the_image_platform(fake_pypi, tmp_path, fixtures):
+    dockerfile = dockerfile_project(tmp_path, fixtures, "FROM python:3.13-alpine\n")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(dockerfile), targets=["linux/arm64"]))
+    data = reply["result"]["structuredContent"]
+    # With an Alpine image, a Docker platform means musl, as with `wheelgap --dockerfile ... -t linux/arm64`.
+    assert data["targets"] == ["3.13 musl-aarch64"]
+    assert data["image"]["platform"] == "musl-x86_64"
+
+
+@pytest.mark.parametrize(
+    ("text", "arguments", "message"),
+    [
+        ("FROM ubuntu:24.04\n", {}, "supported, use check_lockfile with python and targets instead"),
+        ("RUN echo hi\n", {}, "no FROM line found"),
+        ("FROM python:3.13\n", {"path": "/no/such/uv.lock"}, "no such file or directory"),
+        ("FROM python:3.13\n", {"dockerfile": "/no/such/Dockerfile"}, "no such file or directory"),
+        ("FROM python:3.13\n", {"python": "3.12"}, "unknown argument(s): python"),
+    ],
+)
+def test_check_dockerfile_errors(fake_pypi, tmp_path, fixtures, text, arguments, message):
+    dockerfile = dockerfile_project(tmp_path, fixtures, text)
+    (_, reply) = run(init(), call("check_dockerfile", **({"dockerfile": str(dockerfile)} | arguments)))
+    assert reply["result"]["isError"] is True
+    assert message in reply["result"]["content"][0]["text"]
+    assert not fake_pypi
+
+
+def test_check_dockerfile_directory_is_a_tool_error(fake_pypi, tmp_path, fixtures):
+    dockerfile_project(tmp_path, fixtures, "FROM python:3.13\n")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(tmp_path)))
+    assert reply["result"]["isError"] is True
+    assert "is a directory" in reply["result"]["content"][0]["text"]
 
 
 def test_check_package_pyodide_lock_marks_bundled(fake_pypi, fixtures):
@@ -644,3 +709,17 @@ def test_a_crash_on_the_worker_is_still_answered(monkeypatch):
     (_, reply) = run(init(), call("list_targets"))
     assert reply["id"] == 1
     assert reply["error"]["code"] == mcp.INTERNAL_ERROR
+
+
+def test_check_dockerfile_without_a_lockfile_next_to_it_says_to_pass_path(tmp_path):
+    (tmp_path / "Dockerfile").write_text("FROM python:3.13-alpine\n", encoding="utf-8")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(tmp_path / "Dockerfile")))
+    assert reply["result"]["isError"] is True
+    assert "pass 'path'" in reply["result"]["content"][0]["text"]
+
+
+def test_check_dockerfile_errors_carry_no_cli_advice_where_none_applies(tmp_path):
+    (tmp_path / "Dockerfile").write_text("RUN echo hi\n", encoding="utf-8")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(tmp_path / "Dockerfile"), path=str(tmp_path)))
+    text = reply["result"]["content"][0]["text"]
+    assert reply["result"]["isError"] is True and "check_lockfile" not in text

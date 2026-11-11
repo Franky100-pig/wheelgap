@@ -13,6 +13,7 @@ notifications/progress as its index lookups finish; a cancelled call sends no mo
 Tools (all read-only; they look packages up on PyPI, or the index in WHEELGAP_INDEX_URL):
 - check_package: one package (latest release or a given version) on each target.
 - check_lockfile: what `wheelgap PATH --json` reports, so project config, notes and skipped packages match the CLI.
+- check_dockerfile: what `wheelgap PATH --dockerfile DOCKERFILE --json` reports, plus the image it read.
 - list_targets: the platform names the other tools accept.
 """
 
@@ -34,6 +35,7 @@ from packaging.version import InvalidVersion, Version
 from . import __version__, pypi
 from .api import Result, check_package, make_targets, running_python
 from .check import Status
+from .dockerfile import DockerfileError, read_dockerfile
 from .pyodide import PyodideLockError, load_pyodide_lock
 from .sources import SourceError
 from .targets import (
@@ -64,9 +66,10 @@ INTERNAL_ERROR = -32603
 INSTRUCTIONS = (
     "wheelgap tells you whether pip or uv can install a package from a prebuilt wheel on a platform, or will have to "
     "build it from source (or can't install it at all). Use check_lockfile on a project's uv.lock, poetry.lock, "
-    "pdm.lock, pylock.toml, Pipfile.lock or requirements.txt before changing the platforms it deploys to, and "
-    "check_package before adding a dependency. Pass the project's Python version: results differ between versions. "
-    "Linux results assume a glibc (manylinux) or musl version: pass the one your image or distro has."
+    "pdm.lock, pylock.toml, Pipfile.lock or requirements.txt before changing the platforms it deploys to, "
+    "check_dockerfile before changing a Dockerfile's FROM line (it reads the image's Python, platform and libc for "
+    "you), and check_package before adding a dependency. Pass the project's Python version: results differ between "
+    "versions. Linux results assume a glibc (manylinux) or musl version: pass the one your image or distro has."
 )
 
 _STATUS_HELP = (
@@ -179,9 +182,46 @@ TOOLS: list[dict[str, Any]] = [
         "annotations": _READ_ONLY,
     },
     {
+        "name": "check_dockerfile",
+        "title": "Check a lockfile against a Dockerfile's image",
+        "description": (
+            "Check a lockfile for the image a Dockerfile's final stage builds on, exactly as `wheelgap PATH "
+            "--dockerfile DOCKERFILE --json` does: the image's Python, platform (from FROM --platform, default "
+            "linux/amd64) and glibc or musl version (python:3.13-alpine means musl) set the target. Use it before "
+            "changing a FROM line, e.g. from -slim to -alpine or to --platform=linux/arm64. Returns what "
+            "check_lockfile returns, plus 'image': the python, platform, glibc and musl wheelgap read from the "
+            "Dockerfile. A Dockerfile wheelgap can't read the way Docker does is a tool error saying what to pass "
+            "instead. " + _STATUS_HELP
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dockerfile": {
+                    "type": "string",
+                    "description": "Absolute path to the Dockerfile (relative paths are resolved against the server's "
+                    "working directory).",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Absolute path to the lockfile or project directory. Default: the Dockerfile's "
+                    "folder.",
+                },
+                "targets": _TARGETS_PROP
+                | {
+                    "description": "Platforms to check instead of the image's, e.g. ['linux/arm64'] (with an Alpine "
+                    "image, Docker platforms mean musl). Default: the image's platform."
+                },
+            },
+            "required": ["dockerfile"],
+            "additionalProperties": False,
+        },
+        "annotations": _READ_ONLY,
+    },
+    {
         "name": "list_targets",
         "title": "List target platforms",
-        "description": "List the platform names and groups that check_package and check_lockfile accept.",
+        "description": "List the platform names and groups that check_package, check_lockfile and check_dockerfile "
+        "accept.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "annotations": _READ_ONLY | {"openWorldHint": False},
     },
@@ -287,16 +327,12 @@ def _check_package(args: dict[str, Any]) -> dict[str, Any]:
 
 def _check_lockfile(args: dict[str, Any]) -> dict[str, Any]:
     """Run the command line itself with --json, so config, notes and skipped packages are exactly the CLI's."""
-    from . import cli
-
     _check_keys("check_lockfile", args)
     raw = _string(args, "path", required=True) or ""
     offline = args.get("offline")
     if offline is not None and not isinstance(offline, bool):
         raise ToolError("'offline' must be true or false")
-    path = Path(raw).expanduser()
-    if not path.exists():
-        raise ToolError(f"{raw}: no such file or directory (pass an absolute path)")
+    path = _existing(raw)
     # --name=value forms, and -- before the path, so no value can be read as another option.
     argv = ["--json"]
     argv += [f"--python={p}" for p in _pythons(args)]
@@ -306,7 +342,48 @@ def _check_lockfile(args: dict[str, Any]) -> dict[str, Any]:
         argv.append(f"--pyodide-lock={lock_spec}")
     if offline:
         argv.append("--offline")
-    argv += ["--", str(path)]
+    return _run_cli(argv, path)
+
+
+def _check_dockerfile(args: dict[str, Any]) -> dict[str, Any]:
+    """check_lockfile with --dockerfile, plus the image the CLI reads from the Dockerfile."""
+    _check_keys("check_dockerfile", args)
+    dockerfile = _existing(_string(args, "dockerfile", required=True) or "")
+    if dockerfile.is_dir():
+        raise ToolError(f"{args['dockerfile']}: is a directory (pass the Dockerfile itself)")
+    raw = (_string(args, "path") or "").strip()
+    path = _existing(raw) if raw else dockerfile.parent
+    try:
+        image = read_dockerfile(dockerfile)
+    except DockerfileError as e:  # wheelgap's message; its CLI advice, where it gives some, translated
+        message = str(e).replace("pass -p/-t instead", "use check_lockfile with python and targets instead")
+        raise ToolError(message) from e
+    except OSError as e:  # a Dockerfile that can't be read
+        raise ToolError(f"{args['dockerfile']}: {e.strerror or e}") from e
+    argv = ["--json", f"--dockerfile={dockerfile}"]
+    argv += [f"--target={p}" for p in _platforms(args)]
+    try:
+        out = _run_cli(argv, path)
+    except ToolError as e:
+        if raw or "no lockfile found" not in str(e):
+            raise
+        raise ToolError(f"{e} (pass 'path': the lockfile or project directory)") from e
+    out["image"] = {"python": image.python, "platform": image.platform, "glibc": image.glibc, "musl": image.musl}
+    return out
+
+
+def _existing(raw: str) -> Path:
+    path = Path(raw).expanduser()
+    if not path.exists():
+        raise ToolError(f"{raw}: no such file or directory (pass an absolute path)")
+    return path
+
+
+def _run_cli(argv: list[str], path: Path) -> dict[str, Any]:
+    """`wheelgap ARGV -- PATH` with --json in ARGV: its result as the lockfile tools return it."""
+    from . import cli
+
+    argv = [*argv, "--", str(path)]
     out, err = io.StringIO(), io.StringIO()
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -376,6 +453,7 @@ def _list_targets(args: dict[str, Any]) -> dict[str, Any]:
 _HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "check_package": _check_package,
     "check_lockfile": _check_lockfile,
+    "check_dockerfile": _check_dockerfile,
     "list_targets": _list_targets,
 }
 
