@@ -14,6 +14,7 @@ Tools (all read-only; they look packages up on PyPI, or the index in WHEELGAP_IN
 - check_package: one package (latest release or a given version) on each target.
 - check_lockfile: what `wheelgap PATH --json` reports, so project config, notes and skipped packages match the CLI.
 - check_dockerfile: what `wheelgap PATH --dockerfile DOCKERFILE --json` reports, plus the image it read.
+- diff_lockfiles: what `wheelgap diff OLD NEW --json` reports (the packages that got worse, and new ones with gaps).
 - list_targets: the platform names the other tools accept.
 """
 
@@ -68,8 +69,11 @@ INSTRUCTIONS = (
     "build it from source (or can't install it at all). Use check_lockfile on a project's uv.lock, poetry.lock, "
     "pdm.lock, pylock.toml, Pipfile.lock or requirements.txt before changing the platforms it deploys to, "
     "check_dockerfile before changing a Dockerfile's FROM line (it reads the image's Python, platform and libc for "
-    "you), and check_package before adding a dependency. Pass the project's Python version: results differ between "
-    "versions. Linux results assume a glibc (manylinux) or musl version: pass the one your image or distro has."
+    "you), check_package before adding a dependency, and diff_lockfiles to see whether a dependency upgrade lost a "
+    "wheel anywhere (save the old lockfile under its own name first, e.g. `mkdir -p /tmp/old && git show "
+    "HEAD:uv.lock > /tmp/old/uv.lock`). Pass the project's Python version: results "
+    "differ between versions. Linux results assume a glibc (manylinux) or musl version: pass the one your image or "
+    "distro has."
 )
 
 _STATUS_HELP = (
@@ -218,10 +222,43 @@ TOOLS: list[dict[str, Any]] = [
         "annotations": _READ_ONLY,
     },
     {
+        "name": "diff_lockfiles",
+        "title": "Compare two lockfiles",
+        "description": (
+            "Compare a lockfile before and after a change (a dependency upgrade, a re-lock), exactly as `wheelgap diff "
+            "OLD NEW --json` does, and report what got worse: 'worse' lists packages whose status dropped on a target "
+            "(e.g. wheel → source after a version bump), 'new' lists added packages with a gap, and 'ok' is true only "
+            "when both are empty. A package that can no longer be checked (unknown, or now from git, a path, a URL or a"
+            " private index) counts as worse; 'unchecked' names packages unknown on both sides at the same version. "
+            "Pass the old lockfile as 'old' under its own file name, since the name says how to read it: e.g. `mkdir -p"
+            " /tmp/old && git show HEAD:uv.lock > /tmp/old/uv.lock` (this works after the upgrade too, until it's "
+            "committed). As with `wheelgap diff`, the project's [tool.wheelgap] settings don't apply: pass python and "
+            "targets. " + _STATUS_HELP
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "old": {
+                    "type": "string",
+                    "description": "Absolute path to the lockfile (or project directory) before the change.",
+                },
+                "new": {
+                    "type": "string",
+                    "description": "Absolute path to the lockfile (or project directory) after the change.",
+                },
+                "python": _PYTHON_PROP | {"description": _PYTHON_PROP["description"] + " Default: the server's."},
+                "targets": _TARGETS_PROP,
+            },
+            "required": ["old", "new"],
+            "additionalProperties": False,
+        },
+        "annotations": _READ_ONLY,
+    },
+    {
         "name": "list_targets",
         "title": "List target platforms",
-        "description": "List the platform names and groups that check_package, check_lockfile and check_dockerfile "
-        "accept.",
+        "description": "List the platform names and groups that check_package, check_lockfile, check_dockerfile and "
+        "diff_lockfiles accept.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "annotations": _READ_ONLY | {"openWorldHint": False},
     },
@@ -372,6 +409,40 @@ def _check_dockerfile(args: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _diff_lockfiles(args: dict[str, Any]) -> dict[str, Any]:
+    """`wheelgap diff OLD NEW --json`, through diff.py's functions rather than its main(), plus ok."""
+    from . import diff
+    from .api import _check_lockfile as check_with_source
+
+    _check_keys("diff_lockfiles", args)
+    paths = [_existing(_string(args, key, required=True) or "") for key in ("old", "new")]
+    try:
+        targets = make_targets(_pythons(args) or None, _platforms(args) or None)
+    except TargetError as e:
+        raise ToolError(str(e)) from e
+    sides = []
+    for path in paths:
+        try:
+            # As in `wheelgap diff`: no offline mode, so a lock made for other Pythons is re-checked on the index
+            # rather than compared on files it may be missing (which could cancel out and pass on a guess).
+            results, source = check_with_source(path, targets, online=False, offline=False)
+        except OSError as e:  # a lockfile that can't be read
+            raise ToolError(f"{path}: {e.strerror or e}") from e
+        except SourceError:
+            raise
+        except ValueError as e:  # malformed TOML or JSON, not UTF-8: the file's problem, not a bug here
+            raise ToolError(f"{path}: {type(e).__name__}: {e}") from e
+        packages = diff.merge(results, targets)
+        diff.add_skipped(packages, source, targets)
+        sides.append(packages)
+    report = diff.compare(sides[0], sides[1], targets)
+    data: dict[str, Any] = json.loads(diff.json_report(report, targets))
+    del data["version"]  # the server's version is in initialize's serverInfo
+    data["ok"] = not report.worse and not report.new
+    data["paths"] = {"old": str(paths[0].resolve()), "new": str(paths[1].resolve())}
+    return data
+
+
 def _existing(raw: str) -> Path:
     path = Path(raw).expanduser()
     if not path.exists():
@@ -454,6 +525,7 @@ _HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "check_package": _check_package,
     "check_lockfile": _check_lockfile,
     "check_dockerfile": _check_dockerfile,
+    "diff_lockfiles": _diff_lockfiles,
     "list_targets": _list_targets,
 }
 

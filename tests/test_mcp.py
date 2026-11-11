@@ -2,6 +2,7 @@ import io
 import json
 import threading
 from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import pytest
 
@@ -90,7 +91,7 @@ def test_batches_reply_with_a_list():
 def test_tools_list_has_valid_schemas():
     (_, reply) = run(init(), {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     tools = {t["name"]: t for t in reply["result"]["tools"]}
-    assert set(tools) == {"check_package", "check_lockfile", "check_dockerfile", "list_targets"}
+    assert set(tools) == {"check_package", "check_lockfile", "check_dockerfile", "diff_lockfiles", "list_targets"}
     for tool in tools.values():
         assert tool["inputSchema"]["type"] == "object"
         assert tool["annotations"]["readOnlyHint"] is True
@@ -723,3 +724,128 @@ def test_check_dockerfile_errors_carry_no_cli_advice_where_none_applies(tmp_path
     (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(tmp_path / "Dockerfile"), path=str(tmp_path)))
     text = reply["result"]["content"][0]["text"]
     assert reply["result"]["isError"] is True and "check_lockfile" not in text
+
+
+def lockfile_pair(tmp_path, old: str, new: str) -> tuple[str, str]:
+    """Two small uv.lock files, the root project depending on the given [[package]] entries."""
+    head = 'version = 1\nrevision = 3\nrequires-python = ">=3.12"\n\n'
+    paths = []
+    for side, packages in (("old", old), ("new", new)):
+        names = [line.split('"')[1] for line in packages.splitlines() if line.startswith("name = ")]
+        root = '[[package]]\nname = "demo"\nversion = "0.1.0"\nsource = { virtual = "." }\ndependencies = [\n'
+        root += "".join(f'    {{ name = "{n}" }},\n' for n in names) + "]\n\n"
+        (tmp_path / side).mkdir()
+        path = tmp_path / side / "uv.lock"
+        path.write_text(head + root + packages, encoding="utf-8")
+        paths.append(str(path))
+    return paths[0], paths[1]
+
+
+def uv_package(name: str, version: str, kind: str = "wheel") -> str:
+    """A uv.lock [[package]] entry that records one wheel or one sdist, so no lookup is needed."""
+    url = f"https://files.pythonhosted.org/packages/aa/{name}-{version}"
+    if kind == "wheel":
+        files = f'wheels = [\n    {{ url = "{url}-py3-none-any.whl", hash = "sha256:00", size = 1 }},\n]\n'
+    else:
+        files = f'sdist = {{ url = "{url}.tar.gz", hash = "sha256:00", size = 1 }}\n'
+    return (
+        f'[[package]]\nname = "{name}"\nversion = "{version}"\nsource = {{ registry = "https://pypi.org/simple" }}\n'
+        + files
+        + "\n"
+    )
+
+
+def test_diff_lockfiles_reports_a_wheel_lost_to_source(fake_pypi, tmp_path):
+    old, new = lockfile_pair(
+        tmp_path,
+        uv_package("ranged", "1.5") + uv_package("purewheel", "3.1"),
+        uv_package("ranged", "1.9", "sdist") + uv_package("purewheel", "3.1") + uv_package("nowheels", "0.9", "sdist"),
+    )
+    (_, reply) = run(init(), call("diff_lockfiles", old=old, new=new, python="3.13", targets=["linux-x86_64"]))
+    assert reply["result"]["isError"] is False
+    data = reply["result"]["structuredContent"]
+    assert data["ok"] is False
+    assert data["worse"] == [
+        {
+            "name": "ranged",
+            "old_versions": ["1.5"],
+            "new_versions": ["1.9"],
+            "targets": {"linux-x86_64": {"old_status": "wheel", "new_status": "source"}},
+        }
+    ]
+    assert data["new"] == [{"name": "nowheels", "versions": ["0.9"], "targets": {"linux-x86_64": {"status": "source"}}}]
+    assert data["summary"] == {"worse": 1, "new": 1}
+    assert data["paths"] == {"old": old, "new": new}
+    assert "version" not in data
+
+
+def test_diff_lockfiles_matches_wheelgap_diff_json(fake_pypi, tmp_path, capsys):
+    from wheelgap import diff
+
+    old, new = lockfile_pair(tmp_path, uv_package("ranged", "1.5"), uv_package("ranged", "1.9", "sdist"))
+    argv = [old, new, "-p", "3.13", "-t", "linux-x86_64", "-t", "win-amd64", "--json"]
+    assert diff.main(argv) == 1
+    expected = json.loads(capsys.readouterr().out)
+    (_, reply) = run(
+        init(), call("diff_lockfiles", old=old, new=new, python="3.13", targets=["linux-x86_64", "win-amd64"])
+    )
+    data = reply["result"]["structuredContent"]
+    assert data["worse"]
+    for key in ("targets", "worse", "new", "unchecked", "summary"):
+        assert data[key] == expected[key]
+
+
+def test_diff_lockfiles_identical_files_are_ok(fake_pypi, tmp_path):
+    text = uv_package("ranged", "1.9", "sdist") + uv_package("purewheel", "3.1")
+    old, new = lockfile_pair(tmp_path, text, text)
+    (_, reply) = run(init(), call("diff_lockfiles", old=old, new=new, python="3.13", targets=["linux-x86_64"]))
+    data = reply["result"]["structuredContent"]
+    assert data["ok"] is True
+    assert data["worse"] == [] and data["new"] == [] and data["summary"] == {"worse": 0, "new": 0}
+
+
+def test_diff_lockfiles_looks_requirements_up(fake_pypi, tmp_path):
+    # Requirements files record no files, so every package is looked up on the index.
+    (tmp_path / "old.txt").write_text("ranged==1.5\n", encoding="utf-8")
+    (tmp_path / "new.txt").write_text("ranged==1.9\n", encoding="utf-8")
+    arguments = {"old": str(tmp_path / "old.txt"), "new": str(tmp_path / "new.txt"), "python": "3.13"}
+    (_, reply) = run(init(), call("diff_lockfiles", **arguments, targets=["linux-x86_64"]))
+    assert [w["name"] for w in reply["result"]["structuredContent"]["worse"]] == ["ranged"]
+    assert fake_pypi
+
+
+def test_diff_lockfiles_malformed_lockfile_is_a_tool_error(fake_pypi, tmp_path):
+    old, new = lockfile_pair(tmp_path, uv_package("purewheel", "3.1"), uv_package("purewheel", "3.1"))
+    Path(new).write_text("[[package\n", encoding="utf-8")
+    (_, reply) = run(init(), call("diff_lockfiles", old=old, new=new, python="3.13", targets=["linux-x86_64"]))
+    text = reply["result"]["content"][0]["text"]
+    assert reply["result"]["isError"] is True and "internal error" not in text
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"old": "/no/such/uv.lock"}, "no such file or directory"),
+        ({"new": "/no/such/uv.lock"}, "no such file or directory"),
+        ({"old": None}, "'old' is required"),
+        ({"offline": True}, "unknown argument(s): offline"),  # wheelgap diff has no offline mode
+        ({"old": "{tmp}/old.lock"}, "don't know how to read"),  # the saved copy needs its real name
+        ({"targets": ["linux-aarch46"]}, "linux-aarch46"),
+        ({"python": "three"}, "can't read Python version"),
+        ({"glibc": "2.28"}, "unknown argument(s): glibc"),
+        ({"old": "{tmp}/notes.md"}, "don't know how to read"),
+        ({"old": "{tmp}/empty"}, "no lockfile found"),
+    ],
+)
+def test_diff_lockfiles_errors(fake_pypi, tmp_path, arguments, message):
+    old, new = lockfile_pair(tmp_path, uv_package("purewheel", "3.1"), uv_package("purewheel", "3.1"))
+    (tmp_path / "notes.md").write_text("hi\n", encoding="utf-8")
+    (tmp_path / "old.lock").write_text(Path(old).read_text(encoding="utf-8"), encoding="utf-8")
+    (tmp_path / "empty").mkdir()
+    merged = {"old": old, "new": new} | {
+        k: v.format(tmp=tmp_path) if isinstance(v, str) else v for k, v in arguments.items()
+    }
+    (_, reply) = run(init(), call("diff_lockfiles", **{k: v for k, v in merged.items() if v is not None}))
+    assert reply["result"]["isError"] is True
+    assert message in reply["result"]["content"][0]["text"]
+    assert not fake_pypi
