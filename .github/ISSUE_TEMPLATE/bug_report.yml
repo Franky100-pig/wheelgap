@@ -45,8 +45,8 @@ body:
     id: version
     attributes:
       label: wheelgap version
-      description: Output of `wheelgap -V`.
-      placeholder: wheelgap 0.2.0
+      description: Output of `wheelgap --version`.
+      placeholder: "wheelgap 0.8.0 (packaging 26.3, CPython 3.13.1)"
     validations:
       required: true
   - type: input

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `wheelgap --version` also prints the packaging and Python versions, including a `t` suffix on a free-threaded build, so bug reports have what is needed to reproduce a result. (#183, thanks [@sarankumar1325](https://github.com/sarankumar1325))
 - `check_lockfile(..., offline=True)` checks locked distribution files without contacting an index, rejects inputs that need a lookup, and skips re-checking locks made for another Python version, so those versions may show false gaps. (#182, thanks [@jwalith4418-Mj](https://github.com/jwalith4418-Mj))
 - `offline = true` in `[tool.wheelgap]` makes `--offline` the project default, so CI and coding agents don't have to pass the flag on every run. `--online` on the command line overrides it for one run, and when the setting came from `pyproject.toml`, errors and notes name the config key and point to `--online`. (#170, thanks [@sarankumar1325](https://github.com/sarankumar1325))
 - `requirements.txt` now applies constraint files (`-c FILE`, `-cFILE`, `--constraint FILE` or `--constraint=FILE`, read relative to the file naming them) to unpinned requirements, as pip and uv do: an exact constraint picks the version that's checked and a range narrows it. Constraints never add packages. A constraint wheelgap can't apply (an environment marker, a URL or two different exact versions) leaves the package `unknown` rather than guessed, and constraint files given as a URL or `${VAR}` are skipped. (#169, thanks [@arpanjot-coding](https://github.com/arpanjot-coding))

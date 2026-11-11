@@ -5,11 +5,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
 import sys
+import sysconfig
 import tomllib
 from pathlib import Path
 
+import packaging
 from packaging.markers import InvalidMarker, Marker
 from packaging.utils import canonicalize_name
 
@@ -81,6 +84,16 @@ def musl_docker_names(item: str) -> str:
             name = resolved.replace("linux-", "musl-", 1) if resolved.startswith("linux-") else resolved
         out.append(name)
     return ",".join(out)
+
+
+def version_string() -> str:
+    """The --version line, including packaging and the running Python, for bug reports."""
+    gil_disabled = sysconfig.get_config_var("Py_GIL_DISABLED")
+    suffix = "t" if gil_disabled else ""
+    return (
+        f"wheelgap {__version__} (packaging {packaging.__version__}, "
+        f"{platform.python_implementation()} {platform.python_version()}{suffix})"
+    )
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -196,7 +209,7 @@ def make_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--color", choices=["auto", "always", "never"], default="auto")
     p.add_argument("--list-targets", action="store_true", help="list platforms, aliases and compatibility limits")
-    p.add_argument("-V", "--version", action="version", version=f"wheelgap {__version__}")
+    p.add_argument("-V", "--version", action="version", version=version_string())
     return p
 
 
