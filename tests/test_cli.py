@@ -1611,6 +1611,63 @@ def test_output_schema_rejects_other_shapes():
             _check_schema(bad, schema, schema)
 
 
+def test_requirements_note_names_only_unpinned_packages(capsys, fake_pypi, tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("ranged\nfastlib==2.0.0\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 0
+    assert "requirements.txt has 1 unpinned package (ranged)" in err
+    assert "fastlib" not in err.split("unpinned package", 1)[1]
+    assert "newest matching release was checked" in err
+    assert "uv pip compile" in err
+    # Notes stay on stderr, including under --json.
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 0
+    assert "unpinned package (ranged)" in err
+    assert "unpinned" not in out
+
+
+def test_requirements_note_omitted_for_a_pinned_file(capsys, fake_pypi, tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("fastlib==2.0.0\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 0
+    assert "unpinned" not in err
+
+
+def test_requirements_note_omitted_for_command_line_names(capsys, fake_pypi):
+    code, out, err = run(capsys, "ranged", "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 0
+    assert "unpinned" not in err
+
+
+def test_requirements_note_hidden_with_quiet(capsys, fake_pypi, tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("ranged\nfastlib==2.0.0\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "-q")
+    assert code == 0
+    assert "unpinned" not in err
+
+
+def test_requirements_note_follows_constraints_includes_and_errors(capsys, fake_pypi, tmp_path):
+    # ranged is pinned by a constraint (not unpinned); pythonranged appears in two files (named once);
+    # fastlib's constraint has a marker, so it's unknown, not "the newest release was checked".
+    (tmp_path / "constraints.txt").write_text('ranged==1.9\nfastlib<3; sys_platform == "win32"\n', encoding="utf-8")
+    (tmp_path / "dev.txt").write_text("pythonranged>=1\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    req.write_text("-c constraints.txt\n-r dev.txt\nranged\npythonranged\nfastlib\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64")
+    assert "requirements.txt has 1 unpinned package (pythonranged)" in err
+
+
+def test_requirements_note_hidden_with_quiet_config(capsys, fake_pypi, tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\nquiet = true\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    req.write_text("ranged\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64")
+    assert "unpinned" not in err
+
+
 def test_version_includes_packaging(capsys):
     with pytest.raises(SystemExit) as caught:
         main(["--version"])

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A requirements file with unpinned or ranged requirements now prints a stderr note naming those packages, because the newest matching release is what was checked. `-q` hides it, and package names given on the command line are unchanged. (#185, thanks [@sarankumar1325](https://github.com/sarankumar1325))
 - `wheelgap --version` also prints the packaging and Python versions, including a `t` suffix on a free-threaded build, so bug reports have what is needed to reproduce a result. (#183, thanks [@sarankumar1325](https://github.com/sarankumar1325))
 - `check_lockfile(..., offline=True)` checks locked distribution files without contacting an index, rejects inputs that need a lookup, and skips re-checking locks made for another Python version, so those versions may show false gaps. (#182, thanks [@jwalith4418-Mj](https://github.com/jwalith4418-Mj))
 - `offline = true` in `[tool.wheelgap]` makes `--offline` the project default, so CI and coding agents don't have to pass the flag on every run. `--online` on the command line overrides it for one run, and when the setting came from `pyproject.toml`, errors and notes name the config key and point to `--online`. (#170, thanks [@sarankumar1325](https://github.com/sarankumar1325))

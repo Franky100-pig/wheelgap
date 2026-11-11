@@ -93,6 +93,8 @@ class Source:
     uv_pyproject: Path | None = None
     uv_default_groups: list[str] = field(default_factory=lambda: ["dev"])
     uv_selection: UvSelection | None = None
+    # A requirements file (requirements.txt, .in, requirements.lock): unpinned lines get the newest release.
+    requirements: bool = False
 
 
 def pythons_outside_lock(source: Source, targets: Iterable[Target]) -> list[str]:
@@ -570,7 +572,7 @@ def parse_requirements(path: Path) -> Source:
             for entry in entries:
                 spec &= SpecifierSet(entry.spec or "")
             pkg.spec = str(spec) or None
-    return Source(path.name, pkgs)
+    return Source(path.name, pkgs, requirements=True)
 
 
 def _read_requirements(

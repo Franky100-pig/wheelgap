@@ -696,6 +696,35 @@ def refuse_pyodide_url(spec: str, how: str = "--offline") -> None:
         raise PyodideLockError(f"{how}: {spec} would be downloaded; save it and pass its path, or {undo_offline(how)}")
 
 
+def unpinned_requirement_names(source: Source) -> list[str]:
+    """Index requirements that aren't an exact pin, once each. Skipped and non-index lines are omitted, and so are
+    packages with an error (an unusable constraint), since nothing was checked for them."""
+    names: dict[str, str] = {}
+    for package in source.packages:
+        if package.skip or package.error:
+            continue
+        if package.version is None or package.spec:
+            names.setdefault(package.key, package.name)
+    return list(names.values())
+
+
+def note_unpinned_requirements(sources: list[Source]) -> None:
+    for source in sources:
+        if not source.requirements:
+            continue
+        names = unpinned_requirement_names(source)
+        if not names:
+            continue
+        noun = "package" if len(names) == 1 else "packages"
+        listed = ", ".join(names[:2]) + (", …" if len(names) > 2 else "")
+        print(
+            f"wheelgap: note: {source.label} has {len(names)} unpinned {noun} ({listed}), "
+            "so the newest matching release was checked; pin them (uv pip compile, pip-compile) "
+            "to check what you install",
+            file=sys.stderr,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         # Don't crash printing ✓ to a non-UTF-8 pipe (e.g. Windows cp1252).
@@ -818,6 +847,9 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:  # malformed TOML and friends
         print(f"wheelgap: error: {type(e).__name__}: {e}", file=sys.stderr)
         return input_error_json(e) if args.json else 2
+
+    if not quiet:
+        note_unpinned_requirements(sources)
 
     needed_by_source = [selected_packages(source, targets) for source in sources]
     packages = [package for needed in needed_by_source for package in needed]
