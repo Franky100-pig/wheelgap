@@ -113,16 +113,19 @@ class Source:
     unselected_keys: set[str] = field(default_factory=set)
 
 
-def pythons_outside_lock(source: Source, targets: Iterable[Target]) -> list[str]:
-    """Target Pythons the lockfile's requires-python leaves out, e.g. ['3.14t'] for `==3.13.*`.
+def pythons_outside_lock(source: Source, targets: Iterable[Target], *, bounds_only: bool = True) -> list[str]:
+    """Target Pythons the source's requires-python leaves out, e.g. ['3.14t'] for `==3.13.*`.
 
-    uv keeps only the wheels that can serve requires-python (abi3 and pure wheels survive), so the lock may
-    be missing wheels for those Pythons. Like uv, only the bounds count: `!=3.12.*` doesn't exclude 3.12.
+    For a lockfile, uv keeps only the wheels that can serve requires-python (abi3 and pure wheels survive), so
+    the lock may be missing wheels for those Pythons. Like uv, only the bounds count there: `!=3.12.*` doesn't
+    exclude 3.12. With bounds_only=False (a library's pyproject.toml, which pip checks in full against the
+    running Python), every clause counts, so `!=3.12.*` leaves out 3.12 but `!=3.12.0` doesn't.
     """
     if not source.requires_python:
         return []
     try:
-        spec = SpecifierSet(",".join(str(s) for s in SpecifierSet(source.requires_python) if s.operator != "!="))
+        clauses = SpecifierSet(source.requires_python)
+        spec = SpecifierSet(",".join(str(s) for s in clauses if not (bounds_only and s.operator == "!=")))
     except InvalidSpecifier:
         return []
     out = []
@@ -673,6 +676,8 @@ def parse_pyproject(path: Path) -> Source:
             )
         extras[key] = list(lines)
     source = Source(path.name, pyproject_extras=extras, pyproject_dynamic_extras="optional-dependencies" in dynamic)
+    if isinstance(requires_python := project.get("requires-python"), str):
+        source.requires_python = requires_python
     if isinstance(name := project.get("name"), str):
         source.pyproject_name = canonicalize_name(name)
     self_extras: list[str] = []

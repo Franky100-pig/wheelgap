@@ -226,7 +226,9 @@ Each requirement is read like a line of a requirements file, so ranges and bare 
 matching release and markers are respected. With several `-p` versions, that release isn't filtered by
 `Requires-Python` ([#84](https://github.com/wheelgap/wheelgap/issues/84)), so ranges and bare names can
 show false gaps. Only direct dependencies are checked: their own dependencies aren't, and wheelgap always
-prints a note saying so. Use a lockfile for the full picture.
+prints a note saying so. Use a lockfile for the full picture. If `[project] requires-python` leaves out a `-p`
+Python (every clause counts, as pip applies them), that target is still checked and a note names it; an invalid
+`requires-python` is ignored with a note.
 `[dependency-groups]` isn't read yet, so `--group`, `--only-group` and `--no-dev` are errors here, and a
 `dependencies` listed in `[project] dynamic` is an input error (exit 2), as are dynamic
 `optional-dependencies` with `--extra`/`--all-extras` and Poetry dependencies kept in

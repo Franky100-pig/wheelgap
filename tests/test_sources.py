@@ -752,6 +752,16 @@ def test_pyproject_direct_dependencies(tmp_path):
     assert source.pyproject_extras == {"fast": ["purewheel"], "test": ["nowheels", "my-lib[fast]"]}
 
 
+def test_pyproject_records_requires_python(tmp_path):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(
+        '[project]\nname = "x"\ndependencies = []\nrequires-python = ">=3.11"\n',
+        encoding="utf-8",
+    )
+    (source,) = load_inputs([str(path)])
+    assert source.requires_python == ">=3.11"
+
+
 @pytest.mark.parametrize(
     "extras,all_extras,added",
     [

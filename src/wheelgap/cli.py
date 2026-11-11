@@ -15,6 +15,7 @@ from pathlib import Path
 
 import packaging
 from packaging.markers import InvalidMarker, Marker
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
 
 from . import __version__, cache
@@ -1026,6 +1027,23 @@ def main(argv: list[str] | None = None) -> int:
                 "the newest matching release",
                 file=sys.stderr,
             )
+            if source.requires_python and not quiet:  # the answer is right either way, so -q drops these
+                try:
+                    SpecifierSet(source.requires_python)
+                except InvalidSpecifier:
+                    print(
+                        f"wheelgap: note: {source.label}: ignoring requires-python "
+                        f"{source.requires_python!r}, which isn't a valid specifier",
+                        file=sys.stderr,
+                    )
+                else:
+                    if outside := pythons_outside_lock(source, targets, bounds_only=False):
+                        print(
+                            f"wheelgap: note: {source.label} requires Python {source.requires_python}, "
+                            f"which leaves out Python {', '.join(outside)}; those targets are checked anyway "
+                            "because you asked for them",
+                            file=sys.stderr,
+                        )
 
     needed_by_source = [selected_packages(source, targets) for source in sources]
     packages = [package for needed in needed_by_source for package in needed]
@@ -1051,7 +1069,8 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
     for s, needed in zip(sources, needed_by_source, strict=True):
-        if outside := pythons_outside_lock(s, targets):
+        # A pyproject.toml has no lock to re-check, so it never goes down the uv.lock path below.
+        if s.pyproject_extras is None and (outside := pythons_outside_lock(s, targets)):
             if offline:  # no re-check, so every locked package may lack wheels for those Pythons
                 print(
                     f"wheelgap: note: {s.label} is locked for Python {s.requires_python}, so it may be missing "
