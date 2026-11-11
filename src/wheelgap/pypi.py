@@ -359,6 +359,38 @@ def is_pypi(registry: str | None) -> bool:
     return (registry or PYPI_SIMPLE).rstrip("/") == PYPI_SIMPLE
 
 
+def _index(url: str, suffix: str) -> tuple[str, str, int | None, str] | None:
+    """(scheme, hostname, port, repository path) of an index URL ending in `suffix`, the default port filled in.
+    One host can serve many repositories (Artifactory, Nexus), so the path counts. Never the user or password.
+    None for anything that isn't plainly such a URL, so it matches nothing: that includes a backslash, whitespace or
+    a control character, which other URL parsers (pip's, a browser's) may read as a different host."""
+    if "\\" in url or any(c.isspace() or not c.isprintable() for c in url):
+        return None
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:  # a malformed host or port
+        return None
+    path = parts.path.rstrip("/")
+    if not parts.hostname or port == 0 or not path.endswith(suffix) or parts.query or parts.fragment:
+        return None
+    return parts.scheme, parts.hostname, port or {"https": 443, "http": 80}.get(parts.scheme), path[: -len(suffix)]
+
+
+def may_look_up(registry: str | None, simple_index: str | None = None) -> bool:
+    """Whether a package pinned to `registry` may be looked up by name: it comes from PyPI, or, for lookups on the
+    JSON API (no `simple_index`), from the index WHEELGAP_INDEX_URL points at, such as a PyPI mirror: the same
+    scheme, host, port and repository path (`<repo>/simple` and `<repo>/pypi`). Either way its name only goes to the
+    index the lock says it came from. Unset, WHEELGAP_INDEX_URL is PyPI and only is_pypi() counts."""
+    if is_pypi(registry):
+        return True
+    base = index_url()
+    if registry is None or simple_index is not None or base == DEFAULT_INDEX:
+        return False
+    index = _index(registry, "/simple")
+    return index is not None and index == _index(base, "/pypi")
+
+
 def keeps_locked_files(p: Package) -> bool:
     """Under --online, a package from another index keeps the files in the lock: PyPI doesn't know it."""
     return not p.skip and p.files is not None and not is_pypi(p.registry)
@@ -396,8 +428,9 @@ def fill_all(
     write_cache: bool = False,
 ) -> int:
     """Look packages up on PyPI. A package the lock says came from another index is never looked up: PyPI doesn't
-    know it. With refresh (--online) it keeps its locked files; with no files (an old poetry.lock) it is skipped as
-    a private index. `python` limits range resolution to releases supporting that interpreter.
+    know it. With refresh (--online) it keeps its locked files; with no files (an old poetry.lock, a Pipfile.lock)
+    it is skipped as a private index, unless WHEELGAP_INDEX_URL is that same index (see may_look_up).
+    `python` limits range resolution to releases supporting that interpreter.
     With `simple_index` (--index-url), lookups go to that PEP 691 simple index instead of PyPI's JSON API.
     `read_cache` and `write_cache` read pinned JSON API lookups from, and save them to, the on-disk cache (see
     cache.py); simple-index lookups never use it.
@@ -407,7 +440,7 @@ def fill_all(
         base, auth = split_credentials(simple_index)  # validate first: a bad URL fails before any lookup
         fn = partial(fill_simple, base=base, auth=auth, python=python)
     for p in packages:
-        if p.files is None and not p.skip and not is_pypi(p.registry):
+        if p.files is None and not p.skip and not may_look_up(p.registry, simple_index):
             p.skip = "private index"  # the name is internal; a namesake on PyPI is another package
     kept = {id(p) for p in packages if refresh and keeps_locked_files(p)}
     # An error from parsing (a constraint wheelgap can't apply) stays unknown: a lookup would hide it.

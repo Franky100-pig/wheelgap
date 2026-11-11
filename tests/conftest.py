@@ -57,7 +57,8 @@ def fake_pypi(monkeypatch):
 
     def fetch_json(url, timeout=20.0):
         calls.append(url)
-        parts = url.removeprefix(pypi.DEFAULT_INDEX + "/").removesuffix("/json").split("/")
+        # Served at whatever WHEELGAP_INDEX_URL points at, so tests can assert which index was asked.
+        parts = url.removeprefix(pypi.index_url() + "/").removesuffix("/json").split("/")
         name = parts[0]
         if name not in FAKE_INDEX:
             raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)

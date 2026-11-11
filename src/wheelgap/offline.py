@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .pypi import is_pypi
+from .pypi import may_look_up
 from .sources import Source, SourceError
 
 
@@ -11,12 +11,18 @@ def undo_offline(how: str) -> str:
     return "drop --offline" if how == "--offline" else "pass --online for this run"
 
 
-def require_offline(sources: list[Source], how: str = "--offline", *, undo: str | None = None) -> None:
+def require_offline(
+    sources: list[Source], how: str = "--offline", *, undo: str | None = None, simple_index: str | None = None
+) -> None:
     """--offline: raise SourceError if an input has packages that can only be answered by looking them up."""
     problems = []
     for s in sources:
         # A private-index package with no files is skipped by fill_all, not looked up, so it doesn't count.
-        need = [p.name for p in s.packages if not p.skip and not p.error and p.files is None and is_pypi(p.registry)]
+        need = [
+            p.name
+            for p in s.packages
+            if not p.skip and not p.error and p.files is None and may_look_up(p.registry, simple_index)
+        ]
         if need:
             names = ", ".join(need[:3]) + (", …" if len(need) > 3 else "")
             problems.append(

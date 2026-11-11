@@ -50,7 +50,8 @@ class Package:
     spec: str | None = None
     # Files of a pinned release that the index marks as yanked (see check.status_for).
     yanked: frozenset[str] = frozenset()
-    # uv.lock / pylock.toml / poetry.lock: the index the lock says the package came from, e.g. https://pypi.org/simple.
+    # uv.lock / pylock.toml / poetry.lock / Pipfile.lock: the index the lock says the package came from, e.g.
+    # https://pypi.org/simple.
     registry: str | None = None
     # The index picked `version` (an unpinned or ranged requirement): it isn't a pin from the input.
     version_from_index: bool = False
@@ -437,6 +438,11 @@ def _add_once(pkgs: list[Package], seen: dict[tuple[str, str | None], Package], 
         return
     if pkg.skip == "private index":
         first.skip = pkg.skip  # Pipenv may pin the index in one category only: keep the name off pypi.org anyway
+    if pkg.registry is not None and pkg.registry != first.registry:
+        if first.registry is None:
+            first.registry = pkg.registry  # the other entry is from PyPI: this index decides for both
+        else:
+            first.skip = "private index"  # pinned to two indexes: no single lookup is safe for both
     if first.markers is not None:
         first.markers = None if pkg.markers is None else first.markers + pkg.markers
 
@@ -508,8 +514,12 @@ def parse_pipfile_lock(path: Path) -> Source:
             if pkg.skip is None and p.get("editable"):
                 pkg.skip = "editable"
             index = p.get("index")
-            if pkg.skip is None and index is not None and not _is_public_pypi(source_urls.get(str(index))):
-                pkg.skip = "private index"  # don't send internal names to pypi.org, or check a namesake there
+            if pkg.skip is None and index is not None:
+                url = source_urls.get(str(index))
+                if url is None:  # an index the lock doesn't describe: no way to tell where the name may go
+                    pkg.skip = "private index"
+                elif not _is_public_pypi(url):
+                    pkg.registry = url  # pypi.fill_all skips it, unless WHEELGAP_INDEX_URL is that index
             _add_once(pkgs, seen, pkg)
     return Source(path.name, pkgs)
 

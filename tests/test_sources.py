@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from wheelgap import pypi
 from wheelgap.check import Status, check
 from wheelgap.sources import (
     Source,
@@ -353,24 +354,55 @@ def _two_source_pipfile_lock(tmp_path):
     return path
 
 
-def test_pipfile_lock_private_index_is_skipped(tmp_path):
+def test_pipfile_lock_private_index_is_skipped(tmp_path, fake_pypi):
     (src,) = load_inputs([str(_two_source_pipfile_lock(tmp_path))])
+    # Parsing records the index; fill_all decides whether it may be looked up (see test_may_look_up).
+    assert [(p.name, p.skip, p.registry) for p in src.packages] == [
+        ("acme-utils", None, "https://pkgs.example.com/simple"),
+        ("requests", None, None),
+        ("six", None, None),  # pypi.python.org is PyPI too
+        ("fastlib", None, None),
+        ("ghost", "private index", None),  # an index the lock doesn't describe: can't tell it's PyPI
+        ("oddball", None, "https://[bad/simple"),
+    ]
+    pypi.fill_all(src.packages)
     assert [(p.name, p.skip) for p in src.packages] == [
         ("acme-utils", "private index"),
         ("requests", None),
         ("six", None),
         ("fastlib", None),
-        ("ghost", "private index"),  # an index the lock doesn't describe: can't tell it's PyPI
-        ("oddball", "private index"),  # a URL urlparse rejects: skipped, not a crash
+        ("ghost", "private index"),
+        ("oddball", "private index"),  # a URL urlsplit rejects: skipped, not a crash
     ]
+    assert not [url for url in fake_pypi if "acme" in url or "ghost" in url or "oddball" in url], fake_pypi
 
 
-def test_pipfile_lock_private_index_in_one_category_skips_the_package(tmp_path):
+def test_pipfile_lock_private_index_in_one_category_skips_the_package(tmp_path, fake_pypi):
     # Pipenv writes "index" on direct dependencies: the same package can be direct in develop, transitive in default.
     path = tmp_path / "Pipfile.lock"
     lock = {
         "_meta": {"sources": [{"name": "internal", "url": "https://pkgs.example.com/simple"}]},
         "default": {"acme-utils": {"version": "==2.1.0"}},
+        "develop": {"acme-utils": {"version": "==2.1.0", "index": "internal"}},
+    }
+    path.write_text(json.dumps(lock), encoding="utf-8")
+    (src,) = load_inputs([str(path)])
+    assert [(p.name, p.registry) for p in src.packages] == [("acme-utils", "https://pkgs.example.com/simple")]
+    pypi.fill_all(src.packages)
+    assert [(p.name, p.skip) for p in src.packages] == [("acme-utils", "private index")]
+    assert fake_pypi == []
+
+
+def test_pipfile_lock_package_pinned_to_two_indexes_is_skipped(tmp_path):
+    path = tmp_path / "Pipfile.lock"
+    lock = {
+        "_meta": {
+            "sources": [
+                {"name": "mirror", "url": "https://mirror.example.com/simple"},
+                {"name": "internal", "url": "https://pkgs.example.com/simple"},
+            ]
+        },
+        "default": {"acme-utils": {"version": "==2.1.0", "index": "mirror"}},
         "develop": {"acme-utils": {"version": "==2.1.0", "index": "internal"}},
     }
     path.write_text(json.dumps(lock), encoding="utf-8")

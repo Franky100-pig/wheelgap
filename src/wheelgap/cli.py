@@ -861,7 +861,7 @@ def main(argv: list[str] | None = None) -> int:
                 strict=bool(from_cli or args.only_group),
             )
         if offline:
-            require_offline(sources, offline_how)
+            require_offline(sources, offline_how, simple_index=index_url)
         fail_on = args.fail_on or config.get("fail-on", "source")
         pyodide_lock = None
         if args.pyodide_lock:

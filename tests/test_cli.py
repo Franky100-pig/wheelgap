@@ -505,6 +505,65 @@ def test_pipfile_lock_private_index_is_not_looked_up(capsys, tmp_path, fake_pypi
     assert fake_pypi and not any("acme" in url for url in fake_pypi)
 
 
+def _mirror_pipfile_lock(tmp_path):
+    path = tmp_path / "Pipfile.lock"
+    lock = {
+        "_meta": {"sources": [{"name": "mirror", "url": "https://mirror.example.com/simple", "verify_ssl": True}]},
+        "default": {
+            "fastlib": {"version": "==2.0.0", "index": "mirror"},
+            "purewheel": {"version": "==3.1", "index": "mirror"},
+        },
+    }
+    path.write_text(json.dumps(lock), encoding="utf-8")
+    return path
+
+
+def test_pipfile_lock_mirror_is_looked_up_on_wheelgap_index_url(capsys, tmp_path, fake_pypi, monkeypatch):
+    # #146: WHEELGAP_INDEX_URL on the same index as the lock's source: the names go nowhere new.
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://mirror.example.com/pypi")
+    code, out, err = run(capsys, str(_mirror_pipfile_lock(tmp_path)), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 0, err
+    data = json.loads(out)
+    assert data["skipped"] == []
+    assert [p["name"] for p in data["packages"]] == ["fastlib", "purewheel"]
+    assert sorted(fake_pypi) == [
+        "https://mirror.example.com/pypi/fastlib/2.0.0/json",
+        "https://mirror.example.com/pypi/purewheel/3.1/json",
+    ]
+
+
+def test_pipfile_lock_mirror_is_skipped_without_wheelgap_index_url(capsys, tmp_path, fake_pypi):
+    code, out, err = run(capsys, str(_mirror_pipfile_lock(tmp_path)), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 0, err
+    data = json.loads(out)
+    assert data["skipped"] == [
+        {"name": "fastlib", "reason": "private index"},
+        {"name": "purewheel", "reason": "private index"},
+    ]
+    assert not data["packages"]
+    assert fake_pypi == []
+
+
+def test_offline_refuses_a_pipfile_lock_mirror_on_wheelgap_index_url(capsys, tmp_path, fake_pypi, monkeypatch):
+    # The mirror would be asked, so --offline counts those packages; without the variable they're skipped instead.
+    path = _mirror_pipfile_lock(tmp_path)
+    code, out, err = run(capsys, str(path), "--offline", "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 0, err
+    assert len(json.loads(out)["skipped"]) == 2
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://mirror.example.com/pypi")
+    code, _, err = run(capsys, str(path), "--offline", "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2
+    assert "Pipfile.lock needs the index for 2 packages (fastlib, purewheel)" in err
+    # --index-url replaces the JSON API, so WHEELGAP_INDEX_URL's host doesn't count and they're skipped again.
+    index = "https://mirror.example.com/simple"
+    code, out, err = run(
+        capsys, str(path), "--offline", "--index-url", index, "-p", "3.13", "-t", "linux-x86_64", "--json"
+    )
+    assert code == 0, err
+    assert len(json.loads(out)["skipped"]) == 2
+    assert fake_pypi == []
+
+
 def test_poetry_lock_private_index_with_no_files_is_not_looked_up(capsys, tmp_path, fake_pypi):
     path = tmp_path / "poetry.lock"
     path.write_text(
