@@ -300,6 +300,8 @@ for r in wheelgap.check_lockfile("uv.lock", targets):  # markers and the uv grap
 
 `check_packages([...])` checks many packages in parallel, and `check_package(..., files=[...])` works offline from filenames you already have.
 
+To count packages that Pyodide ships itself, as `--pyodide-lock` does, pass `pyodide_locks=[wheelgap.pyodide.load_pyodide_lock("pyodide-lock.json")]` (a path or https URL, one lock per Python) to `check_packages()`, `check_package()` or `check_lockfile()`. They show as `bundled` on pyodide targets for the lock's Python, and the result's `bundled_version` is the version Pyodide ships. A different version from your pin or range still counts as `bundled` (`ok` stays `True`, as in the CLI), so check `bundled_version_differs`; `to_dict()` includes both as `"bundled"` and `"bundled_version_differs"`. A lock that no pyodide target can use raises `PyodideLockError`, as on the command line.
+
 ### Scanning the top PyPI packages
 
 ```bash
@@ -307,6 +309,8 @@ python -m wheelgap.scan --top 5000 --out coverage.json
 ```
 
 This checks the latest release of the most-downloaded packages (from [top-pypi-packages](https://hugovk.dev/top-pypi-packages/)) against the eight common platforms (and Pyodide), for Python 3.13, 3.14, 3.14t, 3.15 and 3.15t by default, and writes one JSON file with per-platform totals. It's the data behind the [coverage tracker on the roadmap](https://github.com/wheelgap/wheelgap/discussions/43).
+
+Add `--pyodide-lock PATH_OR_URL` once per Pyodide release (each is for one Python) to count the packages Pyodide ships itself as `bundled` on that Python's `pyodide` target; the per-target `summary` counts them too, and `pyodide_locks` in the JSON lists the locks used. Pyodide targets with no lock get a note on stderr.
 
 ### With an AI coding agent
 
