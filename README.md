@@ -336,6 +336,8 @@ for r in wheelgap.check_lockfile("uv.lock", targets):  # markers and the uv grap
 
 `check_lockfile(..., offline=True)` never contacts an index: it raises `wheelgap.sources.SourceError` if an input has no locked file list and skips the re-check for Python versions outside the lock's `requires-python` (so those versions may show false gaps). It cannot be combined with `online=True`.
 
+The package ships a `py.typed` marker (PEP 561), so mypy, pyright and other type checkers use its annotations.
+
 `check_packages([...])` checks many packages in parallel, and `check_package(..., files=[...])` works offline from filenames you already have.
 
 To count packages that Pyodide ships itself, as `--pyodide-lock` does, pass `pyodide_locks=[wheelgap.pyodide.load_pyodide_lock("pyodide-lock.json")]` (a path or https URL, one lock per Python) to `check_packages()`, `check_package()` or `check_lockfile()`. They show as `bundled` on pyodide targets for the lock's Python, and the result's `bundled_version` is the version Pyodide ships. A different version from your pin or range still counts as `bundled` (`ok` stays `True`, as in the CLI), so check `bundled_version_differs`; `to_dict()` includes both as `"bundled"` and `"bundled_version_differs"`. A lock that no pyodide target can use raises `PyodideLockError`, as on the command line.
