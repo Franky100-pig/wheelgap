@@ -371,6 +371,14 @@ On Claude Code 2.1.275 or later, `/plugin install wheelgap --marketplace wheelga
 
 **Codex, Cursor, GitHub Copilot and others:** copy [`integrations/claude-code/skills/check-wheels/`](integrations/claude-code/skills/check-wheels/) into your project's `.agents/skills/` folder. For a Cursor project rule instead, copy [`integrations/cursor/wheelgap.mdc`](integrations/cursor/wheelgap.mdc) to `.cursor/rules/`.
 
+**As an MCP server** (new, not yet released): `wheelgap-mcp` lets any agent that speaks the [Model Context Protocol](https://modelcontextprotocol.io/) call wheelgap as a tool, with no shell access needed. It runs over stdio and has three read-only tools: `check_package` (one package, latest or a given version), `check_lockfile` and `list_targets`. `check_lockfile` gives the same answer as `wheelgap PATH --json`, `[tool.wheelgap]` settings included: it returns the packages with gaps, the ones it skipped (git, path and private-index packages, which aren't checked) and any notes. Like wheelgap, it needs nothing beyond `packaging`. Until the next release, run it from GitHub; for Claude Code:
+
+```bash
+claude mcp add wheelgap -- uvx --from git+https://github.com/wheelgap/wheelgap wheelgap-mcp
+```
+
+Other clients take the same command (`uvx`) and arguments in their MCP settings. Pass `check_lockfile` an absolute path, since the server's working directory may not be your project.
+
 Contributing to wheelgap with an agent? See [AGENTS.md](https://github.com/wheelgap/wheelgap/blob/main/AGENTS.md).
 
 ## How it works
