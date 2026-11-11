@@ -138,7 +138,8 @@ def make_parser() -> argparse.ArgumentParser:
         metavar="PLATFORM",
         help=(
             "target platform (repeatable; 'all' for the 8 common ones, 'everything' adds armv7l, ppc64le, "
-            f"s390x and riscv64 Linux, 'mobile' is iOS and Android; default: {','.join(DEFAULT_PLATFORMS)})"
+            "s390x, riscv64 and i686 Linux and win32, 'mobile' is iOS and Android; "
+            f"default: {','.join(DEFAULT_PLATFORMS)})"
         ),
     )
     p.add_argument("--glibc", metavar="X.Y", help=f"glibc version for linux-* targets (default: {DEFAULT_GLIBC})")

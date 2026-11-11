@@ -31,18 +31,24 @@ ARCHES = {
     "linux/ppc64le": "ppc64le",
     "linux/s390x": "s390x",
     "linux/riscv64": "riscv64",
+    "linux/386": "i686",
+    "linux/i386": "i686",  # containerd normalises it to linux/386
 }
 WINDOWS_VARIANTS = ("windowsservercore", "nanoserver")
 IMAGE_NAMES = ("python", "library/python", "docker.io/library/python", "docker.io/python")
 UV_IMAGE = "ghcr.io/astral-sh/uv"
 UV_ARCHES = {"x86_64", "aarch64"}
 # Arches the official python images are published for, by Debian release (trixie and alpine have them all).
-# Checked on Docker Hub 2026-11-10 for the X.Y tags (python:3.13-bookworm, python:3.13-slim-bullseye).
-DEBIAN_ARCHES = {"bookworm": {"x86_64", "aarch64", "armv7l", "ppc64le"}, "bullseye": {"x86_64", "aarch64", "armv7l"}}
+# Checked on Docker Hub 2026-11-10 for the X.Y tags (python:3.13-bookworm, python:3.13-slim-bullseye), and
+# 2026-11-11 for linux/386.
+DEBIAN_ARCHES = {
+    "bookworm": {"x86_64", "aarch64", "armv7l", "ppc64le", "i686"},
+    "bullseye": {"x86_64", "aarch64", "armv7l", "i686"},
+}
 # Images that stopped being rebuilt before Docker Hub dropped ppc64le/s390x still have them: patch and pre-release
 # tags (python:3.12.7-bookworm, python:3.11.0-bullseye) and these end-of-life X.Y tags. riscv64 was never built for
 # either release.
-OLD_DEBIAN_ARCHES = {"x86_64", "aarch64", "armv7l", "ppc64le", "s390x"}
+OLD_DEBIAN_ARCHES = {"x86_64", "aarch64", "armv7l", "ppc64le", "s390x", "i686"}
 OLD_DEBIAN_TAGS = {
     ("3.6", "bullseye"),
     ("3.7", "bullseye"),
