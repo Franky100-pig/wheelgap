@@ -16,6 +16,10 @@ Tools (all read-only; they look packages up on PyPI, or the index in WHEELGAP_IN
 - check_dockerfile: what `wheelgap PATH --dockerfile DOCKERFILE --json` reports, plus the image it read.
 - diff_lockfiles: what `wheelgap diff OLD NEW --json` reports (the packages that got worse, and new ones with gaps).
 - list_targets: the platform names the other tools accept.
+
+Paths may be file:// URIs. If the client has the roots capability, the server asks it for roots/list after
+notifications/initialized (and again on notifications/roots/list_changed), and a relative path is resolved against the
+first root that contains it, then against the working directory.
 """
 
 from __future__ import annotations
@@ -23,11 +27,15 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import re
 import sys
 import threading
+import urllib.parse
+import urllib.request
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -163,8 +171,8 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path to the lockfile or project directory (relative paths are resolved "
-                    "against the server's working directory).",
+                    "description": "Absolute path or file:// URI of the lockfile or project directory (a relative "
+                    "path is resolved against the client's roots, then the server's working directory).",
                 },
                 "python": _PYTHON_PROP
                 | {
@@ -202,13 +210,13 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "dockerfile": {
                     "type": "string",
-                    "description": "Absolute path to the Dockerfile (relative paths are resolved against the server's "
-                    "working directory).",
+                    "description": "Absolute path or file:// URI of the Dockerfile (a relative path is resolved "
+                    "against the client's roots, then the server's working directory).",
                 },
                 "path": {
                     "type": "string",
-                    "description": "Absolute path to the lockfile or project directory. Default: the Dockerfile's "
-                    "folder.",
+                    "description": "Absolute path or file:// URI of the lockfile or project directory. Default: the "
+                    "Dockerfile's folder.",
                 },
                 "targets": _TARGETS_PROP
                 | {
@@ -409,6 +417,23 @@ def _check_dockerfile(args: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# The client's roots (from roots/list) for the call running on this thread; Server._call sets it.
+_ROOTS: ContextVar[tuple[Path, ...]] = ContextVar("wheelgap_mcp_roots", default=())
+_URI_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+def _file_uri_path(uri: str) -> Path | None:
+    """The local path of a file:// URI (Windows file:///C:/... too), or None if it isn't one on this machine."""
+    parts = urllib.parse.urlsplit(uri)
+    if parts.scheme.lower() != "file":
+        return None
+    if parts.netloc.lower() in ("", "localhost"):
+        return Path(urllib.request.url2pathname(parts.path))
+    if os.name == "nt":  # file://server/share/... is a UNC path there
+        return Path(urllib.request.url2pathname(f"//{parts.netloc}{parts.path}"))
+    return None
+
+
 def _diff_lockfiles(args: dict[str, Any]) -> dict[str, Any]:
     """`wheelgap diff OLD NEW --json`, through diff.py's functions rather than its main(), plus ok."""
     from . import diff
@@ -444,7 +469,17 @@ def _diff_lockfiles(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _existing(raw: str) -> Path:
-    path = Path(raw).expanduser()
+    """An argument naming a file or directory: a path or a file:// URI. A relative path is looked for in the client's
+    roots first (the first root that contains it wins), then in the server's working directory."""
+    if _URI_RE.match(raw):
+        uri_path = _file_uri_path(raw)
+        if uri_path is None:
+            raise ToolError(f"{raw}: only file:// URIs for this machine are accepted (or pass an absolute path)")
+        path = uri_path
+    else:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = next((root / path for root in _ROOTS.get() if (root / path).exists()), path)
     if not path.exists():
         raise ToolError(f"{raw}: no such file or directory (pass an absolute path)")
     return path
@@ -554,6 +589,10 @@ class Server:
         self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wheelgap-mcp") if send else None
         self._calls: dict[str | int, _Call] = {}
         self._lock = threading.Lock()  # guards _calls and each _Call's cancelled flag
+        self._client_roots = False  # the client declared the roots capability in initialize
+        self._roots_request: str | None = None  # the id of our roots/list request still waiting for its answer
+        self._roots_sent = 0
+        self._roots: tuple[Path, ...] = ()
 
     def close(self, wait: bool = True) -> None:
         """Wait for queued and running calls to send their results (or, with wait=False, drop the queued ones)."""
@@ -601,6 +640,12 @@ class Server:
             # A notification (initialized, cancelled, ...) or a response to us: nothing to send.
             if method == "notifications/cancelled" and isinstance(params, dict):
                 self._cancel(params.get("requestId"))
+            elif method in ("notifications/initialized", "notifications/roots/list_changed"):
+                self._ask_for_roots()
+            elif (
+                "method" not in message and self._roots_request is not None and message.get("id") == self._roots_request
+            ):
+                self._roots_answer(message)
             return None
         msg_id = message["id"]
         if not isinstance(msg_id, (str, int)) or isinstance(msg_id, bool):
@@ -688,7 +733,32 @@ class Server:
             call.sent = progress
             self._send({"jsonrpc": "2.0", "method": "notifications/progress", "params": params})
 
+    def _ask_for_roots(self) -> None:
+        """Send roots/list if the client has roots. Its answer arrives on stdin like any other message and is read
+        by the same loop (see _roots_answer), so nothing waits for it: a client that never answers can't stall the
+        server, and a call handled before the answer resolves relative paths against the working directory, as
+        it would without roots. The worker only ever reads the tuple, which is replaced whole."""
+        if not self._client_roots or self._send is None:
+            return
+        self._roots_sent += 1
+        self._roots_request = f"wheelgap-roots-{self._roots_sent}"
+        self._send({"jsonrpc": "2.0", "id": self._roots_request, "method": "roots/list"})
+
+    def _roots_answer(self, message: dict[str, Any]) -> None:
+        self._roots_request = None
+        result = message.get("result")
+        roots = result.get("roots") if isinstance(result, dict) else None
+        paths = []
+        for root in roots if isinstance(roots, list) else ():
+            uri = root.get("uri") if isinstance(root, dict) else None
+            path = _file_uri_path(uri) if isinstance(uri, str) else None
+            if path is not None:
+                paths.append(path)
+        self._roots = tuple(paths)  # an error or a malformed answer leaves no roots
+
     def _initialize(self, params: dict[str, Any]) -> dict[str, Any]:
+        capabilities = params.get("capabilities")
+        self._client_roots = isinstance(capabilities, dict) and isinstance(capabilities.get("roots"), dict)
         asked = params.get("protocolVersion")
         self.protocol_version = asked if asked in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[-1]
         return {
@@ -699,6 +769,7 @@ class Server:
         }
 
     def _call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        roots = _ROOTS.set(self._roots)
         try:
             # wheelgap's own messages go to stderr already; this keeps any stray print off the protocol stream.
             with contextlib.redirect_stdout(sys.stderr):
@@ -708,6 +779,8 @@ class Server:
             return {"content": [{"type": "text", "text": str(e)}], "isError": True}
         except Exception as e:  # a bug: report it to the model rather than end the connection
             return {"content": [{"type": "text", "text": f"internal error: {type(e).__name__}: {e}"}], "isError": True}
+        finally:
+            _ROOTS.reset(roots)
         result: dict[str, Any] = {"content": [{"type": "text", "text": text}], "isError": False}
         if self.protocol_version >= _STRUCTURED_FROM:
             result["structuredContent"] = data

@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -724,6 +725,142 @@ def test_check_dockerfile_errors_carry_no_cli_advice_where_none_applies(tmp_path
     (_, reply) = run(init(), call("check_dockerfile", dockerfile=str(tmp_path / "Dockerfile"), path=str(tmp_path)))
     text = reply["result"]["content"][0]["text"]
     assert reply["result"]["isError"] is True and "check_lockfile" not in text
+
+
+def init_with_roots() -> dict:
+    message = init()
+    message["params"]["capabilities"] = {"roots": {"listChanged": True}}
+    return message
+
+
+INITIALIZED = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+
+
+def roots_answer(*paths, msg_id: str = "wheelgap-roots-1") -> dict:
+    return {"jsonrpc": "2.0", "id": msg_id, "result": {"roots": [{"uri": p.as_uri(), "name": p.name} for p in paths]}}
+
+
+def test_check_lockfile_accepts_a_file_uri(fake_pypi, fixtures, tmp_path):
+    project = tmp_path / "my app"  # a space, so the URI is percent-encoded
+    project.mkdir()
+    (project / "uv.lock").write_bytes((fixtures / "uvproj" / "uv.lock").read_bytes())
+    uri = (project / "uv.lock").as_uri()
+    assert "%20" in uri
+    (_, reply) = run(init(), call("check_lockfile", path=uri, python="3.13", targets=["linux-x86_64"]))
+    assert reply["result"]["isError"] is False
+    data = reply["result"]["structuredContent"]
+    assert data["path"] == str((project / "uv.lock").resolve())
+    assert {g["name"] for g in data["gaps"]} == {"nativeext", "puresdist"}
+
+
+def test_check_dockerfile_accepts_file_uris(fake_pypi, tmp_path, fixtures):
+    dockerfile = dockerfile_project(tmp_path, fixtures, "FROM python:3.13-alpine\n")
+    (_, reply) = run(init(), call("check_dockerfile", dockerfile=dockerfile.as_uri(), path=tmp_path.as_uri()))
+    assert reply["result"]["structuredContent"]["targets"] == ["3.13 musl-x86_64"]
+
+
+@pytest.mark.parametrize("uri", ["https://example.com/uv.lock", "ftp://example.com/uv.lock"])
+def test_other_uris_are_tool_errors(fake_pypi, uri):
+    (_, reply) = run(init(), call("check_lockfile", path=uri))
+    assert reply["result"]["isError"] is True
+    assert "only file:// URIs" in reply["result"]["content"][0]["text"]
+    assert not fake_pypi
+
+
+def test_a_file_uri_for_another_host_is_unc_on_windows_only(fake_pypi):
+    uri = "file://otherhost/srv/app/uv.lock"
+    if os.name == "nt":  # a UNC path; not opened here, so the test doesn't wait on the network
+        assert mcp._file_uri_path(uri) == mcp.Path(r"\\otherhost\srv\app\uv.lock")
+        return
+    assert mcp._file_uri_path(uri) is None
+    (_, reply) = run(init(), call("check_lockfile", path=uri))
+    assert reply["result"]["isError"] is True
+    assert "only file:// URIs" in reply["result"]["content"][0]["text"]
+    assert not fake_pypi
+
+
+def test_file_uri_to_path_handles_localhost_and_windows_drives(monkeypatch):
+    assert mcp._file_uri_path("file://localhost/srv/app/uv.lock") == mcp.Path("/srv/app/uv.lock")
+    assert mcp._file_uri_path("FILE:///srv/a%20b") == mcp.Path("/srv/a b")
+    assert mcp._file_uri_path("https://example.com/x") is None
+    # On Windows, url2pathname turns /C:/... into C:\...; here, check the drive is passed to it intact.
+    seen = []
+    monkeypatch.setattr(mcp.urllib.request, "url2pathname", lambda p: seen.append(p) or p)
+    mcp._file_uri_path("file:///C:/Users/me/app/uv.lock")
+    assert seen == ["/C:/Users/me/app/uv.lock"]
+
+
+def test_relative_path_resolves_against_the_client_roots(fake_pypi, fixtures, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # the server's working directory has no uvproj
+    other = tmp_path / "other"
+    other.mkdir()
+    replies = run(
+        init_with_roots(),
+        INITIALIZED,
+        roots_answer(other, fixtures),  # the first root that contains the path wins
+        call("check_lockfile", path="uvproj/uv.lock", python="3.13", targets=["linux-x86_64"]),
+    )
+    (_, request, reply) = replies
+    assert request == {"jsonrpc": "2.0", "id": "wheelgap-roots-1", "method": "roots/list"}
+    assert reply["id"] == 1 and reply["result"]["isError"] is False
+    assert reply["result"]["structuredContent"]["path"] == str((fixtures / "uvproj" / "uv.lock").resolve())
+
+
+def test_roots_list_changed_asks_again(fake_pypi, fixtures, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    replies = run(
+        init_with_roots(),
+        INITIALIZED,
+        roots_answer(tmp_path),
+        {"jsonrpc": "2.0", "method": "notifications/roots/list_changed"},
+        roots_answer(fixtures, msg_id="wheelgap-roots-2"),
+        call("check_lockfile", path="uvproj", python="3.13", targets=["linux-x86_64"]),
+    )
+    assert [r.get("method") for r in replies] == [None, "roots/list", "roots/list", None]
+    assert replies[2]["id"] == "wheelgap-roots-2"
+    assert replies[3]["result"]["isError"] is False
+
+
+def test_no_roots_request_without_the_capability(fake_pypi, fixtures, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (_, reply) = run(init(), INITIALIZED, call("check_lockfile", path="uvproj"))
+    assert "roots/list" not in json.dumps(reply)
+    assert reply["result"]["isError"] is True and "no such file or directory" in reply["result"]["content"][0]["text"]
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"jsonrpc": "2.0", "id": "wheelgap-roots-1", "error": {"code": -32601, "message": "no roots"}},
+        {"jsonrpc": "2.0", "id": "wheelgap-roots-1", "result": {"roots": "nope"}},
+        {"jsonrpc": "2.0", "id": "wheelgap-roots-1", "result": {"roots": [{"uri": "https://example.com/"}, 3]}},
+    ],
+)
+def test_a_bad_roots_answer_means_the_working_directory(fake_pypi, fixtures, monkeypatch, answer):
+    monkeypatch.chdir(fixtures)
+    (_, _, reply) = run(init_with_roots(), INITIALIZED, answer, call("check_lockfile", path="uvproj", python="3.13"))
+    assert reply["result"]["isError"] is False
+    assert reply["result"]["structuredContent"]["path"] == str((fixtures / "uvproj").resolve())
+
+
+def test_relative_path_in_no_root_falls_back_to_the_working_directory(fake_pypi, fixtures, tmp_path, monkeypatch):
+    monkeypatch.chdir(fixtures)
+    (_, _, reply) = run(
+        init_with_roots(), INITIALIZED, roots_answer(tmp_path), call("check_lockfile", path="uvproj", python="3.13")
+    )
+    assert reply["result"]["structuredContent"]["path"] == str((fixtures / "uvproj").resolve())
+
+
+def test_an_error_response_with_no_id_leaves_the_roots_alone(fake_pypi, fixtures, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    replies = run(
+        init_with_roots(),
+        INITIALIZED,
+        roots_answer(fixtures),
+        {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}},  # not an answer to us
+        call("check_lockfile", path="uvproj", python="3.13", targets=["linux-x86_64"]),
+    )
+    assert replies[-1]["result"]["isError"] is False
 
 
 def lockfile_pair(tmp_path, old: str, new: str) -> tuple[str, str]:
