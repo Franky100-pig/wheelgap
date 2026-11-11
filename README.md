@@ -232,7 +232,7 @@ prints a note saying so. Use a lockfile for the full picture.
 `optional-dependencies` with `--extra`/`--all-extras` and Poetry dependencies kept in
 `[tool.poetry.dependencies]` (check `poetry.lock` instead). `wheelgap .` in a directory with no lockfile
 doesn't switch to `pyproject.toml` on its own; the error suggests it. `check_lockfile()` and
-`python -m wheelgap.diff` don't read `pyproject.toml`.
+`wheelgap diff` don't read `pyproject.toml`.
 
 ### Targets
 
@@ -351,10 +351,10 @@ Add `--pyodide-lock PATH_OR_URL` once per Pyodide release (each is for one Pytho
 ### Comparing two lockfiles
 
 ```bash
-python -m wheelgap.diff old/uv.lock uv.lock -p 3.13 -t linux-aarch64,musl-aarch64
+wheelgap diff old/uv.lock uv.lock -p 3.13 -t linux-aarch64,musl-aarch64
 ```
 
-This checks both lockfiles and lists the packages that got worse on a target (a wheel that became a source build, say) and the new packages with gaps, so a dependency bump that drops a platform fails CI. It exits 1 if there are any, 0 if not, and 2 on bad input. A package that can no longer be checked counts as worse: `unknown`, or now installed from git, a path, a URL or a private index (a new one of those counts as a new gap). Packages are matched by name, so a requirements-file path with no name (`./pkg`, or `-e ./pkg` without `#egg=`) shows up as a new package rather than as the one it replaced. The same `-p` and `-t` apply to both lockfiles, and `[tool.wheelgap]` and `.python-version` aren't read yet, so pass them explicitly. It's a module entry point for now; `wheelgap diff` will follow.
+This checks both lockfiles and lists the packages that got worse on a target (a wheel that became a source build, say) and the new packages with gaps, so a dependency bump that drops a platform fails CI. It exits 1 if there are any, 0 if not, and 2 on bad input. A package that can no longer be checked counts as worse: `unknown`, or now installed from git, a path, a URL or a private index (a new one of those counts as a new gap). Packages are matched by name, so a requirements-file path with no name (`./pkg`, or `-e ./pkg` without `#egg=`) shows up as a new package rather than as the one it replaced. The same `-p` and `-t` apply to both lockfiles, and `[tool.wheelgap]` and `.python-version` aren't read yet, so pass them explicitly. `--json` prints one object with `worse` (each package's `old_versions` and `new_versions` lists and, per target, `old_status` and `new_status`), `new` (each new package's `versions` and per-target `status`), `unchecked` and `summary` counts; a skipped cell has the status `skipped` and a `skip_reason` (`git`, `url`, `private index`, ...). `diff` is a subcommand only as the first argument when there's no file or folder named `diff` in the current directory (then it's read as an input, with a note; `python -m wheelgap.diff` always compares, and a pinned `diff==2023.12.6` checks the PyPI package of that name). `python -m wheelgap.diff` works the same way.
 
 ### With an AI coding agent
 
@@ -410,8 +410,6 @@ wheelgap is growing into **caniuse for Python wheels**: an open map of which pac
 Next up for the CLI, each with a first step written up and no PR yet:
 
 - "nearest version with a wheel" hints ([#20](https://github.com/wheelgap/wheelgap/issues/20))
-- `wheelgap diff`: the new gaps between two lockfiles, for PR comments ([#51](https://github.com/wheelgap/wheelgap/issues/51))
-- caching index lookups between runs ([#65](https://github.com/wheelgap/wheelgap/issues/65))
 - version ranges: picking the newest release that supports each target's Python ([#84](https://github.com/wheelgap/wheelgap/issues/84))
 
 The [roadmap](https://github.com/wheelgap/wheelgap/labels/roadmap) and [help wanted](https://github.com/wheelgap/wheelgap/labels/help%20wanted) labels have more.

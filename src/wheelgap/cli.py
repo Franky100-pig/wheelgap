@@ -863,6 +863,18 @@ def main(argv: list[str] | None = None) -> int:
                 reconfigure(encoding="utf-8", errors="replace")
             else:
                 reconfigure(errors="replace")
+    argv = sys.argv[1:] if argv is None else argv
+    # `wheelgap diff OLD NEW`: a subcommand only when "diff" comes first and isn't a file or folder here, so
+    # `wheelgap ./diff` still checks a folder named diff (and `wheelgap diff==1.0` the PyPI package).
+    if argv[:1] == ["diff"]:
+        if not Path("diff").exists():
+            from .diff import main as diff_main
+
+            return diff_main(argv[1:], prog="wheelgap diff")
+        print(
+            "wheelgap: note: reading ./diff as an input; for the comparison, run python -m wheelgap.diff",
+            file=sys.stderr,
+        )
     parser = make_parser()
     args = parser.parse_args(argv)
     if args.json and args.markdown:
