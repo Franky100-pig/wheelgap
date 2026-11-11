@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- An unknown target like `linux-aarch46` now suggests the closest name when there is one (`did you mean 'linux-aarch64'?`), instead of listing every platform. Names with no close match still get the full list, and so do real names for another platform (`macos-amd64`, `osx-arm64`) and Docker platforms, rather than a near neighbour that would be the wrong platform. (#184, thanks [@sarankumar1325](https://github.com/sarankumar1325))
 - A requirements file with unpinned or ranged requirements now prints a stderr note naming those packages, because the newest matching release is what was checked. `-q` hides it, and package names given on the command line are unchanged. (#185, thanks [@sarankumar1325](https://github.com/sarankumar1325))
 - `wheelgap --version` also prints the packaging and Python versions, including a `t` suffix on a free-threaded build, so bug reports have what is needed to reproduce a result. (#183, thanks [@sarankumar1325](https://github.com/sarankumar1325))
 - `check_lockfile(..., offline=True)` checks locked distribution files without contacting an index, rejects inputs that need a lookup, and skips re-checking locks made for another Python version, so those versions may show false gaps. (#182, thanks [@jwalith4418-Mj](https://github.com/jwalith4418-Mj))
