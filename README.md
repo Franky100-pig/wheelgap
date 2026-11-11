@@ -179,8 +179,8 @@ project extras are included only when requested. `--no-dev` removes `dev`, while
 excludes project dependencies and default groups. Combine `--only-group` with `--group` to add more
 groups, but not with `--extra`/`--all-extras`. An explicit `dev` group conflicts with `--no-dev`.
 Unknown extra/group names are errors. Command-line selectors need a `uv.lock` input, or for groups a Poetry 2.x
-`poetry.lock`, or for `--extra`/`--all-extras` a `pyproject.toml` (see below); configured `groups` apply to
-`uv.lock` and Poetry 2.x `poetry.lock` inputs, and configured `extras` only to `uv.lock` inputs.
+`poetry.lock` or a `pdm.lock`, or for `--extra`/`--all-extras` a `pyproject.toml` (see below); configured `groups`
+apply to `uv.lock`, Poetry 2.x `poetry.lock` and `pdm.lock` inputs, and configured `extras` only to `uv.lock` inputs.
 
 `poetry.lock` (Poetry 2.x) inputs accept `--group`, `--only-group` and `--no-dev` with Poetry's meanings, and
 configured `groups` apply to them too. `main` and every group not marked `optional = true` in
@@ -188,6 +188,16 @@ configured `groups` apply to them too. `main` and every group not marked `option
 and `--only-group` checks only the named groups (`main` only if named). A package counts if any of its groups is
 selected, with the markers of those groups. `--extra` isn't supported for `poetry.lock` yet, and a command-line
 selection on a Poetry 1.x lock (no per-package groups) is an error; configured `groups` leave a 1.x lock unfiltered.
+
+`pdm.lock` inputs take the same selectors with PDM's meanings, and configured `groups` apply to them too. Every
+group the lock was made for (its `[metadata] groups`: `default`, the dev groups and any optional-dependencies groups
+locked with `pdm lock -G`) counts, as with a plain `pdm install`; `--no-dev` leaves out `dev` (like
+`pdm install --without dev`), and `--only-group` checks only the named groups (`default` only if named), so PDM's
+`--prod` is `--only-group default` here. `--group` only checks that the group is locked, since it already counts. A
+group that's in `pyproject.toml` but not in the lock is an error (lock it with `pdm lock -G <name>`), as in PDM. A
+package counts if any of its groups is selected. `--extra` isn't supported for `pdm.lock`, and a command-line
+selection on a lock without package groups (one locked without the `inherit_metadata` strategy) is an error;
+configured `groups` leave such a lock unfiltered.
 
 Default selections can also be configured:
 
