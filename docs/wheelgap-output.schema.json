@@ -66,6 +66,20 @@
                     "type": "integer",
                     "minimum": 0,
                     "description": "Packages whose results include source, missing or unknown."
+                },
+                "per_target": {
+                    "type": "object",
+                    "description": "Gap counts for every checked target, keyed by target label, with zeros for a target without gaps (including when only one target is checked). Present from the release after 0.8.0 on; older versions leave it out.",
+                    "additionalProperties": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["source", "missing", "unknown"],
+                        "properties": {
+                            "source": {"type": "integer", "minimum": 0, "description": "Packages that build from source on this target."},
+                            "missing": {"type": "integer", "minimum": 0, "description": "Packages that can't install on this target."},
+                            "unknown": {"type": "integer", "minimum": 0, "description": "Packages wheelgap couldn't check for this target."}
+                        }
+                    }
                 }
             }
         }
