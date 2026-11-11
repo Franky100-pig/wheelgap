@@ -14,7 +14,9 @@ from pathlib import Path
 
 import packaging
 from packaging.markers import InvalidMarker, Marker
+from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 
 from . import __version__
 from .api import running_python
@@ -426,11 +428,31 @@ def render_explain(rows: list[Row], targets: list[Target], style: Style) -> list
     return out
 
 
+def bundled_version_differs(r: Row, lock: PyodideLock) -> bool:
+    """Pyodide ships a version the input doesn't allow: micropip.install of that requirement would fail.
+
+    A pin is compared as a version (0.9 == 0.9.0), a range by whether it contains Pyodide's version, and a
+    requirement with neither (the index picked the newest release) never differs.
+    """
+    pkg, have = r.package, lock.packages[r.package.key]
+    if pkg.version_from_index:
+        return pkg.spec is not None and not SpecifierSet(pkg.spec).contains(have, prereleases=True)
+    if not pkg.version:
+        return False
+    try:
+        return Version(pkg.version) != Version(have)
+    except InvalidVersion:
+        return pkg.version != have
+
+
 def bundled_line(rows: list[Row], lock: PyodideLock) -> str:
     def one(r: Row) -> str:
-        have = lock.packages[r.package.key]
-        pinned = r.package.version
-        return f"{r.package.name} {have}" + (f" (you pinned {pinned})" if pinned and pinned != have else "")
+        have, pkg = lock.packages[r.package.key], r.package
+        if not bundled_version_differs(r, lock):
+            return f"{pkg.name} {have}"
+        return f"{pkg.name} {have} " + (
+            f"(outside {pkg.spec})" if pkg.version_from_index else f"(you pinned {pkg.version})"
+        )
 
     noun = "package comes" if len(rows) == 1 else "packages come"
     return f"{len(rows)} {noun} from Pyodide {lock.pyodide_version}'s own builds: " + ", ".join(map(one, rows))
@@ -457,6 +479,7 @@ def report_json(
         }
         if pyodide_lock and Status.BUNDLED in r.results.values():
             out["bundled"] = pyodide_lock.packages[r.package.key]
+            out["bundled_version_differs"] = bundled_version_differs(r, pyodide_lock)
         if explained:
             out["rejected"] = {
                 t.label(multi_py): [{"file": f, "reason": why} for f, why in explain(r.package.files or [], t)]
@@ -947,6 +970,12 @@ def main(argv: list[str] | None = None) -> int:
             print("gaps: " + ", ".join(r.package.name for r in gaps))
         if ignored:
             print(style.dim("ignored: " + ", ".join(ignored)))
+        if pyodide_lock:  # a bundled build of another version passes, but quiet mode mustn't hide that (#75)
+            differs = [
+                r for r in rows if Status.BUNDLED in r.results.values() and bundled_version_differs(r, pyodide_lock)
+            ]
+            if differs:
+                print(style.dim(bundled_line(differs, pyodide_lock)))
         for r in rows:
             if r.package.error:  # say why a package is "unknown", even in quiet mode
                 print(f"wheelgap: could not check {r.package.name}: {r.package.error}", file=sys.stderr)

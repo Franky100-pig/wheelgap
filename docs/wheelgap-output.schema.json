@@ -110,6 +110,10 @@
                 "bundled": {
                     "description": "Present with --pyodide-lock when this package is bundled on a Pyodide target: the version Pyodide ships.",
                     "type": "string"
+                },
+                "bundled_version_differs": {
+                    "description": "Present with bundled: true when Pyodide's version isn't the one pinned, or is outside the required range (it still counts as bundled). Always false for an unpinned requirement.",
+                    "type": "boolean"
                 }
             }
         }

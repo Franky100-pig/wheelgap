@@ -52,6 +52,8 @@ class Package:
     yanked: frozenset[str] = frozenset()
     # uv.lock / pylock.toml / poetry.lock: the index the lock says the package came from, e.g. https://pypi.org/simple.
     registry: str | None = None
+    # The index picked `version` (an unpinned or ranged requirement): it isn't a pin from the input.
+    version_from_index: bool = False
 
     @property
     def key(self) -> str:

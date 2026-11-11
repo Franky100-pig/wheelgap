@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- With `--pyodide-lock`, a package Pyodide bundles at a different version than you pinned is no longer hidden by `-q`, and `--json` marks it with `"bundled_version_differs": true`. It still counts as `bundled` and passes. The note no longer names unpinned requirements or a pin written another way (`0.9` for `0.9.0`), and a range only counts when Pyodide's version is outside it. (#186)
 - An unknown target like `linux-aarch46` now suggests the closest name when there is one (`did you mean 'linux-aarch64'?`), instead of listing every platform. Names with no close match still get the full list, and so do real names for another platform (`macos-amd64`, `osx-arm64`) and Docker platforms, rather than a near neighbour that would be the wrong platform. (#184, thanks [@sarankumar1325](https://github.com/sarankumar1325))
 - A requirements file with unpinned or ranged requirements now prints a stderr note naming those packages, because the newest matching release is what was checked. `-q` hides it, and package names given on the command line are unchanged. (#185, thanks [@sarankumar1325](https://github.com/sarankumar1325))
 - `wheelgap --version` also prints the packaging and Python versions, including a `t` suffix on a free-threaded build, so bug reports have what is needed to reproduce a result. (#183, thanks [@sarankumar1325](https://github.com/sarankumar1325))

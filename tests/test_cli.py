@@ -1462,7 +1462,7 @@ def test_ignore_unmatched_does_not_change_exit_code(capsys, fixtures):
 
 
 OUTPUT_SCHEMA = Path(__file__).parent.parent / "docs" / "wheelgap-output.schema.json"
-JSON_TYPES = {"object": dict, "array": list, "string": str, "integer": int, "null": type(None)}
+JSON_TYPES = {"object": dict, "array": list, "string": str, "integer": int, "boolean": bool, "null": type(None)}
 
 
 def _check_schema(value, schema, root, where="$"):
@@ -1477,7 +1477,10 @@ def _check_schema(value, schema, root, where="$"):
     if "type" in schema:
         names = schema["type"] if isinstance(schema["type"], list) else [schema["type"]]
         # bool is an int in Python, but not an integer in JSON Schema
-        assert not isinstance(value, bool) and isinstance(value, tuple(JSON_TYPES[n] for n in names)), (where, value)
+        if isinstance(value, bool):
+            assert "boolean" in names, (where, value)
+        else:
+            assert isinstance(value, tuple(JSON_TYPES[n] for n in names)), (where, value)
     if "enum" in schema:
         assert value in schema["enum"], (where, value)
     if "minimum" in schema:
@@ -1522,7 +1525,16 @@ def _assert_matches_output_schema(data):
     assert len(labels) == len(set(labels))
     for pkg in data["packages"]:
         assert {"name", "version", "error", "results"} <= set(pkg)
-        assert set(pkg) <= {"name", "version", "error", "results", "rejected", "via", "bundled"}
+        assert set(pkg) <= {
+            "name",
+            "version",
+            "error",
+            "results",
+            "rejected",
+            "via",
+            "bundled",
+            "bundled_version_differs",
+        }
         assert isinstance(pkg["name"], str) and pkg["name"]
         assert pkg["version"] is None or isinstance(pkg["version"], str)
         assert pkg["error"] is None or isinstance(pkg["error"], str)

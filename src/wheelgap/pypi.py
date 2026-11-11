@@ -230,7 +230,7 @@ def fill_simple(pkg: Package, base: str, auth: str | None, python: str | None = 
             else:
                 pkg.error = "not on index"
             return pkg
-        pkg.version = str(chosen)
+        pkg.version, pkg.version_from_index = str(chosen), True
         pkg.files = [e["filename"] for e in live[chosen]]
     except (ValueError, TypeError, KeyError, AttributeError):  # InvalidVersion is a ValueError
         pkg.error = "unexpected response from the index"
@@ -325,11 +325,13 @@ def fill(pkg: Package, python: str | None = None) -> Package:
                 pkg.error = f"no release matches {pkg.spec}" + (f" for Python {python}" if python else "")
                 return pkg
             pkg.version, urls = found
+            pkg.version_from_index = True
         else:
             urls = _files(data.get("urls", []))
             if not pinned:
                 info = data.get("info")
                 pkg.version = info.get("version") if isinstance(info, dict) else None
+                pkg.version_from_index = True
         names = [u["filename"] for u in urls]
         if pinned:
             # Keep yanked files but mark them: check.status_for uses them only if nothing else fits (PEP 592).
