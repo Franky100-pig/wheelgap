@@ -1369,6 +1369,40 @@ def test_offline_and_online_are_a_usage_error(capsys, fixtures):
     assert "--offline and --online can't be used together" in capsys.readouterr().err
 
 
+def test_offline_from_config_never_contacts_the_index(capsys, tmp_path, fake_pypi):
+    (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\noffline = true\n", encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("fastlib==2.0.0\n", encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path / "requirements.txt"), "-p", "3.13")
+    assert code == 2 and not out and fake_pypi == []
+    assert err == (
+        "wheelgap: error: offline = true in [tool.wheelgap]: requirements.txt needs the index for 1 package "
+        "(fastlib); use a lockfile that lists each package's files, or pass --online for this run\n"
+    )
+
+
+def test_offline_from_config_skips_the_requires_python_recheck(capsys, fake_pypi, tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\noffline = true\n", encoding="utf-8")
+    (tmp_path / "uv.lock").write_text(LOCK_312_ONLY, encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path), "-q", "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert fake_pypi == []
+    assert "with offline = true in [tool.wheelgap] its packages weren't re-checked on the index" in err
+
+
+def test_online_flag_overrides_offline_in_config(capsys, tmp_path, fake_pypi):
+    (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\noffline = true\n", encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("fastlib==2.0.0\n", encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path / "requirements.txt"), "--online", "-p", "3.13", "--json")
+    assert code != 2 and fake_pypi  # looked up, not refused
+    assert json.loads(out)["packages"][0]["name"] == "fastlib"
+
+
+def test_offline_in_config_must_be_a_boolean(capsys, tmp_path, fixtures):
+    (tmp_path / "pyproject.toml").write_text('[tool.wheelgap]\noffline = "yes"\n', encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("fastlib==2.0.0\n", encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path / "requirements.txt"), "-p", "3.13")
+    assert code == 2 and "[tool.wheelgap] offline must be a boolean" in err
+
+
 def test_ignore_matches_no_package_prints_note(capsys, fixtures):
     code, out, err = run(
         capsys,

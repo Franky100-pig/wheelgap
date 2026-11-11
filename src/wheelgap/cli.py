@@ -270,9 +270,9 @@ def load_config(path: Path) -> dict:
                 raise SourceError(f"{path}: [tool.wheelgap] {key} must be {example}")
             if key == "fail-on" and value not in FAIL_ON:
                 raise SourceError(f"{path}: [tool.wheelgap] fail-on must be one of: {', '.join(FAIL_ON)}")
-        elif key == "quiet":
+        elif key in ("quiet", "offline"):
             if not isinstance(value, bool):
-                raise SourceError(f"{path}: [tool.wheelgap] quiet must be a boolean")
+                raise SourceError(f"{path}: [tool.wheelgap] {key} must be a boolean")
         else:
             raise SourceError(f"{path}: unknown key in [tool.wheelgap]: {key}")
         config[key] = value
@@ -676,7 +676,12 @@ def selected_packages(source: Source, targets: list[Target]) -> list[Package]:
     return [package for index, package in enumerate(source.packages) if index in selected]
 
 
-def require_offline(sources: list[Source]) -> None:
+def _undo_offline(how: str) -> str:
+    """How to turn offline mode off: drop the flag, or override the config key for one run."""
+    return "drop --offline" if how == "--offline" else "pass --online for this run"
+
+
+def require_offline(sources: list[Source], how: str = "--offline") -> None:
     """--offline: raise SourceError if an input has packages that can only be answered by looking them up."""
     problems = []
     for s in sources:
@@ -689,14 +694,14 @@ def require_offline(sources: list[Source]) -> None:
             )
     if problems:
         raise SourceError(
-            f"--offline: {'; '.join(problems)}; use a lockfile that lists each package's files, or drop --offline"
+            f"{how}: {'; '.join(problems)}; use a lockfile that lists each package's files, or {_undo_offline(how)}"
         )
 
 
-def refuse_pyodide_url(spec: str) -> None:
+def refuse_pyodide_url(spec: str, how: str = "--offline") -> None:
     """--offline: a pyodide-lock.json URL would be downloaded, so ask for a local copy instead."""
     if "://" in spec:
-        raise PyodideLockError(f"--offline: {spec} would be downloaded; save it and pass its path, or drop --offline")
+        raise PyodideLockError(f"{how}: {spec} would be downloaded; save it and pass its path, or {_undo_offline(how)}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -727,6 +732,9 @@ def main(argv: list[str] | None = None) -> int:
         pyproject = find_pyproject(args.inputs)
         config = load_config(pyproject) if pyproject else {}
         quiet = args.quiet if args.quiet is not None else config.get("quiet", False)
+        # offline = true is a project default, so --online on the command line wins over it.
+        offline = args.offline or (config.get("offline", False) and not args.online)
+        offline_how = "--offline" if args.offline else "offline = true in [tool.wheelgap]"
         # Quiet only changes the text output, so it can't clash with --explain when printing JSON or Markdown.
         if quiet and args.explain and not (args.json or args.markdown):
             parser.error("--explain cannot be used with quiet mode (--quiet or quiet = true; --no-quiet turns it off)")
@@ -794,13 +802,13 @@ def main(argv: list[str] | None = None) -> int:
                 # Configured extras/groups apply to uv.lock inputs only; on the command line they need one.
                 strict=bool(from_cli or args.only_group),
             )
-        if args.offline:
-            require_offline(sources)
+        if offline:
+            require_offline(sources, offline_how)
         fail_on = args.fail_on or config.get("fail-on", "source")
         pyodide_lock = None
         if args.pyodide_lock:
-            if args.offline:
-                refuse_pyodide_url(args.pyodide_lock)
+            if offline:
+                refuse_pyodide_url(args.pyodide_lock, offline_how)
             pyodide_lock = load_pyodide_lock(args.pyodide_lock)
             check_targets(pyodide_lock, targets)  # asked for explicitly, so a mismatch is an error
         elif (lock_spec := config.get("pyodide-lock")) and any(PLATFORMS[t.platform][0] == "pyodide" for t in targets):
@@ -808,8 +816,8 @@ def main(argv: list[str] | None = None) -> int:
             # affects `wheelgap -t linux` in the same project. A relative path is relative to pyproject.toml.
             if pyproject and not lock_spec.lower().startswith(("http://", "https://")):
                 lock_spec = str(pyproject.parent / lock_spec)
-            if args.offline:
-                refuse_pyodide_url(lock_spec)
+            if offline:
+                refuse_pyodide_url(lock_spec, offline_how)
             pyodide_lock = load_pyodide_lock(lock_spec)
             check_targets(pyodide_lock, targets)  # pyodide targets but none for this lock's Python: say so
     except (TargetError, SourceError, DockerfileError, PyodideLockError, OSError) as e:
@@ -840,11 +848,11 @@ def main(argv: list[str] | None = None) -> int:
         )
     for s, needed in zip(sources, needed_by_source, strict=True):
         if outside := pythons_outside_lock(s, targets):
-            if args.offline:  # no re-check, so every locked package may lack wheels for those Pythons
+            if offline:  # no re-check, so every locked package may lack wheels for those Pythons
                 print(
                     f"wheelgap: note: {s.label} is locked for Python {s.requires_python}, so it may be missing "
-                    f"wheels for Python {', '.join(outside)}; with --offline its packages weren't re-checked on the "
-                    "index, so they may show false gaps for those Pythons",
+                    f"wheels for Python {', '.join(outside)}; with {offline_how} its packages weren't re-checked "
+                    "on the index, so they may show false gaps for those Pythons",
                     file=sys.stderr,
                 )
                 continue
