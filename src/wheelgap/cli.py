@@ -681,7 +681,7 @@ def require_offline(sources: list[Source]) -> None:
     problems = []
     for s in sources:
         # A private-index package with no files is skipped by fill_all, not looked up, so it doesn't count.
-        need = [p.name for p in s.packages if not p.skip and p.files is None and is_pypi(p.registry)]
+        need = [p.name for p in s.packages if not p.skip and not p.error and p.files is None and is_pypi(p.registry)]
         if need:
             names = ", ".join(need[:3]) + (", …" if len(need) > 3 else "")
             problems.append(

@@ -395,7 +395,8 @@ def fill_all(
         if p.files is None and not p.skip and not is_pypi(p.registry):
             p.skip = "private index"  # the name is internal; a namesake on PyPI is another package
     kept = {id(p) for p in packages if refresh and keeps_locked_files(p)}
-    todo = [p for p in packages if not p.skip and id(p) not in kept and (refresh or p.files is None)]
+    # An error from parsing (a constraint wheelgap can't apply) stays unknown: a lookup would hide it.
+    todo = [p for p in packages if not p.skip and not p.error and id(p) not in kept and (refresh or p.files is None)]
     if todo:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             list(pool.map(fn, todo))

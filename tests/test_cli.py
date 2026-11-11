@@ -930,6 +930,28 @@ def test_markdown_lookup_errors_and_empty_names(capsys, fake_pypi, tmp_path):
     )
 
 
+# ranged: 1.5 wheel, 1.9 sdist only, 2.0 wheel. Unconstrained, 2.0 is checked (wheel).
+@pytest.mark.parametrize("constraint", ["ranged==1.9", "ranged<2"])
+def test_requirements_constraint_picks_the_checked_release(tmp_path, fake_pypi, capsys, constraint):
+    path = tmp_path / "requirements.txt"
+    path.write_text("ranged\n-c constraints.txt\n", encoding="utf-8")
+    (tmp_path / "constraints.txt").write_text(constraint + "\n", encoding="utf-8")
+    code, out, _ = run(capsys, str(path), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 1
+    assert "1.9" in out and "source" in out
+
+
+def test_requirements_marker_constraint_is_unknown(tmp_path, fake_pypi, capsys):
+    path = tmp_path / "requirements.txt"
+    path.write_text("ranged\n-c constraints.txt\n", encoding="utf-8")
+    (tmp_path / "constraints.txt").write_text('ranged<2; sys_platform == "win32"\n', encoding="utf-8")
+    code, out, _ = run(capsys, str(path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 1
+    (row,) = json.loads(out)["packages"]
+    assert row["version"] is None  # not looked up: the latest release isn't what pip would install
+    assert "marker" in row["error"]
+
+
 # requires-python ==3.12.*, so uv kept only fastlib's cp312 wheel; PyPI (fake_pypi) has a cp313 one.
 LOCK_312_ONLY = (
     'version = 1\nrequires-python = "==3.12.*"\n\n'

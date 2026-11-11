@@ -115,6 +115,69 @@ def test_requirements(fixtures):
     assert len(src.packages) == 5
 
 
+@pytest.mark.parametrize(
+    "option",
+    ["-c constraints.txt", "-cconstraints.txt", "--constraint constraints.txt", "--constraint=constraints.txt"],
+)
+def test_requirements_constraints_pin_without_adding_packages(tmp_path, option):
+    path = tmp_path / "requirements.txt"
+    path.write_text("ranged\n" + option + "\n", encoding="utf-8")
+    (tmp_path / "constraints.txt").write_text("ranged==1.9\nonly-constraint==2\n", encoding="utf-8")
+    packages = parse_requirements(path).packages
+    assert [(p.name, p.version, p.spec) for p in packages] == [("ranged", "1.9", None)]
+
+
+def test_requirements_nested_constraints_combine_ranges_and_keep_pins(tmp_path):
+    directory = tmp_path / "sub"
+    directory.mkdir()
+    path = tmp_path / "requirements.txt"
+    path.write_text("-r sub/more.txt\n-c sub/constraints.txt\n", encoding="utf-8")
+    (directory / "more.txt").write_text("ranged>=1.5\npinned==3\n", encoding="utf-8")
+    (directory / "constraints.txt").write_text("-c nested.txt\npinned==1\n", encoding="utf-8")
+    (directory / "nested.txt").write_text(
+        "ranged<2 \\\n    --hash=sha256:00  # note\n-c constraints.txt\n", encoding="utf-8"
+    )
+    ranged, pinned = parse_requirements(path).packages
+    assert ranged.spec == "<2,>=1.5"
+    assert ranged.version is None
+    assert pinned.version == "3"
+
+
+def test_requirements_marker_constraint_is_an_error(tmp_path):
+    path = tmp_path / "requirements.txt"
+    path.write_text("ranged\n-c constraints.txt\n", encoding="utf-8")
+    (tmp_path / "constraints.txt").write_text('ranged<2; sys_platform == "win32"\n', encoding="utf-8")
+    (pkg,) = parse_requirements(path).packages
+    assert pkg.error is not None and "marker" in pkg.error
+
+
+def test_requirements_url_and_env_var_constraints_are_skipped(tmp_path):
+    path = tmp_path / "requirements.txt"
+    path.write_text(
+        "ranged\n-c https://example.com/upper.txt\n--constraint=${PIP_CONSTRAINT}\n-c c-${PY}.txt\n", encoding="utf-8"
+    )
+    assert [(p.name, p.version, p.spec, p.error) for p in parse_requirements(path).packages] == [
+        ("ranged", None, None, None)
+    ]
+
+
+@pytest.mark.parametrize(
+    "lines,version,error",
+    [
+        ("ranged==1.9\nranged==1.9.0\n", "1.9", None),  # the same version, written two ways
+        ("ranged==1.9\nranged==2.0\n", None, "conflicting exact versions"),
+        ("ranged @ https://example.com/ranged-1.9.tar.gz\n", None, "isn't an index version"),
+    ],
+)
+def test_requirements_constraint_pins_and_unusable_constraints(tmp_path, lines, version, error):
+    path = tmp_path / "requirements.txt"
+    path.write_text("ranged\n-c constraints.txt\n", encoding="utf-8")
+    (tmp_path / "constraints.txt").write_text(lines, encoding="utf-8")
+    (pkg,) = parse_requirements(path).packages
+    assert pkg.version == version
+    assert (pkg.error is None) if error is None else (error in pkg.error)
+
+
 @pytest.mark.parametrize("input_name", ["pipenvproj", "pipenvproj/Pipfile.lock"])
 def test_pipfile_lock(fixtures, input_name):
     (src,) = load_inputs([str(fixtures / input_name)])
