@@ -98,6 +98,12 @@ class Source:
     uv_selection: UvSelection | None = None
     # A requirements file (requirements.txt, .in, requirements.lock): unpinned lines get the newest release.
     requirements: bool = False
+    # poetry.lock only: each package's [[package]] table, kept so --group/--only-group/--no-dev can pick packages
+    # by the groups Poetry records on them.
+    poetry_tables: list[dict] | None = None
+    poetry_pyproject: Path | None = None
+    # poetry.lock after a group selection: the packages it left out, which were still read (for --ignore notes).
+    unselected_keys: set[str] = field(default_factory=set)
 
 
 def pythons_outside_lock(source: Source, targets: Iterable[Target]) -> list[str]:
@@ -211,16 +217,35 @@ def uv_group_names(package: dict) -> frozenset[str]:
     )
 
 
-def select_uv_dependencies(sources: list[Source], selection: UvSelection, strict: bool = True) -> None:
-    """Apply `selection` to the uv.lock sources. With strict (selectors from the command line), other inputs are an
-    error; otherwise (from [tool.wheelgap]) they're left as they are."""
+def select_uv_dependencies(
+    sources: list[Source],
+    selection: UvSelection,
+    strict: bool = True,
+    *,
+    configured_extras: bool = False,
+    poetry: bool = True,
+) -> None:
+    """Apply `selection` to the uv.lock sources, and its groups to Poetry 2.x poetry.lock sources. With strict
+    (selectors from the command line), other inputs are an error; otherwise (from [tool.wheelgap]) they're left as
+    they are. configured_extras: the extras come from [tool.wheelgap], which apply to uv.lock inputs only, so a
+    poetry.lock doesn't reject them. poetry=False leaves poetry.lock inputs as they are (only extras configured)."""
     if selection.only_groups and (selection.extras or selection.all_extras):
         raise SourceError("--only-group cannot be combined with --extra or --all-extras")
     if selection.no_dev and "dev" in selection.groups | selection.only_groups:
         raise SourceError("--no-dev cannot be combined with an explicit dev group")
     if strict and (not sources or any(source.uv_packages is None for source in sources)):
-        raise SourceError("extra/group selection requires uv.lock inputs")
+        others = [source for source in sources if source.uv_packages is None]
+        if sources and all(source.poetry_tables is not None for source in others):
+            if selection.all_extras or (selection.extras and not configured_extras):
+                raise SourceError("extra selection requires uv.lock inputs (poetry.lock supports groups only)")
+        else:
+            raise SourceError("extra/group selection requires uv.lock inputs")
     for source in sources:
+        if source.poetry_tables is not None:
+            # A Poetry 1.x lock doesn't record groups per package; configured groups leave it as it is.
+            if poetry and (strict or source.edges is None):
+                _select_poetry_groups(source, selection)
+            continue
         if source.uv_packages is None:
             continue
         pyproject = source.uv_pyproject
@@ -250,6 +275,60 @@ def select_uv_dependencies(sources: list[Source], selection: UvSelection, strict
             if unknown:
                 raise SourceError(f"{source.label}: unknown {label}: {', '.join(sorted(unknown))}")
         source.uv_selection = selection
+
+
+def _poetry_markers(p: dict, groups: Iterable[str]) -> list[str] | None:
+    """A Poetry 2.x package's markers for the given groups: None (always installed) if a group has no marker."""
+    markers = p.get("markers")
+    if isinstance(markers, str):
+        return [markers]
+    if not isinstance(markers, dict):
+        return None
+    # Poetry leaves a group out of the dict when the package is always installed for it.
+    if any(g not in markers for g in groups):
+        return None
+    return [m for g in groups if isinstance(m := markers.get(g), str)] or None
+
+
+def _select_poetry_groups(source: Source, selection: UvSelection) -> None:
+    """Keep the poetry.lock packages that Poetry would install for `selection`, with Poetry's meanings: `main` and
+    every non-optional group by default, `--group` adds a group (like `poetry install --with`), `--no-dev` leaves
+    out `dev`, and `--only-group` installs only the named groups (`main` too only if named)."""
+    tables = source.poetry_tables or []
+    if source.edges is not None or any(not isinstance(t.get("groups"), list) for t in tables):
+        raise SourceError(f"{source.label}: group selection needs a poetry.lock from Poetry 2.x (with package groups)")
+    known = {"main"} | {canonicalize_name(g) for t in tables for g in t["groups"]}
+    optional: set[str] = set()
+    pyproject = source.poetry_pyproject
+    if pyproject is not None and pyproject.is_file():
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        # PEP 735 groups (Poetry 2.2+): an empty one is in no package's groups, but it's still a known group.
+        pep735 = data.get("dependency-groups")
+        known.update(canonicalize_name(name) for name in (pep735 if isinstance(pep735, dict) else {}))
+        declared = data.get("tool", {}).get("poetry", {})
+        for name, group in (declared.get("group") or {}).items():
+            known.add(canonicalize_name(name))
+            if isinstance(group, dict) and group.get("optional") is True:
+                optional.add(canonicalize_name(name))
+    unknown = (selection.groups | selection.only_groups) - known
+    if unknown:
+        raise SourceError(f"{source.label}: unknown groups: {', '.join(sorted(unknown))}")
+    if selection.only_groups:
+        chosen = set(selection.only_groups | selection.groups)
+    else:
+        chosen = (known - optional) | selection.groups
+    if selection.no_dev:
+        chosen.discard("dev")
+    kept = []
+    for pkg, table in zip(source.packages, tables, strict=True):
+        groups = [g for g in table["groups"] if canonicalize_name(g) in chosen]
+        if groups:
+            pkg.markers = _poetry_markers(table, groups)
+            kept.append(pkg)
+        else:
+            source.unselected_keys.add(pkg.key)
+    source.packages = kept
+    source.poetry_tables = None
 
 
 def parse_pylock(path: Path) -> Source:
@@ -321,8 +400,10 @@ def parse_poetry_lock(path: Path) -> Source:
         # under a marker (colorama directly, and via click only on Windows).
         declared = _project_dependencies(path.parent / "pyproject.toml")
         roots |= {i for i, p in enumerate(pkgs) if p.key in declared}
-        return Source(path.name, pkgs, edges=edges, roots=sorted(roots))
-    return Source(path.name, pkgs)
+        return Source(path.name, pkgs, edges=edges, roots=sorted(roots), poetry_tables=data.get("package", []))
+    return Source(
+        path.name, pkgs, poetry_tables=data.get("package", []), poetry_pyproject=path.parent / "pyproject.toml"
+    )
 
 
 def _graph_roots(pkgs: list[Package], edges: dict[int, list[Edge]]) -> list[int]:

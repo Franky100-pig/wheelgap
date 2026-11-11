@@ -178,8 +178,16 @@ unless `--only-group` is given;
 project extras are included only when requested. `--no-dev` removes `dev`, while `--only-group`
 excludes project dependencies and default groups. Combine `--only-group` with `--group` to add more
 groups, but not with `--extra`/`--all-extras`. An explicit `dev` group conflicts with `--no-dev`.
-Unknown extra/group names are errors. Command-line selectors need a `uv.lock` input; configured
-`extras`/`groups` apply only to `uv.lock` inputs.
+Unknown extra/group names are errors. Command-line selectors need a `uv.lock` input, or for groups a Poetry 2.x
+`poetry.lock` (see below); configured `groups` apply to `uv.lock` and Poetry 2.x `poetry.lock` inputs, and
+configured `extras` only to `uv.lock` inputs.
+
+`poetry.lock` (Poetry 2.x) inputs accept `--group`, `--only-group` and `--no-dev` with Poetry's meanings, and
+configured `groups` apply to them too. `main` and every group not marked `optional = true` in
+`pyproject.toml` count; `--group` adds a group (like `poetry install --with`), `--no-dev` leaves out `dev`,
+and `--only-group` checks only the named groups (`main` only if named). A package counts if any of its groups is
+selected, with the markers of those groups. `--extra` isn't supported for `poetry.lock` yet, and a command-line
+selection on a Poetry 1.x lock (no per-package groups) is an error; configured `groups` leave a 1.x lock unfiltered.
 
 Default selections can also be configured:
 

@@ -942,8 +942,11 @@ def main(argv: list[str] | None = None) -> int:
                     no_dev=args.no_dev,
                     only_groups=frozenset(canonicalize_name(name) for name in args.only_group or []),
                 ),
-                # Configured extras/groups apply to uv.lock inputs only; on the command line they need one.
+                # Configured extras apply to uv.lock inputs only, configured groups to uv.lock and Poetry 2.x
+                # poetry.lock inputs; on the command line they need one of those.
                 strict=bool(from_cli or args.only_group),
+                configured_extras=args.extra is None and extra_names is not None,
+                poetry=bool(from_cli or args.only_group) or group_names is not None,
             )
         if offline:
             require_offline(sources, offline_how, simple_index=index_url)
@@ -1036,7 +1039,8 @@ def main(argv: list[str] | None = None) -> int:
             ignore_on.setdefault(canonicalize_name(name), set()).update(checked.intersection(platforms))
     ignore_on = {key: platforms for key, platforms in ignore_on.items() if platforms}
     if ignores and not quiet:
-        known_keys = {p.key for s in sources for p in s.packages}  # every package read, selected or not
+        # Every package read, selected or not.
+        known_keys = {p.key for s in sources for p in s.packages}.union(*(s.unselected_keys for s in sources))
         unmatched = list(dict.fromkeys(item for item, name, _ in ignores if canonicalize_name(name) not in known_keys))
         if unmatched:
             print(f"wheelgap: note: --ignore matches no package: {', '.join(unmatched)}", file=sys.stderr)

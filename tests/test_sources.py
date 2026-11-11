@@ -7,11 +7,13 @@ from wheelgap.check import Status, check
 from wheelgap.sources import (
     Source,
     SourceError,
+    UvSelection,
     find_lockfile,
     load_inputs,
     parse_poetry_lock,
     parse_requirements,
     pythons_outside_lock,
+    select_uv_dependencies,
 )
 from wheelgap.targets import build_targets
 
@@ -724,3 +726,15 @@ def test_poetry_lock_records_a_legacy_source_as_the_registry(tmp_path):
     )
     (pkg,) = parse_poetry_lock(path).packages
     assert pkg.registry == "https://pkgs.example.com/simple"
+
+
+def test_poetry_group_selection_keeps_markers_per_group(tmp_path):
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "colorama"\nversion = "0.4.6"\ngroups = ["main", "dev"]\n'
+        'markers = { main = "sys_platform == \\"win32\\"" }\nfiles = []\n\n[metadata]\nlock-version = "2.1"\n',
+        encoding="utf-8",
+    )
+    sources = load_inputs([str(tmp_path)])
+    select_uv_dependencies(sources, UvSelection(no_dev=True))
+    # Without dev, only main's marker applies.
+    assert sources[0].packages[0].markers == ['sys_platform == "win32"']
