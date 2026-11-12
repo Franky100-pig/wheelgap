@@ -73,6 +73,11 @@
                 }
             }
         },
+        "advisory": {
+            "type": "array",
+            "description": "Present in versions after 0.9.0 (0.9.0 and older don't write it): labels of the checked targets that --advisory or advisory = [...] in [tool.wheelgap] made advisory, empty when there are none. Gaps on these targets are reported in packages and counted in with_gaps and per_target as usual, but don't change the exit code.",
+            "items": {"type": "string"}
+        },
         "summary": {
             "type": "object",
             "additionalProperties": false,
@@ -82,7 +87,7 @@
                 "with_gaps": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "Packages whose results include source, missing or unknown, not counting the platforms in ignored_targets."
+                    "description": "Packages whose results include source, missing or unknown, not counting the platforms in ignored_targets. Gaps on advisory targets count."
                 },
                 "per_target": {
                     "type": "object",
