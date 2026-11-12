@@ -206,7 +206,8 @@ PYODIDE_PLATFORMS: dict[tuple[int, int], list[str]] = {
 }
 
 # The newest CPython release wheelgap knows: `-p next` checks it, and `-p next-t` its free-threaded build. Move it on
-# when a new CPython comes out (each October), with a PYODIDE_PLATFORMS entry once Pyodide has a build for it.
+# when a new CPython comes out (each October), with PYODIDE_PLATFORMS here and PYODIDE_ABI in pyodide.py once Pyodide
+# has a build for it.
 NEWEST_PYTHON = (3, 15)
 NEXT_PYTHONS = {"next": False, "next-t": True}  # name -> free-threaded
 

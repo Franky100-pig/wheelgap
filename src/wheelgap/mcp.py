@@ -165,7 +165,9 @@ TOOLS: list[dict[str, Any]] = [
             "Notes and errors name command-line flags (--offline is the offline argument here). "
             "Packages from git, paths, URLs or private indexes are listed under "
             "'skipped': they were NOT checked. 'notes' says when an answer may be incomplete. Requirements files are "
-            "looked up on the index. " + _STATUS_HELP
+            "looked up on the index. With two Pythons checked, one newer (e.g. python '3.14,next'), "
+            "'blocking_newer_python' names the packages with a gap on the newer one only; it leaves out packages "
+            "that couldn't be checked. " + _STATUS_HELP
         ),
         "inputSchema": {
             "type": "object",
@@ -312,7 +314,7 @@ def _platforms(args: dict[str, Any]) -> list[str]:
 
 def _pythons(args: dict[str, Any]) -> list[str]:
     python = _string(args, "python") or ""
-    parts = [p.strip() for p in python.split(",") if p.strip()]
+    parts = [p.strip().lower() for p in python.split(",") if p.strip()]  # the CLI takes Next and 3.14T too
     if bad := [p for p in parts if not _PYTHON_RE.fullmatch(p)]:
         raise ToolError(
             f"can't read Python version(s) {', '.join(map(repr, bad))} (expected e.g. '3.13', '3.14t' or 'next')"
@@ -544,7 +546,7 @@ def _run_cli(argv: list[str], path: Path) -> dict[str, Any]:
         "ignored": data["ignored"],
         "ignored_targets": data["ignored_targets"],
         "notes": notes,
-    }
+    } | ({"blocking_newer_python": data["blocking_newer_python"]} if "blocking_newer_python" in data else {})
 
 
 def _list_targets(args: dict[str, Any]) -> dict[str, Any]:

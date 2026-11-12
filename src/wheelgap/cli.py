@@ -11,6 +11,7 @@ import sys
 import sysconfig
 import tomllib
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import packaging
@@ -356,7 +357,8 @@ def load_uv_targets(path: Path, pythons: list[str]) -> list[str]:
         # e.g. a mobile-only project, or `wheelgap requests` run in a project folder: don't fail the run
         print(
             f"wheelgap: note: {path} [tool.uv] required-environments matches none of the native targets "
-            f"for Python {', '.join(pythons)}, so the default targets are checked; select targets with -t",
+            f"for Python {', '.join(dict.fromkeys(t.python for t in targets))}, so the default targets are checked; "
+            "select targets with -t",
             file=sys.stderr,
         )
     return platforms
@@ -502,11 +504,23 @@ def bundled_line(rows: list[Row], lock: PyodideLock) -> str:
 _OK = (Status.WHEEL, Status.NOT_NEEDED, Status.BUNDLED)
 
 
-def blocking_newer_python(rows: list[Row], targets: list[Target]) -> tuple[str, str, list[str]] | None:
-    """With exactly two Pythons checked, one newer: the older, the newer, and the packages that block the upgrade.
+@dataclass(frozen=True)
+class Blocking:
+    """What blocks the move to the newer of two checked Pythons (see blocking_newer_python)."""
 
-    A package blocks it when the newer Python has a gap (source or missing) on a platform where the older one has a
-    wheel (or doesn't install the package). Gaps the older Python has too, unknowns and ignored targets don't count.
+    older: str
+    newer: str
+    names: list[str]  # packages with a gap on the newer Python only
+    unchecked: int  # other packages that couldn't be checked on the newer Python, so may block it too
+
+
+def blocking_newer_python(rows: list[Row], targets: list[Target]) -> Blocking | None:
+    """With exactly two Pythons checked, one newer: the packages that block the upgrade.
+
+    It's decided per package name, over every row (input or forked version) of it: a package blocks the upgrade
+    when, on some platform, the newer Python has a gap (source or missing) and every result for the older Python is
+    a wheel, n/a or bundled. Gaps the older Python has too and ignored targets don't count. A package that is unknown
+    on the newer Python isn't listed, but is counted in `unchecked`, since it may block the upgrade too.
     """
     by_python: dict[str, dict[str, Target]] = {}
     for t in targets:
@@ -517,24 +531,34 @@ def blocking_newer_python(rows: list[Row], targets: list[Target]) -> tuple[str, 
     old, new = next(iter(older.values())), next(iter(newer.values()))
     if (old.major, old.minor) == (new.major, new.minor):  # 3.14 and 3.14t: neither is newer
         return None
-    blocking = [
-        r.package.name
-        for r in rows
+    by_name: dict[str, list[Row]] = {}
+    for r in rows:
+        by_name.setdefault(r.package.key, []).append(r)
+    names, unchecked = [], 0
+    for group in by_name.values():
+
+        def results(t: Target, group: list[Row] = group) -> list[Status]:
+            return [r.results[t] for r in group if t not in r.ignored]
+
         if any(
-            r.results[t] in (Status.SOURCE, Status.MISSING)
-            and t not in r.ignored
-            and platform in older
-            and r.results[older[platform]] in _OK
-            for platform, t in newer.items()
-        )
-    ]
-    return old.python, new.python, blocking
+            any(s in (Status.SOURCE, Status.MISSING) for s in results(t)) and all(s in _OK for s in results(older[p]))
+            for p, t in newer.items()
+        ):
+            names.append(group[0].package.name)
+        elif any(Status.UNKNOWN in results(t) for t in newer.values()):
+            unchecked += 1
+    return Blocking(old.python, new.python, names, unchecked)
 
 
-def blocking_line(blocking: tuple[str, str, list[str]]) -> str:
+def blocking_line(blocking: Blocking) -> str:
     """'blocking 3.15: numpy, pydantic-core' (see blocking_newer_python)."""
-    old, new, names = blocking
-    return f"blocking {new}: {', '.join(names)}" if names else f"blocking {new}: none, apart from gaps {old} has too"
+    n = blocking.unchecked
+    unchecked = f"{n} package{'s' * (n != 1)} couldn't be checked" if n else ""
+    if blocking.names:
+        return f"blocking {blocking.newer}: {', '.join(blocking.names)}" + (f" ({unchecked})" if n else "")
+    if n:
+        return f"blocking {blocking.newer}: none known ({unchecked})"
+    return f"blocking {blocking.newer}: none (every gap on {blocking.newer} is on {blocking.older} too)"
 
 
 def report_json(
@@ -582,7 +606,7 @@ def report_json(
         "summary": {"packages": len(rows), "with_gaps": len(gaps), "per_target": target_counts(gaps, targets)},
     }
     if blocking is not None:
-        report["blocking_newer_python"] = blocking[2]
+        report["blocking_newer_python"] = blocking.names
     return json.dumps(report, indent=2)
 
 

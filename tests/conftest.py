@@ -20,6 +20,8 @@ FAKE_INDEX = {
             "newpylag-1.0.tar.gz",
         ]
     },
+    "cp314only": {"1.0": ["cp314only-1.0-cp314-cp314-manylinux_2_17_x86_64.whl"]},  # no sdist: missing on 3.15
+    "forked": {"0.9": ["forked-0.9.tar.gz"], "1.0": ["forked-1.0.tar.gz"]},
     "ranged": {
         "1.5": ["ranged-1.5-py3-none-any.whl"],
         "1.9": ["ranged-1.9.tar.gz"],

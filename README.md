@@ -315,14 +315,14 @@ wheelgap uv.lock -p 3.14 -p next -t linux-x86_64,linux-aarch64
 wheelgap uv.lock -p 3.14 -p next-t -t all   # the upgrade and free-threading together
 ```
 
-When exactly two Python versions are checked and one is newer, the summary names the packages that block the upgrade: those with a gap (`● source` or `✗ missing`) on the newer Python on a platform where the older one has a wheel. Gaps both Pythons share, and targets ignored with `--ignore NAME:TARGET`, don't count.
+When exactly two Python versions are checked and one is newer, the summary names the packages that block the upgrade: those with a gap (`● source` or `✗ missing`) on the newer Python on a platform where the older one has a wheel (or doesn't install the package). Gaps both Pythons share, and targets ignored with `--ignore NAME:TARGET`, don't count. Packages that couldn't be checked aren't listed, only counted (`blocking 3.15: none known (1 package couldn't be checked)`), so an empty list isn't a pass on its own: the summary and the exit code still decide.
 
 ```
 3 of 41 packages have gaps: 3 will build from source.
 blocking 3.15: numpy, pydantic-core
 ```
 
-`--markdown` and `-q` print the same line, and `--json` has the list as `blocking_newer_python` (`[]` when nothing blocks the upgrade; the key is left out unless two Pythons, one newer, are checked). Two builds of the same version, such as `-p 3.14 -p 3.14t`, have no newer one, so they get no such line; the [free-threading recipe](https://github.com/wheelgap/wheelgap/blob/main/docs/recipes.md#free-threading-readiness) lists a free-threaded build's gaps for scripts.
+`--markdown` and `-q` print the same line, and `--json` has the list as `blocking_newer_python` (`[]` when no package is known to block the upgrade; the key is left out unless two Pythons, one newer, are checked). The MCP server's `check_lockfile` returns it too. Two builds of the same version, such as `-p 3.14 -p 3.14t`, have no newer one, so they get no such line; the [free-threading recipe](https://github.com/wheelgap/wheelgap/blob/main/docs/recipes.md#free-threading-readiness) lists a free-threaded build's gaps for scripts.
 
 ### In CI (GitHub Action)
 

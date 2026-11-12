@@ -153,6 +153,16 @@ def test_uv_required_environments_matching_no_target_falls_back_to_defaults(
     assert [t["platform"] for t in json.loads(out)["targets"]] == DEFAULT_PLATFORMS
 
 
+def test_uv_required_environments_note_names_the_resolved_python(capsys, tmp_path, monkeypatch, fake_pypi):
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.uv]\nrequired-environments = [\"sys_platform == 'android'\"]\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    code, _, err = run(capsys, "purewheel==3.1", "-p", "3.14,next", "--json")
+    assert code == 0
+    assert "native targets for Python 3.14, 3.15, so the default targets" in err
+
+
 @pytest.mark.parametrize("setting", ["", "required-environments = []", "environments = [\"sys_platform == 'linux'\"]"])
 def test_uv_required_environments_absent_or_empty(capsys, tmp_path, monkeypatch, fake_pypi, setting):
     (tmp_path / "pyproject.toml").write_text("[tool.uv]\n" + setting, encoding="utf-8")
@@ -915,12 +925,76 @@ def test_python_next_names_what_blocks_the_upgrade(capsys, fake_pypi):
 def test_blocking_newer_python_only_counts_new_gaps(capsys, fake_pypi):
     # Ignoring newpylag on Linux leaves only nowheels, which has gaps on 3.14 too.
     code, out, _ = run(capsys, *UPGRADE, "-p", "3.14,3.15", "--ignore", "newpylag:linux-x86_64")
-    assert "blocking 3.15: none, apart from gaps 3.14 has too" in out.splitlines()
+    assert "blocking 3.15: none (every gap on 3.15 is on 3.14 too)" in out.splitlines()
     code, out, _ = run(capsys, *UPGRADE, "-p", "3.14,3.15", "--ignore", "newpylag:linux-x86_64", "--json")
     assert json.loads(out)["blocking_newer_python"] == []
     # Nothing is printed when there are no gaps at all.
     code, out, _ = run(capsys, "purewheel==3.1", "-p", "3.14", "-p", "3.15", "--color", "never")
     assert code == 0 and "blocking" not in out
+
+
+def _blocking(capsys, tmp_path, requirements, *args):
+    """The blocking line of the text report and blocking_newer_python of --json, for a requirements file."""
+    path = tmp_path / "requirements.txt"
+    path.write_text(requirements, encoding="utf-8")
+    argv = [str(path), "-p", "3.14,next", "-t", "linux-x86_64", "--color", "never", *args]
+    _, out, _ = run(capsys, *argv)
+    line = next((ln for ln in out.splitlines() if ln.startswith("blocking ")), None)
+    _, out, _ = run(capsys, *argv, "--json")
+    data = json.loads(out)
+    _assert_matches_output_schema(data)
+    return line, data["blocking_newer_python"]
+
+
+@pytest.mark.parametrize(
+    "requirements,line,names",
+    [
+        # Unknown on the newer Python only, or on both: not listed, and "none" would be untrue.
+        (
+            'does-not-exist==1.0; python_version >= "3.15"\nnowheels==0.9\n',
+            "blocking 3.15: none known (1 package couldn't be checked)",
+            [],
+        ),
+        ("does-not-exist==1.0\nnowheels==0.9\n", "blocking 3.15: none known (1 package couldn't be checked)", []),
+        (
+            "does-not-exist==1.0\nnewpylag==1.0\n",
+            "blocking 3.15: newpylag (1 package couldn't be checked)",
+            ["newpylag"],
+        ),
+        # n/a on the older Python counts as fine there, so a source build on the newer one blocks it.
+        ('nowheels==0.9; python_version >= "3.15"\n', "blocking 3.15: nowheels", ["nowheels"]),
+        # missing (a wheel for 3.14, no sdist) blocks, like source.
+        ("cp314only==1.0\n", "blocking 3.15: cp314only", ["cp314only"]),
+        # Forked versions: 3.14 builds forked from source too, so it doesn't block 3.15.
+        (
+            'forked==0.9; python_version < "3.15"\nforked==1.0; python_version >= "3.15"\n',
+            "blocking 3.15: none (every gap on 3.15 is on 3.14 too)",
+            [],
+        ),
+    ],
+)
+def test_blocking_newer_python_cases(capsys, fake_pypi, tmp_path, requirements, line, names):
+    assert _blocking(capsys, tmp_path, requirements) == (line, names)
+
+
+def test_blocking_newer_python_names_a_package_once(capsys, fake_pypi, tmp_path):
+    for folder in ("a", "b"):
+        (tmp_path / folder).mkdir()
+        (tmp_path / folder / "requirements.txt").write_text("newpylag==1.0\n", encoding="utf-8")
+    argv = [str(tmp_path / "a" / "requirements.txt"), str(tmp_path / "b" / "requirements.txt"), "-p", "3.14,3.15"]
+    _, out, _ = run(capsys, *argv, "-t", "linux-x86_64", "--color", "never")
+    assert "blocking 3.15: newpylag" in out.splitlines()
+    _, out, _ = run(capsys, *argv, "-t", "linux-x86_64", "--json")
+    assert json.loads(out)["blocking_newer_python"] == ["newpylag"]
+
+
+def test_blocking_newer_python_bundled_on_the_older_python(capsys, fake_pypi, fixtures):
+    # Pyodide 0.29 (Python 3.13) bundles fastlib; there's no 3.14 Pyodide wheel, and Pyodide can't build the sdist.
+    args = ("fastlib==2.0.0", "-p", "3.13,3.14", "-t", "pyodide", "--pyodide-lock", str(fixtures / "pyodide-lock.json"))
+    _, out, _ = run(capsys, *args, "--json")
+    data = json.loads(out)
+    assert data["packages"][0]["results"] == {"3.13 pyodide": "bundled", "3.14 pyodide": "missing"}
+    assert data["blocking_newer_python"] == ["fastlib"]
 
 
 @pytest.mark.parametrize("pythons", [["3.15"], ["3.15", "3.15t"], ["3.13", "3.14", "3.15"]])
