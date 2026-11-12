@@ -3,26 +3,26 @@
 import io
 import json
 import os
+import random
 import re
 import subprocess
 import sys
 
 import pytest
 
+import wheelgap.logsafe
 from wheelgap import cli
 from wheelgap.cli import main
 from wheelgap.diff import main as diff_main
 from wheelgap.logsafe import CommandGuard, guarded_output, neutralize, write_command
 
-ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+LEADING_COMMAND = re.compile(r"(?:\s|\ufeff|\x1b\[[0-9;]*[A-Za-z])*::")
 
 
 def commands(text):
-    """Lines the Actions runner would read as workflow commands: `::` first (after whitespace; colour codes too, to
-    be safe) or `##[` anywhere. Lines end at LF, CR or CRLF, as the runner reads them."""
-    return [
-        line for line in re.split(r"\r\n|\r|\n", text) if ANSI.sub("", line).lstrip().startswith("::") or "##[" in line
-    ]
+    """Lines the Actions runner would read as workflow commands: `::` first (after whitespace or a BOM, which .NET
+    skips; colour codes too, to be safe) or `##[` anywhere. Lines end at LF, CR or CRLF, as the runner reads them."""
+    return [line for line in re.split(r"\r\n|\r|\n", text) if LEADING_COMMAND.match(line) or "##[" in line]
 
 
 def run(capsys, *argv):
@@ -136,8 +136,8 @@ def test_requirements_text_cant_run_workflow_commands(capsys, fake_pypi, tmp_pat
         ("\x1b[1m::error::x\x1b[0m", "\x1b[1m\\u003a:error::x\x1b[0m"),
         ("a ##[error]b ##[warning]c", "a \\u0023#[error]b \\u0023#[warning]c"),
         ('  "version": "##[x"', '  "version": "\\u0023#[x"'),  # still valid JSON, with the same value
-        # What .NET's TrimStart skips: tab, VT, FF, NEL, NBSP, em space, line separator, ideographic space.
-        *[(f"{ws}::error::x", f"{ws}\\u003a:error::x") for ws in "\t\v\f\x85\xa0\u2003\u2028\u3000"],
+        # What .NET's TrimStart skips (tab, VT, FF, NEL, NBSP, em space, line separator, ideographic space), and a BOM.
+        *[(f"{ws}::error::x", f"{ws}\\u003a:error::x") for ws in "\t\v\f\x85\xa0\u2003\u2028\u3000\ufeff"],
         # Normal output is never changed.
         ("numpy  2.3.4  ✓  ● source", "numpy  2.3.4  ✓  ● source"),
         ("  via: a → b", "  via: a → b"),
@@ -317,3 +317,88 @@ def test_guarded_output_guards_stderr_even_when_stdout_already_is(capsys, monkey
     with guarded_output():
         print("::error::x", file=sys.stderr)
     assert capsys.readouterr().err == "\\u003a:error::x\n"
+
+
+# A colon, a colour code, a colon: the visible text starts with `::`, but there's no `::` in the string. neutralize
+# used to look for one there and raise, and the traceback quoting the line then printed after the guard was gone.
+SPLIT_COLONS = ":\x1b[0m:##[add-mask]hunter2"
+
+
+def wheelgap_subprocess(*argv):
+    env = {k: v for k, v in os.environ.items() if k not in ("FORCE_COLOR", "NO_COLOR")}
+    proc = subprocess.run([sys.executable, *argv], capture_output=True, env=env, check=False)
+    return proc.returncode, proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")
+
+
+@pytest.mark.parametrize("entry", ["wheelgap", "wheelgap.diff"])
+@pytest.mark.parametrize("input_name", ["requirements.txt", "pyproject.toml"])
+def test_colons_split_by_colour_codes(tmp_path, entry, input_name):
+    if input_name == "requirements.txt":
+        text = SPLIT_COLONS + "\n"
+    else:
+        dependency = json.dumps(":\x1b[0m:##[error]pwned")  # a JSON string is a TOML basic string (\u001b)
+        text = f'[project]\nname = "demo"\nversion = "0.1.0"\ndependencies = [{dependency}]\n'
+    (tmp_path / "new").mkdir()
+    (tmp_path / "new" / input_name).write_text(text, encoding="utf-8")
+    (tmp_path / "old.txt").write_text("", encoding="utf-8")
+    new = str(tmp_path / "new" / input_name)
+    if entry == "wheelgap":
+        argv = [new, "-p", "3.13", "-t", "linux-x86_64", "--offline", "--no-cache", "--github-annotations"]
+    else:
+        argv = [str(tmp_path / "old.txt"), new, "-p", "3.13", "-t", "linux-x86_64"]
+    code, out, err = wheelgap_subprocess("-m", entry, *argv)
+    assert code == 2, err
+    assert "Traceback" not in err and "wheelgap: error: " in err
+    assert not commands(out + err)
+
+
+ALPHABET = [
+    ":",
+    "::",
+    "#",
+    "##[",
+    "[",
+    "]",
+    "\x1b",
+    "\x1b[",
+    "\x1b[0m",
+    "\x1b[1;31m",
+    " ",
+    "\t",
+    "\xa0",
+    "\x85",
+    "\u3000",
+]
+ALPHABET += ["\ufeff", "\r", "\n", "\r\n", "a", "0", ";", "m", "%"]
+
+
+def test_neutralize_never_raises_or_leaves_a_command():
+    rng = random.Random(247)
+    for _ in range(5000):
+        text = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(0, 12)))
+        for line in re.split(r"\r\n|\r|\n", text):
+            result = neutralize(line)
+            assert isinstance(result, str)
+            assert not commands(result), repr(line)
+        raw = io.StringIO()  # the same text through the guard, in random pieces
+        guard = CommandGuard(raw)
+        cuts = sorted(rng.sample(range(len(text) + 1), min(3, len(text) + 1)))
+        for start, end in zip([0, *cuts], [*cuts, len(text)], strict=True):
+            guard.write(text[start:end])
+        guard.finish()
+        assert not commands(raw.getvalue()), repr(text)
+
+
+def test_an_error_in_the_guard_prints_a_fixed_message(capsys, fake_pypi, tmp_path, monkeypatch):
+    # If the guard itself fails, the error quoting the text mustn't be printed: not by the guard, which just failed,
+    # and not by the interpreter after the guard is gone.
+    def broken(line):
+        raise RuntimeError(f"can't neutralize {line}")
+
+    monkeypatch.setattr(wheelgap.logsafe, "neutralize", broken)
+    (tmp_path / "requirements.txt").write_text(SPLIT_COLONS + "\n", encoding="utf-8")
+    with pytest.raises(SystemExit) as caught:
+        main([str(tmp_path / "requirements.txt"), "-p", "3.13", "-t", "linux-x86_64"])
+    assert caught.value.code == 2
+    out, err = capsys.readouterr()
+    assert (out, err) == ("", "wheelgap: error: an internal error occurred while writing output\n")

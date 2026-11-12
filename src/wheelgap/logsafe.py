@@ -8,15 +8,16 @@ put anything in those. So the CLI writes through CommandGuard, which changes any
 command:
 
 - `##[` becomes `\\u0023#[`;
-- a line starting with `::` (after whitespace and colour codes) gets its first `:` written as `\\u003a`.
+- a line starting with `::` (after whitespace, a BOM and colour codes) gets its first `:` written as `\\u003a`.
 
 Both are JSON escapes, so in `--json` output, where such text can only be inside a string, the decoded values are
 unchanged; in text and Markdown the escape shows. Normal output never contains either, so it's never changed.
 
-"Whitespace" is what .NET's TrimStart removes (NBSP, U+0085, U+3000, ...); str.lstrip removes all of those. The
+"Whitespace" is what .NET's TrimStart removes (NBSP, U+0085, U+3000, ...); regex \\s matches all of those. The
 runner reads the log as UTF-8, so the guard writes UTF-8 to a pipe whatever PYTHONIOENCODING says: in latin-1,
 `Â` + NBSP would be the bytes C2 A0, which the runner reads as NBSP alone, then `::`. A traceback, printed after
-the guard is gone, would print exception text unguarded, so guarded_output prints it itself.
+the guard is gone, would print exception text unguarded, so guarded_output prints it itself; if even that fails, it
+writes a fixed message instead.
 
 Problem matchers (`::add-matcher::`, set up by other steps) turn ordinary lines into annotations by design; they're
 out of scope here.
@@ -30,21 +31,23 @@ import io
 import re
 import sys
 import traceback
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import TextIO
 
 _BREAK = re.compile(r"(\r\n|\r|\n)")
-_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# `::` at the start of a line, after whitespace (what .NET's TrimStart skips; \s covers it), a BOM (.NET drops one
+# at the start of a pipe) or colour codes (the runner doesn't skip those, so this is only to be safe).
+_LEADING_COMMAND = re.compile(r"\A((?:\s|\ufeff|\x1b\[[0-9;]*[A-Za-z])*)::")
 
 
 def neutralize(line: str) -> str:
-    """One line (no line breaks) changed so the runner won't read it as a workflow command."""
-    line = line.replace("##[", "\\u0023#[")
-    if _ANSI.sub("", line).lstrip().startswith("::"):
-        i = line.index("::")  # colour codes have no colons, so this is the one that starts the visible text
-        line = line[:i] + "\\u003a" + line[i + 1 :]
-    return line
+    """One line (no line breaks) changed so the runner won't read it as a workflow command. It never raises."""
+    return _LEADING_COMMAND.sub(r"\1\\u003a:", line.replace("##[", "\\u0023#["), count=1)
+
+
+# What the guard writes instead of an error it can't print safely, such as one raised while writing.
+_FALLBACK = "wheelgap: error: an internal error occurred while writing output\n"
 
 
 class CommandGuard(io.TextIOBase):
@@ -141,17 +144,32 @@ def guarded_output() -> Iterator[None]:
     out, err = sys.stdout, sys.stderr
     guards = CommandGuard(out), CommandGuard(err)
     sys.stdout, sys.stderr = guards
+    failed = False
     try:
         yield
     except SystemExit as e:
         if e.code is None or isinstance(e.code, int):
             raise
-        print(e.code, file=sys.stderr)
+        message = e.code
+        failed = not _print_safely(lambda: print(message, file=sys.stderr))
         raise SystemExit(1) from None  # as the interpreter does for sys.exit("message")
     except Exception:  # not KeyboardInterrupt: its traceback is wheelgap's own code, no input text
-        traceback.print_exc()
+        failed = not _print_safely(traceback.print_exc)
         raise SystemExit(2) from None
     finally:
         sys.stdout, sys.stderr = out, err
         for guard in guards:
-            guard.finish()
+            failed = not _print_safely(guard.finish) or failed
+        if failed:
+            err.write(_FALLBACK)  # a fixed message: the text that failed may be what mustn't be printed
+            err.flush()
+
+
+def _print_safely(action: Callable[[], object]) -> bool:
+    """Run an action that prints through the guard; False if it raised (whatever it printed so far went through
+    the guard, and the rest is dropped)."""
+    try:
+        action()
+    except Exception:
+        return False
+    return True
