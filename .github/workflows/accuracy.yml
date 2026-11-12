@@ -15,6 +15,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: accuracy
+  cancel-in-progress: false
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -36,7 +40,8 @@ jobs:
           {
             echo "### wheelgap against pip"
             echo
-            echo '```'
-            head -c 60000 accuracy.log
-            echo '```'
+            echo '~~~~~~~~~~text'
+            head -c 60000 accuracy.log | sed 's/^~~~~/ ~~~~/'  # the log can't close the fence
+            echo
+            echo '~~~~~~~~~~'
           } >> "$GITHUB_STEP_SUMMARY"

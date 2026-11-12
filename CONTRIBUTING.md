@@ -67,7 +67,7 @@ Found a package that wheelgap misjudges? Open a [bug report](https://github.com/
 
 ## Checking wheelgap against pip
 
-`scripts/check_against_pip.py` compares wheelgap with pip on about 50 real PyPI packages: for each package's latest release and each of its targets (manylinux and musllinux on x86_64 and aarch64, Windows on x86_64 and ARM, macOS on Apple silicon, free-threaded 3.14t and glibc 2.17), it runs `pip download --no-deps --only-binary=:all:` with the tags [AGENTS.md](AGENTS.md#no-issue-fits-find-a-real-bug) lists, and checks that pip downloads a wheel exactly when wheelgap says `wheel`. It needs the network and pip, and takes a while (it downloads each wheel it finds, then deletes it):
+`scripts/check_against_pip.py` compares wheelgap with pip on about 50 real PyPI packages: for each package's latest release and each of its targets (manylinux and musllinux on x86_64 and aarch64, Windows on x86_64 and ARM, macOS on Apple silicon, free-threaded 3.14t and glibc 2.17), it asks pip what it would install (`pip install --dry-run --no-deps --only-binary=:all:`, which picks a file as `pip download` does but fetches only its metadata) with the tags [AGENTS.md](AGENTS.md#no-issue-fits-find-a-real-bug) lists, and checks that pip picks a wheel exactly when wheelgap says `wheel`. It needs the network and pip, and takes a few minutes:
 
 ```bash
 uv run --with pip python scripts/check_against_pip.py                 # everything
@@ -75,7 +75,7 @@ uv run --with pip python scripts/check_against_pip.py numpy orjson    # just the
 uv run --with pip python scripts/check_against_pip.py -t win-arm64    # just this target (a platform or a label)
 ```
 
-It prints a table of every disagreement, with the pip command that shows it, and exits 1 if there is any (2 if a check couldn't be made, for example a failed download). The [Accuracy](.github/workflows/accuracy.yml) workflow runs it every Monday.
+It prints a table of every disagreement, with the pip command that shows it, and exits 1 if there is any (2 if a check couldn't be made, for example because pip couldn't reach PyPI). The [Accuracy](.github/workflows/accuracy.yml) workflow runs it every Monday.
 
 ## Questions
 
