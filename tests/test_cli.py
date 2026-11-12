@@ -2100,6 +2100,7 @@ def _assert_matches_output_schema(data):
             "results",
             "rejected",
             "via",
+            "build_requires",
             "notes",
             "bundled",
             "bundled_version_differs",
@@ -2123,6 +2124,9 @@ def _assert_matches_output_schema(data):
             for label, path in pkg["via"].items():
                 assert label in labels
                 assert isinstance(path, list) and all(isinstance(s, str) for s in path)
+        if "build_requires" in pkg:
+            reqs = pkg["build_requires"]
+            assert reqs is None or (isinstance(reqs, list) and all(isinstance(r, str) for r in reqs))
         if "conda_forge" in pkg:  # a hint for some of the targets in rejected, never an empty one
             assert pkg["conda_forge"]["builds"] and set(pkg["conda_forge"]["builds"]) <= set(pkg["rejected"])
             assert all(pkg["conda_forge"]["builds"].values())
@@ -2182,9 +2186,27 @@ def test_json_output_matches_schema(capsys, fixtures):
             assert all("rejected" in pkg and "via" in pkg and "notes" in pkg for pkg in data["packages"])
         else:
             assert all("notes" not in pkg for pkg in data["packages"])
+        assert not any("build_requires" in pkg for pkg in data["packages"])  # only with --build-info
         if "winonly" in args:
             assert "winonly" in data["ignored"]
             assert all(pkg["name"] != "winonly" for pkg in data["packages"])
+
+
+def test_json_build_info_matches_schema(capsys, tmp_path, fake_pypi, fake_files):
+    import io
+    import tarfile
+
+    pyproject = b'[build-system]\nrequires = ["maturin>=1"]\n'
+    with tarfile.open(tmp_path / "s.tar.gz", "w:gz") as tar:
+        info = tarfile.TarInfo("nowheels-0.9/pyproject.toml")
+        info.size = len(pyproject)
+        tar.addfile(info, io.BytesIO(pyproject))
+    fake_files.files["nowheels-0.9.tar.gz"] = (tmp_path / "s.tar.gz").read_bytes()
+    args = ["nowheels==0.9", "fastlib==2.0.0", "-p", "3.13", "-t", "linux-x86_64", "--all", "--json", "--explain"]
+    code, out, _ = run(capsys, *args, "--build-info")
+    data = json.loads(out)
+    _assert_matches_output_schema(data)
+    assert {p["name"]: p["build_requires"] for p in data["packages"]} == {"fastlib": None, "nowheels": ["maturin>=1"]}
 
 
 def test_json_output_with_pyodide_lock_matches_schema(capsys, fixtures, fake_pypi):
