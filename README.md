@@ -94,6 +94,8 @@ targets = ["linux-x86_64", "linux-aarch64", "musl-aarch64"]
 glibc = "2.31"
 ```
 
+Not sure what to put there? `wheelgap --suggest-targets` reads the platforms your CI and Dockerfiles already name and suggests these lines ([below](#suggest-targets-from-your-ci-and-dockerfiles)).
+
 For uv projects, wheelgap also reads `[tool.uv] required-environments` as default targets:
 
 ```toml
@@ -372,6 +374,87 @@ wheelgap -p 3.12 -t pyodide --pyodide-lock https://cdn.jsdelivr.net/pyodide/v0.2
 Docker platform names also work with `-t`, for example `-t linux/amd64,linux/arm64` (also `linux/arm64/v8`, `linux/arm/v7`, `linux/ppc64le`, `linux/s390x`, `linux/riscv64` and `linux/386`, also spelled `linux/i386`).
 
 `-t all` checks the eight common native platforms, and `-t everything` adds the armv7l, ppc64le, s390x, riscv64 and i686 Linux targets (glibc and musl) and `win32`. Pyodide, iOS and Android are only checked when you name them. Python versions take a trailing `t` for free-threaded builds (`3.14t`), which correctly rejects `abi3` wheels. Without `-p`, wheelgap reads a `.python-version` file next to the lockfile (or `pyproject.toml`) if there is one, and otherwise uses the Python it is running on.
+
+### Suggest targets from your CI and Dockerfiles
+
+`wheelgap --suggest-targets [DIR]` (default: the current directory) reads the platforms and Pythons the project already names, and prints each suggestion with the file and line it came from, then a `[tool.wheelgap]` snippet to paste into `pyproject.toml`. It only suggests: nothing is changed or checked, and it exits 0. It can't be combined with `-p`, `-t`, `--dockerfile` or `--list-targets`, and a `DIR` that isn't a folder exits 2.
+
+```
+$ wheelgap --suggest-targets
+Targets:
+  linux-x86_64
+    .github/workflows/wheels.yml:5  runs-on: ubuntu-24.04
+  linux-aarch64
+    .github/workflows/test.yml:9  runs-on: ubuntu-24.04-arm (matrix.os, line 5)
+  musl-x86_64
+    Dockerfile:4  FROM python:3.13-alpine (no --platform: read as linux/amd64, musl 1.2)
+  win-amd64
+    .github/workflows/test.yml:9  runs-on: windows-latest (matrix.os, line 5)
+Pythons:
+  3.13
+    .github/workflows/test.yml:8  python-version: 3.13 (matrix.python-version, line 14)
+    Dockerfile:4                  FROM python:3.13-alpine
+  3.14
+    .github/workflows/test.yml:8  python-version: 3.14 (matrix.python-version, line 14)
+Couldn't read (not guessed):
+  .github/workflows/wheels.yml:12  job build: the matrix is computed (${{ fromJSON(needs.plan.outputs.matrix) }})
+
+Suggested settings for pyproject.toml (nothing was changed or checked). They combine every job, lint,
+release and bot jobs too, so keep only the platforms you ship to:
+
+[tool.wheelgap]
+python = ["3.13", "3.14"]
+targets = ["linux-x86_64", "linux-aarch64", "musl-x86_64", "win-amd64"]
+glibc = "2.39"
+musl = "1.2"
+```
+
+The snippet combines every job in every workflow, including lint, release and bot jobs (the `plan` job above adds `linux-x86_64`), so check it before pasting and keep only the platforms you ship to.
+
+- **GitHub Actions** (`.github/workflows/*.yml` and `*.yaml`):
+  - Each job's `runs-on`, as a single label or `${{ matrix.KEY }}` with a literal matrix. The matrix can use lists and `include` and `exclude` entries, which are combined as GitHub does.
+  - The `python-version` given to `actions/setup-python` or `astral-sh/setup-uv`, as a literal (`"3.13"`, `3.13.1`, `3.14t`) or from the matrix.
+  - setup-python's `freethreaded: true`, which adds the `t` (free-threading starts at 3.13, so `3.12t` is refused).
+  - setup-python's `architecture`, where it's certain: `x86` on x64 Windows is `win32`, and `x64` on Apple silicon is `macos-x86_64` (Rosetta). It can come from a literal matrix, which pairs each runner with its own architecture.
+  - Input names are case-insensitive, as Actions reads them (`Architecture: x86`). Step keys such as `uses` and `with` aren't.
+- **Runner labels.** [GitHub-hosted runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) labels map to targets as follows. Other Ubuntu versions (`ubuntu-22.04`, `ubuntu-22.04-arm`) and Windows images (`windows-2022`, `windows-2025-vs2026`) map the same way.
+  - `ubuntu-latest`, `ubuntu-slim` and `ubuntu-24.04` → `linux-x86_64`.
+  - `ubuntu-24.04-arm` → `linux-aarch64`.
+  - `windows-latest` and `windows-2025` → `win-amd64`.
+  - `windows-11-arm` → `win-arm64`.
+  - `macos-latest`, `macos-14` and later, `xcode-*` and the `-xlarge` runners → `macos-arm64`.
+  - `macos-13`, `macos-15-intel` and the `-large` runners → `macos-x86_64`.
+- **Runner versions.** A pinned label also names its glibc (`ubuntu-22.04` has 2.35, `ubuntu-24.04` 2.39) or its macOS version (`macos-14` is 14.0). A `-latest` label moves, so it names neither. `ubuntu-26.04` names none yet: GitHub's runner-images readme doesn't give its glibc.
+- **Dockerfiles.** Every `Dockerfile`, `Containerfile`, `Dockerfile.*` (also `dockerfile.dev`) and `*.Dockerfile` is read, except in hidden folders, virtual environments, `node_modules`, and `tests`, `test`, `fixtures`, `examples`, `example`, `docs`, `build`, `dist` and `target` folders. The final stage's image is read exactly as `--dockerfile` reads it, for the target, the Python and the glibc or musl version. Without `--platform` it's read as `linux/amd64`, and the output says so.
+
+The snippet sets `glibc`, `musl` or `macos` only when every source of those targets names the same version. Otherwise a `#` line says why it's left out. It also leaves out `python` when no Python was found. `--json` prints the same as an object with `targets`, `python` (each with `file`, `line` and `from`), `unreadable` and `config`.
+
+There's no YAML parser in the standard library, so a workflow is read only when every line is in a small subset of YAML whose meaning is certain. Otherwise the whole file is listed under "Couldn't read: uses YAML this scanner doesn't read", with the first line that isn't. The subset is:
+
+- **Lines.** Blank lines and comments, `key:` or `key: VALUE` (letters, digits, `_`, `.` and `-`, or a whole quoted key without escapes), and list items (`- VALUE`, `- key: VALUE`). A leading `---` (after an optional `%YAML 1.2`) is allowed too.
+- **Values.** A VALUE is one of:
+  - a plain scalar on one line;
+  - a whole single- or double-quoted scalar on one line;
+  - a one-line flow list or mapping of such scalars, with a space after each `:`;
+  - a block scalar header (`|`, `>-`...);
+  - a flow list over several lines, as Prettier writes it, with `[` ending its line (or alone on the next), one item per line, and `]` on its own line.
+- **Accepted but never read.** Anchors and aliases (`&paths`, `*paths`), double-quoted values with escapes, and plain values continued on more-indented lines (long `if:` and `run:` lines) are accepted where they aren't needed, and refused where wheelgap would read them.
+
+Everything else isn't read: multi-line quoted values, anchors or tags inside a value, an alias with no anchor before it, a key or anchor used twice, lines indented under a value (including `key: {...}`), `? ` keys, `<<` merge keys, a second document, flow collections in other layouts, and line breaks other than `\n` and `\r\n`. Non-ASCII spaces such as NBSP are ordinary characters, as they are to YAML.
+
+In a file that is read, anything wheelgap can't be sure of is still listed under "Couldn't read" with its file and line, and never guessed:
+
+- expressions and computed matrices, and a `freethreaded` taken from the matrix;
+- a matrix that might have no combinations (an empty list, or an `exclude` that can't be worked out): GitHub would run nothing, so the job isn't read;
+- a job with a setup step whose `uses` can't be read, which sets an input twice, or which picks the Python under an `if:` (the step may not run);
+- self-hosted and other unknown runner labels;
+- a job that runs in a `container:`;
+- an unquoted `3.10` (YAML reads it as the number 3.1) or `0x10`;
+- `python-version-file`;
+- a job id used twice;
+- Dockerfile templates (`Dockerfile.j2`, `Dockerfile.template`), files or folders it can't open, and Dockerfiles `--dockerfile` would reject.
+
+Setup steps inside your own composite actions aren't read.
 
 ### Free-threading and new Python readiness
 
