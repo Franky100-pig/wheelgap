@@ -30,7 +30,7 @@ def run(capsys, *argv):
 def workflow(tmp_path, text, name="ci.yml"):
     folder = tmp_path / ".github" / "workflows"
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / name).write_text(text)
+    (folder / name).write_text(text, encoding="utf-8")  # non-ASCII cases: Windows would write cp1252
 
 
 def where(items):
