@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- `wheelgap mcp` starts the MCP server, as `wheelgap-mcp` does (`--version` and `--help` too), so `uvx wheelgap mcp` works and MCP registries can start it from the `wheelgap` package. As with `wheelgap diff`, a file or folder named `mcp` in the current directory is still read as an input, with a note, and bare `wheelgap mcp` no longer checks the PyPI package of that name (pin it: `wheelgap mcp==2.3.0`). (#240)
+- `wheelgap mcp` starts the MCP server, as `wheelgap-mcp` does (`--version` and `--help` too), so `uvx wheelgap mcp` works and MCP registries can start it from the `wheelgap` package. `mcp` as the first argument always starts the server, even when a file or folder named `mcp` is in the current directory (MCP clients choose that directory). To check such a folder, run `wheelgap ./mcp` or `wheelgap mcp/`; to check the PyPI package `mcp`, pin it: `wheelgap mcp==2.3.0`. Run in a terminal, `wheelgap mcp` says on stderr that it's waiting for an MCP client. (#240)
 
 ## 0.9.0 (2026-11-12)
 
