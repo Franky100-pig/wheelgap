@@ -43,7 +43,7 @@ The PR template has a short checklist:
 
 - **Tests** for any behaviour change. Tests never hit the network: use the `fake_pypi` fixture in `tests/conftest.py`, or a lockfile fixture under `tests/fixtures/`.
 - **A line in `CHANGELOG.md`** under `## Unreleased`, written for users.
-- **Docs updates** in `docs/` if users would notice the change (a new flag, target or input format).
+- **README updates** if users would notice the change (a new flag, target or input format).
 - Keep the code in the same style as the surrounding code. `ruff` handles formatting.
 
 ## What to expect

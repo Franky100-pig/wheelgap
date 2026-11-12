@@ -13,4 +13,4 @@ AI tools used (if any):
 - [ ] `uv run --group dev ruff format .` and `uv run --group dev ruff check .` pass
 - [ ] `uv run --group dev mypy` and `uv run --group dev pytest` pass
 - [ ] `CHANGELOG.md` has a line under `## Unreleased` (if users would notice the change)
-- [ ] Docs in `docs/` updated (if there's a new flag, target or input format)
+- [ ] README updated (if there's a new flag, target or input format)
