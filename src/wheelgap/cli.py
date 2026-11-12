@@ -269,6 +269,7 @@ def make_parser() -> argparse.ArgumentParser:
 FAIL_ON = ("source", "missing")
 LIST_KEYS = ("python", "targets", "ignore", "extras", "groups", "advisory")
 STR_KEYS = ("glibc", "musl", "macos", "ios", "android-api", "fail-on", "distro", "pyodide-lock", "index-url")
+BOOL_KEYS = ("quiet", "offline")
 
 
 def project_dir(inputs: list[str]) -> Path:
@@ -337,7 +338,7 @@ def load_config(path: Path) -> dict:
                 raise SourceError(f"{path}: [tool.wheelgap] {key} must be {example}")
             if key == "fail-on" and value not in FAIL_ON:
                 raise SourceError(f"{path}: [tool.wheelgap] fail-on must be one of: {', '.join(FAIL_ON)}")
-        elif key in ("quiet", "offline"):
+        elif key in BOOL_KEYS:
             if not isinstance(value, bool):
                 raise SourceError(f"{path}: [tool.wheelgap] {key} must be a boolean")
         else:

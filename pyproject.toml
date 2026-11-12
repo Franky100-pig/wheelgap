@@ -34,6 +34,7 @@ wheelgap-mcp = "wheelgap.mcp:main"
 
 [dependency-groups]
 dev = ["mypy>=1.13", "pytest>=8", "ruff>=0.8"]
+docs = ["mkdocs-material>=9.7"]
 
 [build-system]
 requires = ["hatchling>=1.27"]

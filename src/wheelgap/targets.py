@@ -12,7 +12,7 @@ from packaging import tags
 from packaging.tags import Tag
 
 # Shared with Dockerfile image parsing. Versions are the major/minor libc ABI,
-# not the distribution's package revision (see the distro package links in README).
+# not the distribution's package revision (see the distro package links in docs/targets.md).
 DEBIAN_GLIBC = {"bullseye": "2.31", "bookworm": "2.36", "trixie": "2.41"}
 ALPINE_MUSL = "1.2"  # Alpine 3.13 and later; use --musl 1.1 for older releases.
 DISTROS: dict[str, tuple[str, str]] = {
