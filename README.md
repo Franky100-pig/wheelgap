@@ -342,7 +342,12 @@ result.to_dict()  # {"name": ..., "results": {"3.13 musl-aarch64": "wheel", ...}
 
 for r in wheelgap.check_lockfile("uv.lock", targets):  # markers and the uv graph respected
     print(r.name, r.version, [t.platform for t in r.gaps])
+    print(" → ".join(r.via))  # e.g. app → pandas → numpy
+    for target, why in r.reasons.items():
+        print(target.label(True), why)
 ```
+
+`result.reasons` maps each `source` or `missing` target to the text `--explain` prints under it: every rejected wheel and why (such as `abi3 wheels can't be used on free-threaded Python (only abi3t ones can)`), one per line, or `no wheels published for this version`. Wheel, `n/a`, `bundled` and `unknown` targets have no entry (an `unknown` result's `error` says why). `result.via` is the dependency path from a root down to the package, as `--explain`'s `via:` line shows it, taken from the first target with a gap (or, with none, the first that installs it). `check_lockfile()` fills it for `uv.lock` and `poetry.lock`, the inputs with a dependency graph; it's empty for other inputs and for `check_package()`. `to_dict()` includes both, as `"reasons"` (keyed by target label) and `"via"` (a list).
 
 `check_lockfile(..., offline=True)` never contacts an index: it raises `wheelgap.sources.SourceError` if an input has no locked file list and skips the re-check for Python versions outside the lock's `requires-python` (so those versions may show false gaps). It cannot be combined with `online=True`.
 

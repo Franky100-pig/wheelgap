@@ -6,6 +6,7 @@ targets = wheelgap.make_targets(python="3.13", platforms=["linux-aarch64", "musl
 result = wheelgap.check_package("numpy", "2.3.4", targets=targets)
 result.ok                   # True if every target has a wheel
 result.statuses[targets[1]] # Status.WHEEL / SOURCE / MISSING / ...
+result.reasons[targets[1]]  # for a source or missing target: the wheels --explain lists and why they don't fit
 result.to_dict()            # JSON-friendly, keyed by "3.13 musl-aarch64"
 """
 
@@ -17,7 +18,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .check import Row, Status, check, status_for, wheel_tags
+from .check import Row, Status, check, explain_lines, status_for, wheel_tags
 from .offline import require_offline
 from .pyodide import PyodideLock, bundled_version_differs, bundles, check_locks
 from .pypi import fill_all, recheck_lock
@@ -74,6 +75,12 @@ class Result:
     # pin or range asked for (it still counts as ok, as in the CLI).
     bundled_version: str | None = None
     bundled_version_differs: bool = False
+    # Per SOURCE or MISSING target, what --explain prints under it: each rejected wheel and why, one per line.
+    reasons: dict[Target, str] = field(default_factory=dict)
+    # check_lockfile() with a dependency graph (uv.lock, poetry.lock, ...): the path from a root down to this
+    # package, as --explain's "via" line shows it, e.g. ("app", "pandas", "numpy"). Taken from the first target
+    # with a gap (or, with none, the first that installs it); empty when unknown.
+    via: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -102,14 +109,23 @@ class Result:
         if self.bundled_version is not None:  # the same keys as the CLI's --json
             out["bundled"] = self.bundled_version
             out["bundled_version_differs"] = self.bundled_version_differs
+        out["reasons"] = {t.label(True): text for t, text in self.reasons.items()}
+        out["via"] = list(self.via)
         return out
 
 
-def _result(pkg: Package, statuses: dict[Target, Status], pyodide_locks: Sequence[PyodideLock] = ()) -> Result:
+def _result(
+    pkg: Package,
+    statuses: dict[Target, Status],
+    pyodide_locks: Sequence[PyodideLock] = (),
+    via: dict[Target, list[str]] | None = None,
+) -> Result:
     applied = [lock for lock in pyodide_locks if any(bundles(lock, pkg.key, t, s) for t, s in statuses.items())]
     statuses = {
         t: Status.BUNDLED if any(bundles(lock, pkg.key, t, s) for lock in applied) else s for t, s in statuses.items()
     }
+    via = via or {}
+    gaps_first = [t for t, s in statuses.items() if s not in _OK] + list(statuses)
     return Result(
         pkg.name,
         pkg.version,
@@ -119,6 +135,12 @@ def _result(pkg: Package, statuses: dict[Target, Status], pyodide_locks: Sequenc
         # Locks for different Pythons can ship different versions: report the first, and a difference in any.
         applied[0].packages[pkg.key] if applied else None,
         any(bundled_version_differs(pkg, lock) for lock in applied),
+        {
+            t: "\n".join(explain_lines(pkg.files or [], t))
+            for t, s in statuses.items()
+            if s in (Status.SOURCE, Status.MISSING)
+        },
+        tuple(next((via[t] for t in gaps_first if t in via), ())),
     )
 
 
@@ -231,4 +253,4 @@ def _check_lockfile(
     if not online and not offline and pythons_outside_lock(source, targets):
         recheck_lock(source.packages)
     rows: list[Row] = [r for r in check([source], targets) if r.needed]
-    return [_result(r.package, dict(r.results), pyodide_locks) for r in rows], source
+    return [_result(r.package, dict(r.results), pyodide_locks, r.via) for r in rows], source

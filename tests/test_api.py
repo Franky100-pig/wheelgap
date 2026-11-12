@@ -4,6 +4,7 @@ import pytest
 
 import wheelgap
 from wheelgap import Status
+from wheelgap.cli import main
 from wheelgap.pyodide import PyodideLockError, load_pyodide_lock
 from wheelgap.sources import SourceError
 
@@ -62,6 +63,11 @@ def test_check_package_offline_with_files():
         "version": "1.0",
         "error": None,
         "results": {"3.13 linux-x86_64": "wheel", "3.13 musl-aarch64": "source"},
+        "reasons": {
+            "3.13 musl-aarch64": "x-1.0-cp313-cp313-manylinux_2_17_x86_64.whl  manylinux_2_17_x86_64 doesn't match "
+            "musl-aarch64"
+        },
+        "via": [],
     }
     json.dumps(result.to_dict())  # JSON-friendly
 
@@ -287,3 +293,59 @@ def test_check_lockfile_refuses_pyproject(fake_pypi, tmp_path):
     with pytest.raises(SourceError, match="lists direct dependencies only.*pass a lockfile"):
         wheelgap.check_lockfile(path)
     assert not fake_pypi
+
+
+# abi3lib's only wheel is abi3: fine on 3.13, not on free-threaded 3.14t. app depends on it directly before 3.14,
+# and through mid always, so the path differs per target.
+LOCK_ABI3 = (
+    'version = 1\nrequires-python = ">=3.13"\n\n'
+    '[[package]]\nname = "app"\nversion = "0"\nsource = { editable = "." }\n'
+    'dependencies = [{ name = "mid" }, { name = "abi3lib", marker = "python_full_version < \'3.14\'" }]\n\n'
+    '[[package]]\nname = "mid"\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+    'dependencies = [{ name = "abi3lib" }]\n'
+    'wheels = [{ url = "https://files.pythonhosted.org/p/mid-1.0-py3-none-any.whl" }]\n\n'
+    '[[package]]\nname = "abi3lib"\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+    'sdist = { url = "https://files.pythonhosted.org/p/abi3lib-1.0.tar.gz" }\n'
+    'wheels = [{ url = "https://files.pythonhosted.org/p/abi3lib-1.0-cp312-abi3-manylinux_2_17_x86_64.whl" }]\n'
+)
+
+
+def test_check_lockfile_reasons_and_via(fake_pypi, tmp_path):
+    (tmp_path / "uv.lock").write_text(LOCK_ABI3, encoding="utf-8")
+    gil, ft = wheelgap.make_targets(python="3.13,3.14t", platforms="linux-x86_64")
+    results = {r.name: r for r in wheelgap.check_lockfile(tmp_path, [gil, ft])}
+    lib = results["abi3lib"]
+    assert lib.statuses == {gil: Status.WHEEL, ft: Status.SOURCE}
+    assert lib.reasons == {
+        ft: "abi3lib-1.0-cp312-abi3-manylinux_2_17_x86_64.whl  "
+        "abi3 wheels can't be used on free-threaded Python (only abi3t ones can)"
+    }  # and no reason for the wheel cell
+    assert lib.via == ("app", "mid", "abi3lib")  # the gap's path, not 3.13's shorter app -> abi3lib
+    assert results["mid"].reasons == {} and results["mid"].via == ("app", "mid")  # no gaps, still a path
+    assert lib.to_dict()["reasons"] == {"3.14t linux-x86_64": lib.reasons[ft]}
+    assert lib.to_dict()["via"] == ["app", "mid", "abi3lib"]
+    json.dumps(lib.to_dict())
+
+
+def test_reasons_are_the_text_explain_prints(capsys, fake_pypi, fixtures):
+    targets = wheelgap.make_targets(python="3.14", platforms=["linux-x86_64", "pyodide"])
+    results = {r.name: r for r in wheelgap.check_lockfile(fixtures / "uvproj", targets)}
+    main([str(fixtures / "uvproj"), "-p", "3.14", "-t", "linux-x86_64,pyodide", "--explain", "--exit-zero"])
+    out = capsys.readouterr().out
+    assert results["nativeext"].via == ("demo", "fastlib", "nativeext")
+    assert results["nativeext"].reasons[targets[0]] == "no wheels published for this version"
+    assert results["fastlib"].reasons[targets[0]].count("\n") == 2  # three rejected wheels, padded to one width
+    for r in results.values():
+        for t, text in r.reasons.items():
+            block = out.split(f"{r.name} {r.version} on {t.label(False)}: ", 1)[1].split("\n\n", 1)[0]
+            lines = [line for line in block.split("\n")[1:] if not line.startswith("  via: ")]
+            assert lines == ["  " + line for line in text.split("\n")]
+    assert "can't build packages from source" in results["nativeext"].reasons[targets[1]]
+
+
+def test_via_is_empty_without_a_graph(fake_pypi, tmp_path):
+    (tmp_path / "requirements.txt").write_text("nowheels==0.9\n")
+    (result,) = wheelgap.check_lockfile(tmp_path / "requirements.txt", wheelgap.make_targets("3.13", "linux-x86_64"))
+    assert result.via == () and result.to_dict()["via"] == []
+    assert list(result.reasons.values()) == ["no wheels published for this version"]
+    assert wheelgap.check_package("nowheels", "0.9", wheelgap.make_targets("3.13", "linux-x86_64")).via == ()

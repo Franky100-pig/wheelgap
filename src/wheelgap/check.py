@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -250,6 +251,26 @@ def explain(files: list[str], target: Target) -> list[tuple[str, str]]:
     """(filename, reason) for every wheel `target` rejects, the closest misses first."""
     out = [(f, r) for f in files if f.endswith(".whl") and (r := rejection(f, target))]
     return sorted(out, key=lambda fr: _closeness(fr[0], target))
+
+
+def explain_lines(
+    files: list[str], target: Target, limit: int | None = None, dim: Callable[[str], str] = lambda text: text
+) -> list[str]:
+    """What --explain says under a gap on `target`: each rejected wheel and why (the closest misses first, at most
+    `limit` of them), or that none were published, and that the target can't build the sdist if it can't.
+
+    The command line indents these lines and dims the reasons; the Python API joins them into Result.reasons.
+    """
+    rejected = explain(files, target)
+    out = [] if rejected else [dim("no wheels published for this version")]
+    shown = rejected[:limit]
+    width = max((len(f) for f, _ in shown), default=0)
+    out += [f"{f.ljust(width)}  {dim(reason)}" for f, reason in shown]
+    if len(rejected) > len(shown):
+        out.append(dim(f"… and {len(rejected) - len(shown)} more (--json lists them all)"))
+    if not target.builds_sdists and has_sdist(files):
+        out.append(dim(f"there is an sdist, but {target.platform} can't build packages from source"))
+    return out
 
 
 _marker_cache: dict[str, Marker | None] = {}

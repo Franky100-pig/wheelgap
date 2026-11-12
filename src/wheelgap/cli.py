@@ -20,7 +20,7 @@ from packaging.utils import canonicalize_name
 
 from . import __version__, cache
 from .api import running_python
-from .check import CELL, Row, Status, check, explain, has_sdist, marker_holds, reachable
+from .check import CELL, Row, Status, check, explain, explain_lines, marker_holds, reachable
 from .dockerfile import DockerfileError, read_dockerfile
 from .junit import write_junit
 from .offline import require_offline, undo_offline
@@ -469,16 +469,7 @@ def render_explain(rows: list[Row], targets: list[Target], style: Style) -> list
             path = r.via.get(t, [])
             if len(path) >= 2:  # a lone name says nothing about why the package is there
                 out.append(f"  via: {' → '.join(path)}")
-            rejected = explain(files, t)
-            if not rejected:
-                out.append(style.dim("  no wheels published for this version"))
-            width = max((len(f) for f, _ in rejected[:EXPLAIN_LIMIT]), default=0)
-            for f, reason in rejected[:EXPLAIN_LIMIT]:
-                out.append(f"  {f.ljust(width)}  {style.dim(reason)}")
-            if len(rejected) > EXPLAIN_LIMIT:
-                out.append(style.dim(f"  … and {len(rejected) - EXPLAIN_LIMIT} more (--json lists them all)"))
-            if not t.builds_sdists and has_sdist(files):
-                out.append(style.dim(f"  there is an sdist, but {t.platform} can't build packages from source"))
+            out += [f"  {line}" for line in explain_lines(files, t, EXPLAIN_LIMIT, style.dim)]
             out.append("")
     return out
 

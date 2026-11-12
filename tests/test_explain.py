@@ -1,6 +1,6 @@
 import json
 
-from wheelgap.check import check, explain, rejection
+from wheelgap.check import check, explain, explain_lines, rejection
 from wheelgap.cli import main
 from wheelgap.sources import load_inputs
 from wheelgap.targets import build_targets
@@ -157,3 +157,10 @@ def test_explain_abi3t_and_legacy_manylinux():
     assert rejection("x-1-cp313-cp313-manylinux2014_x86_64.whl", old) == (
         "manylinux2014_x86_64 needs glibc 2.17, newer than 2.12 (--glibc)"
     )
+
+
+def test_explain_lines_limit_is_the_command_lines_only():
+    files = [f"x-1.0-cp3{m}-cp3{m}-win_amd64.whl" for m in range(10, 20)]
+    lines = explain_lines(files, target(), limit=8)
+    assert len(lines) == 9 and lines[-1] == "… and 2 more (--json lists them all)"
+    assert len(explain_lines(files, target())) == 10  # Result.reasons lists every rejected wheel
