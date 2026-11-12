@@ -25,13 +25,26 @@ jobs:
         with:
           persist-credentials: false
 
-      # compare-to: base on wheelgap's own uv.lock, from a shallow checkout, so the base commit is fetched.
+      # compare-to: base on wheelgap's own uv.lock, from a shallow checkout, so the base commit is fetched. Its result
+      # depends on what the pull request does to uv.lock (and pipx needs PyPI), so it doesn't fail the job; the next
+      # step checks that it got past the merge-commit check and the fetch to a report.
       - name: wheelgap's uv.lock against the base branch
+        id: dogfood
         if: github.event_name == 'pull_request'
+        continue-on-error: true
         uses: ./
         with:
           args: uv.lock -p 3.11,3.14,3.14t -t all
           compare-to: base
+
+      - name: Check that it compared
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          REPORT: ${{ steps.dogfood.outputs.report }}
+        run: |
+          set -eu
+          [ -n "$REPORT" ] && grep -qF 'with the base branch (<code>' "$REPORT"
 
       - name: Commit the base fixture
         id: base
