@@ -8,7 +8,7 @@ import urllib.error
 
 import pytest
 
-from wheelgap import cache, notes
+from wheelgap import cache, notes, origin
 from wheelgap.check import Row, Status
 from wheelgap.cli import Style, main, render_explain
 from wheelgap.sources import Package
@@ -490,7 +490,7 @@ def test_note_text_never_starts_a_line():
     row = Row(Package("pkg", "1.0", files=["pkg-1.0.tar.gz"]), {target: Status.SOURCE})
     rows = [row]
     sneaky = notes.Note(("linux-x86_64",), "alternative", "::warning::x", ("https://example.org/",), None, "2026-11-11")
-    lines = render_explain(rows, [target], Style(False), {id(row): [(sneaky, [target])]})
+    lines = render_explain(rows, [target], Style(False), notes={id(row): [(sneaky, [target])]})
     assert "  - ::warning::x" in lines
     assert not any(line.lstrip().startswith("::") for line in lines)
 
@@ -644,7 +644,7 @@ def test_requirements_naming_another_index(capsys, tmp_path, tracker, fake_pypi,
     assert bool(tracker.calls) is sent
 
 
-@pytest.mark.parametrize("variable", notes.INDEX_ENV)
+@pytest.mark.parametrize("variable", origin.INDEX_ENV)
 def test_installer_index_in_the_environment(capsys, tmp_path, tracker, fake_pypi, monkeypatch, variable):
     monkeypatch.setenv(variable, "https://private.example/simple")
     tracker.add("nowheels", note())
@@ -771,3 +771,10 @@ def test_eligible_only_with_a_gap():
     ignored = Row(pkg, {linux: Status.SOURCE, win: Status.WHEEL}, ignored=frozenset({linux}))
     assert not notes_eligible(ignored, [linux, win], source_of)
     assert not notes_eligible(Row(pkg, {linux: Status.SOURCE}), [linux], {})  # not from any input
+
+
+def test_pixi_lock_never(capsys, fixtures, tracker, fake_pypi):
+    tracker.add("fastlib", note(platforms=["all"]))
+    code, out, _ = run(capsys, str(fixtures / "pixiproj"), "-p", "3.13", "-t", "linux-aarch64", "--explain", "--notes")
+    assert code == 1 and "fastlib 2.0.0 on linux-aarch64" in out
+    assert tracker.calls == []

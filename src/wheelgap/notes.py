@@ -7,7 +7,7 @@ untrusted: a note that isn't exactly in the published format is dropped whole, n
 
 Looking a package up sends its name to wheelgap.github.io, so the CLI only asks for packages that are positively PyPI's
 (see may_send), only with --notes (or notes = true), and never with --offline, --index-url or a WHEELGAP_INDEX_URL
-mirror (see index_allows). The lookups are
+mirror (origin.other_index). The lookups are
 optional extras, so they are bounded: one attempt each, a short timeout, a deadline for them all, and none after
 the first connection failure.
 """
@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import datetime as dt
 import http.client
-import os
 import queue
 import re
 import threading
@@ -28,7 +27,7 @@ from urllib.parse import urlsplit
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
 
-from . import cache, pypi
+from . import cache, origin, pypi
 from .sources import Package, Source
 
 TRACKER = "https://wheelgap.github.io/tracker/data/packages"
@@ -168,34 +167,16 @@ def parse(data: object, name: str) -> list[Note] | None:
     return [n for n in map(_note, raw[:MAX_NOTES]) if n is not None]
 
 
-# Installer settings that point pip or uv at another index: with any of them set, a name found on pypi.org may still be
-# installed from somewhere else, and may be private.
-INDEX_ENV = (
-    "PIP_INDEX_URL",
-    "PIP_EXTRA_INDEX_URL",
-    "UV_INDEX_URL",
-    "UV_DEFAULT_INDEX",
-    "UV_INDEX",
-    "UV_EXTRA_INDEX_URL",
-)
-
-
-def index_allows(simple_index: str | None) -> bool:
-    """Whether this run may look anything up: not when packages come from another index (--index-url, or
-    WHEELGAP_INDEX_URL set to a mirror), which may hold private names alongside PyPI's."""
-    return simple_index is None and pypi.index_url() == pypi.DEFAULT_INDEX
-
-
 def may_send(pkg: Package, source: Source) -> bool:
-    """Whether the package's name may go to the tracker: it's positively a PyPI package. Either its lock says it came
-    from PyPI (uv.lock's registry, pylock.toml's index), or this run found it on pypi.org and its input names no
-    other index (Source.pypi_only) and neither does the environment (INDEX_ENV). Never a pdm.lock or poetry.lock
-    entry, a pylock.toml entry with no index, or a skipped package (git, path, URL, private index)."""
-    if pkg.skip:
+    """Whether the package's name may go to the tracker: origin.known_pypi (the rule --conda-forge uses too), with
+    one narrowing. known_pypi trusts a pypi.org registry from any lock, but notes take it only from uv.lock and
+    pylock.toml; from another lock (a poetry.lock legacy source of pypi.org, say), only the found-on-pypi.org route
+    counts, which those locks never satisfy. The caller has already ruled out another index (origin.other_index)."""
+    if not origin.known_pypi(pkg, source):
         return False
-    if source.kind in ("uv", "pylock") and pkg.registry is not None and pypi.is_pypi(pkg.registry):
+    if source.kind in ("uv", "pylock") or pkg.registry is None:
         return True
-    return pkg.found_on_pypi and source.pypi_only and not any(os.environ.get(k) for k in INDEX_ENV)
+    return pkg.found_on_pypi and source.pypi_only and origin.index_env() is None
 
 
 _CONNECTION = (urllib.error.URLError, OSError, http.client.HTTPException)  # HTTPError is handled before these

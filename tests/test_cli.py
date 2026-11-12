@@ -2103,6 +2103,7 @@ def _assert_matches_output_schema(data):
             "notes",
             "bundled",
             "bundled_version_differs",
+            "conda_forge",
         }
         assert isinstance(pkg["name"], str) and pkg["name"]
         assert pkg["version"] is None or isinstance(pkg["version"], str)
@@ -2122,6 +2123,9 @@ def _assert_matches_output_schema(data):
             for label, path in pkg["via"].items():
                 assert label in labels
                 assert isinstance(path, list) and all(isinstance(s, str) for s in path)
+        if "conda_forge" in pkg:  # a hint for some of the targets in rejected, never an empty one
+            assert pkg["conda_forge"]["builds"] and set(pkg["conda_forge"]["builds"]) <= set(pkg["rejected"])
+            assert all(pkg["conda_forge"]["builds"].values())
         for note in pkg.get("notes", []):
             assert set(note["targets"]) <= set(pkg.get("rejected", {})), "notes cover gap targets only"
     for item in data["skipped"]:
@@ -2928,3 +2932,176 @@ def test_github_annotations_partial_ignore(capsys, fake_pypi, fixtures, monkeypa
         "::error file=uvproj/uv.lock,line=23,title=fastlib 2.0.0%3A builds from source::"
         "fastlib 2.0.0 builds from source on linux-aarch64."
     )
+
+
+def test_pixi_lock_json(capsys, fixtures, fake_pypi):
+    code, out, err = run(
+        capsys, str(fixtures / "pixiproj"), "-p", "3.13", "-t", "linux-x86_64,macos-arm64,win-amd64", "--json"
+    )
+    assert code == 1 and not err
+    data = json.loads(out)
+    assert data["sources"] == ["pixi.lock"]
+    packages = {p["name"]: p for p in data["packages"]}
+    assert packages["fastlib"]["results"] == {"linux-x86_64": "wheel", "macos-arm64": "source", "win-amd64": "source"}
+    # Locked for win-64 only, so not installed on the lock's other platforms (with the same Python)
+    assert packages["winonly"]["results"] == {"linux-x86_64": "n/a", "macos-arm64": "n/a", "win-amd64": "wheel"}
+    assert data["skipped"] == [
+        {"name": "internal", "reason": "private index"},
+        {"name": "gitdep", "reason": "git"},
+        {"name": "localpkg", "reason": "conda"},
+        {"name": "openssl", "reason": "conda"},
+        {"name": "python", "reason": "conda"},
+    ]
+    # Every PyPI package is looked up, since the lock records only pixi's pick per platform; the one from another
+    # index never is.
+    assert sorted(fake_pypi) == [
+        "https://pypi.org/pypi/fastlib/2.0.0/json",
+        "https://pypi.org/pypi/purewheel/3.1/json",
+        "https://pypi.org/pypi/winonly/311/json",
+    ]
+
+
+def test_pixi_lock_files_are_looked_up_for_other_targets(capsys, fixtures, tmp_path, fake_pypi):
+    # pixi locked fastlib's sdist (say, for an older glibc), but PyPI also has a wheel the target takes.
+    lock = (fixtures / "pixiproj" / "pixi.lock").read_text(encoding="utf-8")
+    lock = lock.replace(
+        "packages/aa/bb/fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl", "packages/ee/ff/fastlib-2.0.0.tar.gz", 1
+    )
+    (tmp_path / "pixi.lock").write_text(lock, encoding="utf-8")
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    packages = {p["name"]: p for p in json.loads(out)["packages"]}
+    assert packages["fastlib"]["results"] == {"linux-x86_64": "wheel"}
+    assert "https://pypi.org/pypi/fastlib/2.0.0/json" in fake_pypi
+
+
+def test_pixi_lock_failed_lookup_is_unknown(capsys, fixtures, monkeypatch):
+    from wheelgap import pypi
+
+    def down(url, timeout=20.0):
+        raise OSError("no network")
+
+    monkeypatch.setattr(pypi, "fetch_json", down)
+    code, out, _ = run(capsys, str(fixtures / "pixiproj"), "-p", "3.13", "-t", "macos-arm64", "--json")
+    packages = {p["name"]: p for p in json.loads(out)["packages"]}
+    # Not the sdist the lock records for macOS: the release may have a wheel pixi didn't pick.
+    assert packages["fastlib"]["results"] == {"macos-arm64": "unknown"}
+
+
+def test_pixi_lock_environment_option(capsys, fixtures, fake_pypi):
+    code, out, _ = run(
+        capsys, str(fixtures / "pixiproj"), "--environment", "test", "-p", "3.13", "-t", "linux", "--json"
+    )
+    assert [p["name"] for p in json.loads(out)["packages"]] == ["nowheels"]
+    code, out, err = run(capsys, str(fixtures / "pixiproj"), "--environment", "docs", "-p", "3.13")
+    assert code == 2 and not out
+    assert err == (
+        "wheelgap: error: pixi.lock: no environment 'docs' (it has: default, test); pick one with --environment\n"
+    )
+    code, out, err = run(capsys, str(fixtures / "uvproj"), "--environment", "test", "-p", "3.13")
+    assert code == 2 and err == "wheelgap: error: --environment applies to pixi.lock inputs only\n"
+
+
+def test_pixi_lock_offline_needs_the_index(capsys, fixtures, fake_pypi):
+    code, out, err = run(capsys, str(fixtures / "pixiproj"), "--offline", "-p", "3.13")
+    assert code == 2 and not out
+    assert err == (
+        "wheelgap: error: --offline: pixi.lock (it records only the file pixi picked for each platform) needs the "
+        "index for 3 packages (fastlib, purewheel, winonly); use a lockfile that lists each package's files, "
+        "or drop --offline\n"
+    )
+    assert fake_pypi == []
+
+
+MIRROR_PIXI = """\
+version: 7
+platforms:
+- name: linux-64
+environments:
+  default:
+    channels:
+    - url: https://conda.anaconda.org/conda-forge/
+    indexes:
+    - https://pypi.org/simple
+    - https://mirror.example.com/simple
+    packages:
+      linux-64:
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.13.9-hc97d973_101_cp313.conda
+      - pypi: https://mirror.example.com/files/fastlib-2.0.0.tar.gz
+packages:
+- conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.13.9-hc97d973_101_cp313.conda
+- pypi: https://mirror.example.com/files/fastlib-2.0.0.tar.gz
+  name: fastlib
+  version: 2.0.0
+  index: https://mirror.example.com/simple
+"""
+
+
+@pytest.mark.parametrize("online", [False, True])
+def test_pixi_lock_mirror_package_is_looked_up_never_kept(capsys, tmp_path, fake_pypi, monkeypatch, online):
+    # The lock's one file (an sdist) can't answer the target; the mirror the lock names has a wheel for it.
+    (tmp_path / "pixi.lock").write_text(MIRROR_PIXI, encoding="utf-8")
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://mirror.example.com/pypi")
+    args = ["-p", "3.13", "-t", "linux-x86_64", "--json"] + ["--online"] * online
+    code, out, _ = run(capsys, str(tmp_path), *args)
+    assert {p["name"]: p["results"] for p in json.loads(out)["packages"]} == {"fastlib": {"linux-x86_64": "wheel"}}
+    assert fake_pypi == ["https://mirror.example.com/pypi/fastlib/2.0.0/json"]
+    assert code == 0
+
+
+def test_pixi_lock_mirror_package_is_skipped_without_its_index(capsys, tmp_path, fake_pypi):
+    (tmp_path / "pixi.lock").write_text(MIRROR_PIXI, encoding="utf-8")
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--online", "--json")
+    assert json.loads(out)["skipped"] == [
+        {"name": "fastlib", "reason": "private index"},
+        {"name": "python", "reason": "conda"},
+    ]
+    assert fake_pypi == [] and code == 0
+
+
+def test_pixi_lock_next_to_another_lockfile(capsys, fixtures, tmp_path, fake_pypi):
+    (tmp_path / "pixi.lock").write_bytes((fixtures / "pixiproj" / "pixi.lock").read_bytes())
+    (tmp_path / "uv.lock").write_bytes((fixtures / "uvproj" / "uv.lock").read_bytes())
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert json.loads(out)["sources"] == ["uv.lock"]
+    assert err == (
+        f"wheelgap: note: {tmp_path / 'uv.lock'} was checked; {tmp_path / 'pixi.lock'} is in the same folder too "
+        "(pass it, or --environment, to check it instead)\n"
+    )
+    code, out, err = run(
+        capsys, str(tmp_path), "--environment", "default", "-p", "3.13", "-t", "linux-x86_64", "--json"
+    )
+    assert json.loads(out)["sources"] == ["pixi.lock"] and not err
+    code, out, err = run(capsys, str(tmp_path), "-q", "-p", "3.13", "-t", "linux-x86_64")
+    assert not err
+
+
+def test_pixi_lock_empty_environment_is_an_error(capsys, fixtures, fake_pypi):
+    code, out, err = run(capsys, str(fixtures / "pixiproj"), "--environment", "", "-p", "3.13")
+    assert (code, out, err) == (2, "", "wheelgap: error: --environment needs a name\n")
+
+
+def test_pixi_lock_counts_conda_packages_in_text(capsys, tmp_path, fake_pypi):
+    names = ["bzip2", "libffi", "ncurses", "openssl", "readline", "tk"]
+    selectors = [f"      - conda: https://conda.anaconda.org/conda-forge/linux-64/{n}-1.0-h0_0.conda" for n in names]
+    text = MIRROR_PIXI.replace(
+        "      - pypi: https://mirror.example.com/files/fastlib-2.0.0.tar.gz\n", "\n".join(selectors) + "\n"
+    )
+    (tmp_path / "pixi.lock").write_text(text, encoding="utf-8")
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert "skipped 7 non-index packages: 7 conda packages (not on PyPI)" in out
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--markdown")
+    assert "Skipped 7 non-index packages: 7 conda packages (not on PyPI)" in out
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert len(json.loads(out)["skipped"]) == 7  # --json lists each one
+    # Up to five are listed by name, after any others
+    (tmp_path / "pixi.lock").write_text(
+        text.replace(selectors[-1] + "\n", "").replace(selectors[-2] + "\n", ""), encoding="utf-8"
+    )
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert "skipped 5 non-index packages: bzip2 (conda), libffi (conda), ncurses (conda), openssl (conda)," in out
+    # Exactly six are counted; any other skipped package is still named before the count.
+    gitdep = "git+https://github.com/example/gitdep.git#aaaa"
+    six = text.replace(selectors[-1] + "\n", f"      - pypi: {gitdep}\n") + f"- pypi: {gitdep}\n  name: gitdep\n"
+    (tmp_path / "pixi.lock").write_text(six, encoding="utf-8")
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert "skipped 7 non-index packages: gitdep (git), 6 conda packages (not on PyPI)\n" in out
