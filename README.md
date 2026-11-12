@@ -339,6 +339,34 @@ Each package with a gap is also marked on its own line of the lockfile in the pu
 
 To watch a platform before you support it, such as Windows on ARM, make it advisory: `-t linux-x86_64,win-arm64 --advisory win-arm64` (or `advisory = ["win-arm64"]` in `[tool.wheelgap]`). Its gaps are reported as usual but never fail the run: the column is headed `win-arm64 (advisory)` in the table and the Markdown report, the summary includes a line like `3 gaps in 2 packages on advisory targets linux-aarch64, win-arm64 don't fail the run.` (it counts each package once per advisory target, while the line above it counts packages), and `--json` lists the advisory target labels under `advisory`, while `packages`, `summary.with_gaps` and `summary.per_target` still count those gaps. Advisory works per platform, so it marks every Python checked on that platform (`"3.13 win-arm64"` and `"3.14t win-arm64"`): a free-threaded `3.14t` can't be made advisory on its own. `--advisory` takes anything `-t` does (aliases like `windows-arm64`, Docker names like `linux/arm64`), repeated or comma-separated, and replaces the configured list (`--advisory ""` clears it for one run). It only marks targets, so a target must also be checked: an `--advisory` target that isn't is an error (exit 2), while a configured one that a run doesn't check (`-t linux`, a `--dockerfile` image) gets a note on stderr. A group (`all`, `everything`, `mobile`) means whichever of its targets the run checks, so `--advisory all` makes every checked target advisory, and it's an error only when the run checks none of them. When every checked target is advisory, the run can't fail, not even when a lookup fails during an index outage, so a note on stderr says so (`-q` hides it). With `--fail-on missing`, a source build on a required target still passes and a missing package on one still fails, whatever the advisory targets show. An `--ignore NAME:TARGET` gap on an advisory target stays ignored and isn't counted as an advisory gap. In `--junit` reports an advisory gap is a skipped testcase with the message `advisory: source` (or `missing`, `unknown`), not a failure, so dashboards that mark a build unstable on failed tests don't. In the Action, put `--advisory` in `args`: the summary page shows the same marking. `wheelgap diff` has no `--advisory` yet.
 
+**Only fail when a pull request makes things worse** (after 0.9.0: until the next release, use `wheelgap/wheelgap@main`). With `compare-to: base`, the Action runs `wheelgap diff` between the lockfile on the pull request's base commit and the one in the checkout, so it fails only when a dependency bump (from Dependabot, Renovate or a person) loses a wheel or adds a package with a gap, not on gaps you already have:
+
+```yaml
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write  # only for comment: true
+jobs:
+  wheels:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: wheelgap/wheelgap@v0.9.0
+        with:
+          args: uv.lock -p 3.13 -t linux-x86_64,linux-aarch64,musl-aarch64
+          compare-to: base
+          comment: true
+```
+
+- `args` must then start with the lockfile's path, followed only by `-p` and `-t` (what `wheelgap diff` takes); anything else exits 2. The step exits 1 when something got worse, 0 when nothing did, and 2 on bad input, as `wheelgap diff` does.
+- `compare-to: base` reads the base commit from the `pull_request` event and fetches it if the checkout is shallow (the default; in a private repository with `persist-credentials: false`, check out with `fetch-depth: 0` instead). It needs a `pull_request` event and exits 2 on any other; for those, give a git ref instead, such as `compare-to: origin/main` (fetch it first).
+- The report goes to the job summary: a table of each package and target that got worse (`armlib 1.4.0 → 1.5.0`, `musl-aarch64`, `✓ → ● source`) and each new package's gaps. The action's `report` output is the path of the same Markdown file.
+- With `comment: true`, it also posts the table as a pull request comment when something got worse, and edits that one comment on later pushes (to say nothing got worse, once that's true) rather than adding more. A hidden marker naming the lockfile finds it, so two lockfiles get two comments. Package names and versions come from the pull request, so they're escaped and can't add links, @mentions or Markdown to the comment.
+- **Permissions.** Commenting needs `pull-requests: write` for the token (`github-token`, by default the workflow's `GITHUB_TOKEN`). Pull requests from forks always get a read-only token under `pull_request`, and Dependabot's pull requests get one by default too, unless the workflow's `permissions:` asks for more as above. When the comment can't be posted, the step warns and the job summary still has the report; the result is the same either way. So for Dependabot and fork pull requests, the summary-only setup (`comment: false`, the default, with `contents: read`) is enough.
+- **Don't switch to `pull_request_target` to get a write token.** It runs with the base branch's workflow and a write token, so checking out and running the pull request's code there hands that token to the pull request. `compare-to: base` refuses `pull_request_target`, whose default checkout is the base branch: it would compare the base with itself.
+
 Outside the Action, `--markdown` prints the same report as Markdown, for a job summary (`wheelgap --markdown >> "$GITHUB_STEP_SUMMARY"`) or a PR comment. With `--explain`, the rejected wheels go in a collapsed section. `--junit PATH` also writes a JUnit XML file (one testsuite per target) that GitLab, Jenkins, Azure Pipelines and CircleCI can show as a test report, alongside whatever output mode you use.
 
 ### With pre-commit
