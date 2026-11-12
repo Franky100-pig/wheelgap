@@ -411,9 +411,10 @@ There's no YAML parser in the standard library, so workflows are read with a con
 - a job that runs in a `container:`;
 - an unquoted `3.10` (YAML reads it as the number 3.1) or `0x10`;
 - `python-version-file`;
-- flow-style `steps` or `with`, a value on the line after its key, and a quoted value over several lines, where wheelgap would read it (elsewhere it's skipped whole);
+- flow-style `steps` or `with`, a scalar on the line after its key, and a quoted value over several lines, where wheelgap would read it (elsewhere it's skipped whole; a flow list on the line after its key is read);
 - a flow list with anything but plain or quoted scalars and flat `{...}` mappings, read as YAML reads them (`[it's]` is the string `it's`);
 - quoted keys with escapes, lines that are neither a key nor a list item, directives other than `%YAML 1.2`, and more than one YAML document;
+- block scalars with an anchor or tag (`&a |`) or on the line after their key, and line breaks other than `\n` and `\r\n`. Non-ASCII spaces such as NBSP are ordinary characters, as they are to YAML;
 - a job id used twice;
 - Dockerfile templates (`Dockerfile.j2`, `Dockerfile.template`), files or folders it can't open, and Dockerfiles `--dockerfile` would reject.
 

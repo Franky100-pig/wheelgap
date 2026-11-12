@@ -12,6 +12,7 @@ from wheelgap.suggest_targets import (
     _same,
     _Scalar,
     _split_key,
+    _starts,
     _strip_comment,
     _unquote,
     _Unsure,
@@ -812,7 +813,7 @@ JOB = "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
             "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
             "        os: [ubuntu-latest]\n        exclude:\n          - os: ubuntu-latest\n",
             [],
-            [(5, "job test: the matrix is empty")],
+            [(5, "job test: the matrix is empty (neither its runner nor its Python is read)")],
         ),
         (
             "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
@@ -917,8 +918,8 @@ jobs:
     assert refused == []
     assert targets == [
         ("linux-x86_64", CI, 6),
-        ("win-amd64", CI, 6),
         ("macos-arm64", CI, 6),
+        ("win-amd64", CI, 6),
         ("linux-aarch64", CI, 14),
     ]
     assert [(f.value, f.line) for f in found.pythons] == [("3.12", 12), ("3.13", 12), ("3.14t", 14)]
@@ -945,7 +946,7 @@ jobs:
 """,
     )
     found = suggest(tmp_path)
-    assert where(found.targets) == [("linux-x86_64", CI, 6), ("win-amd64", CI, 6), ("macos-arm64", CI, 6)]
+    assert where(found.targets) == [("linux-x86_64", CI, 6), ("macos-arm64", CI, 6), ("win-amd64", CI, 6)]
     assert where(found.pythons) == [("3.12", CI, 12), ("3.13", CI, 12)]
     assert found.unreadable == []
 
@@ -1090,8 +1091,8 @@ jobs:
 """,
     )
     # The first setup-python uses the runner's own architecture, the second 32-bit x86, which only Windows has.
-    assert targets == [("win-amd64", CI, 6), ("win32", CI, 6), ("linux-x86_64", CI, 6)]
-    assert found.targets[1].source == "runs-on: windows-latest (matrix.os, line 3), architecture: x86"
+    assert targets == [("linux-x86_64", CI, 6), ("win-amd64", CI, 6), ("win32", CI, 6)]
+    assert found.targets[2].source == "runs-on: windows-latest (matrix.os, line 3), architecture: x86"
     assert refused == [(6, "job test: setup-python's architecture: x86 on ubuntu-latest isn't read")]
 
 
@@ -1529,3 +1530,225 @@ jobs:
     )
     assert targets == [("linux-x86_64", CI, 3)]
     assert refused == [(16, "job other: runs-on: a value on the line after the key")]
+
+
+X86 = (
+    "      - uses: actions/setup-python@v6\n        with:\n"
+    "          python-version: '3.13'\n          architecture: x86\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("before", "label"),
+    [
+        # A quote after `:` with no space is part of a plain scalar, so it can't swallow the lines after it.
+        ("    env: {A: x:'y}\n", "quote after a colon in a flow mapping"),
+        ('    env: {A: x:"y, B: z}\n', "double quote after a colon"),
+        ("    env:\n      A: x:'y # a comment\n", "quote after a colon in a block mapping"),
+        ("    env:\n      A: it's [not a list\n", "quote and bracket inside a plain scalar"),
+        # A further line of a plain scalar never starts a quoted value or flow collection of its own.
+        ('    steps:\n      - run: echo building\n          "quoted\n', "quote on a continuation line"),
+        ("    steps:\n      - run: echo building\n          - 'quoted\n", "- ' on a continuation line"),
+        ("    steps:\n      - run: echo building\n          [not, closed\n", "[ on a continuation line"),
+        ("    steps:\n      - run: echo building\n          {not: closed\n", "{ on a continuation line"),
+    ],
+)
+def test_quotes_and_brackets_only_open_where_yaml_opens_them(tmp_path, before, label):
+    steps = "" if "steps:" in before else "    steps:\n"
+    targets, refused, found = read(tmp_path, SETUP.split("    steps:\n")[0] + before + steps + X86)
+    assert targets == [("win32", CI, 3)], label
+    assert [f.value for f in found.pythons] == ["3.13"]
+    assert refused == []
+
+
+@pytest.mark.parametrize(
+    ("text", "flow", "expected"),
+    [
+        ("'a", False, True),
+        ("key: 'a", False, True),
+        ("- 'a", False, True),
+        ("x:'y", False, False),
+        ("it's", False, False),
+        ("a 'b", False, False),
+        ("a- 'b", False, False),  # a dash inside a word isn't a list item
+        ("[a, 'b", True, True),
+        ("[a,'b", True, True),
+        ("['b", True, True),
+        ("{a: 'b", True, True),
+        ("[a 'b", True, False),
+        ("[a,'b", False, False),  # outside a flow collection a comma is an ordinary character
+    ],
+)
+def test_where_a_quote_starts(text, flow, expected):
+    assert _starts(text, text.rindex("'"), flow) is expected
+
+
+@pytest.mark.parametrize(
+    ("line", "refused"),
+    [
+        ("    env:\n      A: &a |\n        jobs: x\n", (5, "a block scalar with an anchor or tag (&a |) isn't read")),
+        (
+            "    env:\n      A: !!str >-\n        jobs: x\n",
+            (5, "a block scalar with an anchor or tag (!!str >-) isn't read"),
+        ),
+        (
+            "    steps:\n      - &s !!str |\n        x\n",
+            (5, "a block scalar with an anchor or tag (&s !!str |) isn't read"),
+        ),
+        ("    env:\n      A:\n        |\n        x\n", (6, "a block scalar (|) on the line after A: isn't read")),
+    ],
+)
+def test_block_scalars_with_properties_refuse_the_file(tmp_path, line, refused):
+    targets, got, _ = read(tmp_path, SETUP.split("    steps:\n")[0] + line)
+    assert targets == []
+    assert got == [refused]
+
+
+@pytest.mark.parametrize(
+    ("text", "refused"),
+    [
+        # NBSP isn't whitespace to YAML: it's part of the label, which no runner has.
+        (
+            "jobs:\n  test:\n    runs-on: windows-latest\u00a0\n",
+            [(3, "job test: windows-latest\u00a0 isn't a GitHub-hosted runner wheelgap knows")],
+        ),
+        (
+            "jobs:\n  test:\n    runs-on: windows-latest\u00a0# not a comment\n",
+            [(3, "job test: windows-latest\u00a0# not a comment isn't a GitHub-hosted runner wheelgap knows")],
+        ),
+        (
+            "jobs:\n  test:\n    runs-on: ${{\u00a0matrix.os }}\n",
+            [(3, "job test: runs-on: ${{\u00a0matrix.os }} is an expression")],
+        ),
+        # A line starting with NBSP is at column 0: a top-level key, so the job has no runs-on, as YAML reads it.
+        ("jobs:\n  test:\n\u00a0   runs-on: windows-latest\n", [(2, "job test: no runs-on line")]),
+    ],
+)
+def test_unicode_spaces_are_ordinary_characters(tmp_path, text, refused):
+    targets, got, _ = read(tmp_path, text)
+    assert targets == []
+    assert got == refused
+
+
+@pytest.mark.parametrize("brk", ["\r", "\x85", "\u2028", "\u2029"])
+def test_other_line_breaks_refuse_the_file(tmp_path, brk):
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    (tmp_path / ".github" / "workflows" / "ci.yml").write_bytes(
+        ("jobs:\n  test:\n    runs-on: ubuntu-latest # a" + brk + "b\n").encode("utf-8")
+    )
+    found = suggest(tmp_path)
+    assert found.targets == []
+    assert unreadable(found) == [(CI, 3, f"a line break YAML may read differently ({brk!r})")]
+
+
+def test_crlf_and_tab_indented_comments_are_fine(tmp_path):
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    (tmp_path / ".github" / "workflows" / "ci.yml").write_bytes(
+        b"jobs:\r\n\t# a comment\r\n  test:\r\n    runs-on: ubuntu-latest\r\n"
+    )
+    found = suggest(tmp_path)
+    assert where(found.targets) == [("linux-x86_64", CI, 4)]
+    assert found.unreadable == []
+
+
+MATRIX_ARCH = """\
+jobs:
+  test:
+    runs-on: ${{{{ matrix.os }}}}
+    strategy:
+      matrix:
+        include:
+{entries}
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          architecture: ${{{{ matrix.arch }}}}
+"""
+
+
+def test_a_combination_without_the_architecture_uses_the_runners_own(tmp_path):
+    entries = [
+        "          - {os: windows-latest, arch: x86}",
+        "          - {os: windows-2025}",
+        "          - {os: windows-11-arm, arch: ''}",
+    ]
+    targets, refused, found = read(tmp_path, MATRIX_ARCH.format(entries="\n".join(entries)))
+    assert refused == []
+    assert targets == [("win32", CI, 7), ("win-amd64", CI, 8), ("win-arm64", CI, 9)]
+    # The same matrix in another order gives the same answer, line for line.
+    workflow(tmp_path, MATRIX_ARCH.format(entries="\n".join(reversed(entries))))
+    again = suggest(tmp_path)
+    assert sorted(where(again.targets)) == sorted([("win32", CI, 9), ("win-amd64", CI, 8), ("win-arm64", CI, 7)])
+
+
+def test_a_refusal_partway_through_the_matrix_keeps_no_targets(tmp_path):
+    # The second combination has no os, so runs-on is '' there: nothing from the job is suggested, in either order.
+    for entries in (
+        ["          - {os: windows-latest}", "          - {arch: x86}"],
+        ["          - {arch: x86}", "          - {os: windows-latest}"],
+    ):
+        targets, refused, _ = read(tmp_path, MATRIX_ARCH.format(entries="\n".join(entries)))
+        assert targets == []
+        assert refused == [(3, "job test: matrix.os isn't set in every matrix combination")]
+
+
+@pytest.mark.parametrize(
+    ("matrix", "targets", "refused"),
+    [
+        (
+            "        os:\n          [ubuntu-latest, windows-latest]\n",
+            [("linux-x86_64", CI, 6), ("win-amd64", CI, 6)],
+            [],
+        ),
+        (
+            "        os: [ubuntu-latest]\n        include: ${{ fromJson(inputs.extra) }}\n",
+            [],
+            [(7, "the matrix's include is computed (${{ fromJson(inputs.extra) }})")],
+        ),
+        (
+            "        os: ['ubuntu-latest,\n          windows-latest']\n",
+            [],
+            [(6, "can't read ['ubuntu-latest, windows-latest'] (a quoted value over several lines)")],
+        ),
+        ("        os: [ubuntu-latest,\n          windows-latest]]\n", None, (7, "can't read windows-latest]]")),
+        ("        os: ubuntu-latest\n          windows-latest\n", [], [(6, "can't read the value of os")]),
+        ("        os:\n", [], [(6, "os has no value")]),
+        ("        os:\n          - ubuntu-latest\n          arch: x64\n", [], [(6, "can't read os")]),
+        (
+            "        include:\n          - os: ubuntu-latest\n            os: windows-latest\n",
+            [],
+            [(8, "os is set twice")],
+        ),
+        ("        os: [ubuntu-latest]\n        os: [windows-latest]\n", [], [(7, "os is set twice")]),
+        ("        os: {a: b}\n", [], [(5, "the matrix has values that aren't a plain list")]),
+        ("        os: [{a : b}]\n", [], [(5, "the matrix has values that aren't a plain list")]),
+        ('        os: [{a: "b" c}]\n', [], [(6, 'can\'t read [{a: "b" c}]')]),
+    ],
+)
+def test_matrix_values(tmp_path, matrix, targets, refused):
+    text = "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n" + matrix
+    got_targets, got_refused, _ = read(tmp_path, text)
+    if targets is None:  # the whole file
+        assert got_targets == [] and got_refused == [refused]
+        return
+    assert got_targets == targets
+    assert got_refused == [(line, f"job test: {reason}") for line, reason in refused]
+
+
+def test_a_stray_line_deep_in_a_job_refuses_the_file(tmp_path):
+    _, refused, found = read(tmp_path, SETUP + "      - uses: actions/checkout@v5\n        with:\n          ? weird\n")
+    assert found.targets == []
+    assert refused == [(7, "can't read ? weird")]
+
+
+def test_python_from_a_matrix_key_some_combinations_lack(tmp_path):
+    _, refused, found = read(
+        tmp_path,
+        "jobs:\n  test:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        include:\n"
+        "          - {python: '3.13'}\n          - {other: x}\n"
+        "    steps:\n      - uses: actions/setup-python@v6\n        with:\n"
+        "          python-version: ${{ matrix.python }}\n",
+    )
+    assert found.pythons == []
+    assert refused == [(12, "job test: matrix.python isn't set in every matrix combination")]
