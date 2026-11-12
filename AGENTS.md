@@ -34,6 +34,7 @@ uv run --group dev pytest
 | `pypi.py` | The only HTTP client (`fetch_json`: retries, https-only redirects) and the PyPI lookups (`fill`, `fill_all`, `recheck_lock`) |
 | `cache.py` | The 24-hour on-disk cache of pinned PyPI lookups (`--no-cache` and `--online` skip it) |
 | `dockerfile.py` | `--dockerfile`: reads the final stage's image and platform the way Docker/BuildKit does |
+| `suggest_targets.py` | `--suggest-targets`: targets and Pythons read from GitHub Actions workflows (a conservative line scan) and Dockerfiles |
 | `offline.py` | `--offline`, `offline = true` and `check_lockfile(..., offline=True)`: refuse inputs that would need an index lookup |
 | `pyodide.py` | `--pyodide-lock`: packages Pyodide ships itself |
 | `github.py` | `--github-annotations`: GitHub Actions `::error`/`::warning` lines, and each package's line in its input file |

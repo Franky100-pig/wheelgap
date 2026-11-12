@@ -91,6 +91,8 @@ targets = ["linux-x86_64", "linux-aarch64", "musl-aarch64"]
 glibc = "2.31"
 ```
 
+Not sure what to put there? `wheelgap --suggest-targets` reads the platforms your CI and Dockerfiles already name and suggests these lines ([below](#suggest-targets-from-your-ci-and-dockerfiles)).
+
 For uv projects, wheelgap also reads `[tool.uv] required-environments` as default targets:
 
 ```toml
@@ -305,6 +307,41 @@ wheelgap -p 3.12 -t pyodide --pyodide-lock https://cdn.jsdelivr.net/pyodide/v0.2
 Docker platform names also work with `-t`, for example `-t linux/amd64,linux/arm64` (also `linux/arm64/v8`, `linux/arm/v7`, `linux/ppc64le`, `linux/s390x`, `linux/riscv64` and `linux/386`, also spelled `linux/i386`).
 
 `-t all` checks the eight common native platforms, and `-t everything` adds the armv7l, ppc64le, s390x, riscv64 and i686 Linux targets (glibc and musl) and `win32`. Pyodide, iOS and Android are only checked when you name them. Python versions take a trailing `t` for free-threaded builds (`3.14t`), which correctly rejects `abi3` wheels. Without `-p`, wheelgap reads a `.python-version` file next to the lockfile (or `pyproject.toml`) if there is one, and otherwise uses the Python it is running on.
+
+### Suggest targets from your CI and Dockerfiles
+
+`wheelgap --suggest-targets [DIR]` (default: the current directory) reads the platforms and Pythons the project already names, and prints each suggestion with the file and line it came from, then a `[tool.wheelgap]` snippet to paste into `pyproject.toml`. It only suggests: nothing is changed or checked, and it exits 0.
+
+```
+$ wheelgap --suggest-targets
+Targets:
+  linux-x86_64
+    .github/workflows/wheels.yml:5  runs-on: ubuntu-slim
+  linux-aarch64
+    .github/workflows/test.yml:9  runs-on: ubuntu-24.04-arm (matrix.os, line 5)
+  musl-x86_64
+    Dockerfile:4  FROM python:3.13-alpine (musl 1.2)
+  win-amd64
+    .github/workflows/test.yml:9  runs-on: windows-latest (matrix.os, line 5)
+Pythons:
+  3.13
+    .github/workflows/test.yml:8  python-version: 3.13 (matrix.python-version, line 14)
+    Dockerfile:4                  FROM python:3.13-alpine
+Couldn't read (not guessed):
+  .github/workflows/wheels.yml:12  job build: the matrix is computed (${{ fromJSON(needs.plan.outputs.matrix) }})
+
+Suggested settings for pyproject.toml (nothing was changed or checked):
+
+[tool.wheelgap]
+python = ["3.13"]
+targets = ["linux-x86_64", "linux-aarch64", "musl-x86_64", "win-amd64"]
+musl = "1.2"
+```
+
+- **GitHub Actions** (`.github/workflows/*.yml` and `*.yaml`): each job's `runs-on`, as a single label or `${{ matrix.KEY }}` with a literal matrix (lists, `include` and `exclude`, combined as GitHub does), and the `python-version` given to `actions/setup-python` or `astral-sh/setup-uv`, as a literal (`"3.13"`, `3.13.1`, `3.14t`) or from the matrix. [GitHub-hosted runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) labels map to targets: `ubuntu-latest`, `ubuntu-slim` and `ubuntu-24.04` to `linux-x86_64`, `ubuntu-24.04-arm` to `linux-aarch64`; `windows-latest` and `windows-2025` to `win-amd64`, `windows-11-arm` to `win-arm64`; `macos-latest`, `macos-14` and later, and the `-xlarge` runners to `macos-arm64`; `macos-13`, `macos-15-intel` and the `-large` runners to `macos-x86_64`. Other Ubuntu versions (`ubuntu-22.04`, `ubuntu-22.04-arm`) and Windows images (`windows-2022`, `windows-2025-vs2026`) map the same way.
+- **Dockerfiles** (every `Dockerfile*` and `*.Dockerfile` outside hidden folders, `node_modules` and virtual environments): the final stage's image, read exactly as `--dockerfile` reads it, for the target, the Python and the glibc or musl version.
+
+There's no YAML parser in the standard library, so workflows are read with a conservative line scan. Anything it can't be sure of is listed under "Couldn't read" with its file and line, and never guessed: an expression or a computed matrix, a self-hosted or other unknown runner label, a job that runs in a `container:`, an unquoted `3.10` (YAML reads it as the number 3.1), `python-version-file`, and Dockerfiles `--dockerfile` would reject. A `DIR` that isn't a folder exits 2. The snippet sets `glibc` or `musl` only when every source of those targets names the same version (a runner doesn't), and leaves out `python` when none was found. `--json` prints the same as an object with `targets`, `python` (each with `file`, `line` and `from`), `unreadable` and `config`.
 
 ### Free-threading and new Python readiness
 

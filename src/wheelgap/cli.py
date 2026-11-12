@@ -46,6 +46,9 @@ from .sources import (
     select_uv_dependencies,
     uv_selected_roots,
 )
+from .suggest_targets import render_text as render_suggestions
+from .suggest_targets import suggest
+from .suggest_targets import to_json as suggestions_json
 from .targets import (
     ALIASES,
     DEFAULT_ANDROID_API,
@@ -262,6 +265,14 @@ def make_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--color", choices=["auto", "always", "never"], default="auto")
     p.add_argument("--list-targets", action="store_true", help="list platforms, aliases and compatibility limits")
+    p.add_argument(
+        "--suggest-targets",
+        nargs="?",
+        const=".",
+        metavar="DIR",
+        help="suggest targets and Pythons from DIR's GitHub Actions workflows and Dockerfiles (default: .), "
+        "with a [tool.wheelgap] snippet; checks nothing",
+    )
     p.add_argument("-V", "--version", action="version", version=version_string())
     return p
 
@@ -1054,6 +1065,21 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--list-targets has no Markdown form (use --json)")
     if args.offline and args.online:
         parser.error("--offline and --online can't be used together")
+    if args.suggest_targets is not None:
+        if args.markdown:
+            parser.error("--suggest-targets has no Markdown form (use --json)")
+        if args.inputs:
+            parser.error("--suggest-targets takes the project folder as its value: --suggest-targets DIR")
+        try:
+            found = suggest(Path(args.suggest_targets))
+        except OSError as e:
+            print(f"wheelgap: error: {e}", file=sys.stderr)
+            return input_error_json(e) if args.json else 2
+        if args.json:
+            print(json.dumps(suggestions_json(found), indent=2))
+        else:
+            print("\n".join(render_suggestions(found)))
+        return 0
     try:
         if args.clear_cache:
             folder, count = cache.clear()
