@@ -3,7 +3,10 @@
 import html
 import importlib.util
 import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -189,6 +192,7 @@ def test_the_comment_payload_fits_github(tmp_path, capsys):
         ("usage: wheelgap diff ...", 0, "exited 0 without a report"),
         ('{"version": "0.9.0", "packages": []}', 1, "something other than its report"),  # not a diff report
         ('{"worse": [{"name": "x"}], "new": []}', 1, "something other than its report"),  # no targets
+        ('{"worse": [{"name": "x", "targets": {}}], "new": []}', 1, "something other than its report"),
         (json.dumps(diff_report()), 1, "doesn't match its report"),  # exit 1, but nothing listed
         (json.dumps(diff_report(worse=[worse_entry()])), 0, "doesn't match its report"),
         (json.dumps(diff_report(new=[new_entry()])), 0, "doesn't match its report"),
@@ -307,6 +311,8 @@ def test_a_broken_listing_is_an_error_not_an_empty_one(tmp_path, capsys, listing
         ("###[x", "##\\#[x"),
         ("wheelgap: note: couldn't check x", "wheelgap: note: couldn't check x"),
         ("a :: b", "a :: b"),
+        ("\ufeff::error::x", "\ufeff:\\:error::x"),
+        ("\ufeff \x1b[0m ::error::x", "\ufeff \x1b[0m :\\:error::x"),
     ],
 )
 def test_defuse(line, shown):
@@ -320,3 +326,22 @@ def test_log_defuses_every_line_the_runner_would_see(tmp_path, capsys):
     lines = re.split(r"\r\n|\r|\n", out.removesuffix("\n"))
     assert lines == ["ok", ":\\:error::a", ":\\:warning::b", "  :\\:add-mask::c", "x #\\#[group]d"]
     assert not any(line.lstrip().startswith("::") or "##[" in line for line in lines)
+
+
+def test_log_writes_utf8_on_a_cp1252_runner(tmp_path):
+    (tmp_path / "err").write_text("wheelgap: note: ✓ → ● ::x\n::error::y\n", encoding="utf-8")
+    done = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "action_compare.py"), "log", str(tmp_path / "err")],
+        capture_output=True,
+        env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+    )
+    assert done.returncode == 0
+    assert done.stdout.decode("utf-8").splitlines() == ["wheelgap: note: ✓ → ● ::x", ":\\:error::y"]
+
+
+def test_a_problem_report_when_diff_never_ran(tmp_path, capsys):
+    md = tmp_path / "r.md"
+    argv = ["report", "--lockfile", "uv.lock", "--base-branch", "--problem", "couldn't fetch the base commit"]
+    assert ac.main([*argv, "--markdown", str(md)]) == 2
+    text = html.unescape(md.read_text(encoding="utf-8"))
+    assert "with the base branch. The check couldn't run: couldn't fetch the base commit</p>" in text

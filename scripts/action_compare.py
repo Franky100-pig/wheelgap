@@ -164,7 +164,10 @@ def report(
 ) -> str:
     """The Markdown report, at most `budget` characters."""
     at = f" at {code(head)}" if head else ""
-    with_ = f"the base branch ({code(base)})" if base_branch else code(base)
+    if base_branch:
+        with_ = f"the base branch ({code(base)})" if base else "the base branch"
+    else:
+        with_ = code(base)
     compared = f"Compared {code(lockfile)}{at} with {with_}."
     header = ["### wheelgap diff", ""]
     if data is None:
@@ -231,13 +234,13 @@ def pick(listing: list, login: str, lockfile: str) -> int | None:
     return None
 
 
-_LEADING = re.compile(r"^(?:\s|\x1b\[[0-9;]*m)*")
+_LEADING = re.compile(r"^(?:\s|\ufeff|\x1b\[[0-9;]*m)*")
 
 
 def defuse(line: str) -> str:
     """`line` with nothing the Actions runner reads as a workflow command: it acts on a line whose first
     non-whitespace text is `::` and on `##[` anywhere (actions/runner's ActionCommand.TryParseV2 and TryParse).
-    Colour codes are skipped too, to be safe."""
+    Colour codes and a byte order mark are skipped too, to be safe."""
     line = line.replace("##[", "#\\#[")
     start = _LEADING.match(line).end()  # type: ignore[union-attr]
     if line.startswith("::", start):
@@ -254,10 +257,11 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
     r = sub.add_parser("report", help="write the report; exit 0, 1 or 2 as the step should")
-    r.add_argument("--diff-json", required=True, help="what `wheelgap diff --json` printed")
-    r.add_argument("--exit-code", type=int, required=True, help="wheelgap diff's exit code")
+    r.add_argument("--diff-json", help="what `wheelgap diff --json` printed")
+    r.add_argument("--exit-code", type=int, default=2, help="wheelgap diff's exit code")
+    r.add_argument("--problem", help="diff didn't run: report this reason instead")
     r.add_argument("--lockfile", required=True)
-    r.add_argument("--base", required=True, help="the git ref or commit the lockfile was compared with")
+    r.add_argument("--base", default="", help="the git ref or commit the lockfile was compared with")
     r.add_argument("--base-branch", action="store_true", help="--base is the pull request's base commit")
     r.add_argument("--head", default="", help="the commit checked, shown in the report")
     r.add_argument("--markdown", required=True, help="write the report here")
@@ -278,6 +282,8 @@ def main(argv: list[str] | None = None) -> int:
 
 def run(args: argparse.Namespace) -> int:
     if args.command == "log":
+        # UTF-8 whatever the runner's code page (cp1252 on Windows), so no message is lost to an encoding error.
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
         with open(args.path, encoding="utf-8", errors="replace", newline="") as f:
             text = f.read()
         if text:
@@ -291,7 +297,10 @@ def run(args: argparse.Namespace) -> int:
         return 0
 
     head = args.head if SHA.match(args.head) else ""
-    data, problem = load(args.diff_json, args.exit_code)
+    if args.problem is not None or args.diff_json is None:
+        data, problem = None, esc(args.problem or "no report", MAX_MESSAGE)
+    else:
+        data, problem = load(args.diff_json, args.exit_code)
     budget = MAX_COMMENT - len(marker(args.lockfile)) - 1
     text = report(data, problem, args.lockfile, args.base, args.base_branch, head[:7], budget)
     with open(args.markdown, "w", encoding="utf-8") as f:

@@ -5,6 +5,7 @@ The `pipx` stub runs this wheelgap with the network patched out; `gh` only logs 
 environment variables. Both, and `python3`, record it if the token ever reaches them through the environment.
 """
 
+import html
 import json
 import os
 import shutil
@@ -60,6 +61,7 @@ exec "$PYTHON_REAL" "$@"
 """,
     "gh": r"""#!/bin/bash
 printf '%s\n' "$*" >> "$GH_LOG"
+printf '%s\n' "$GH_HOST" >> "$GH_LOG.host"
 [ "$GH_TOKEN" = "TOKEN_HERE" ] || { echo "gh: no token (HTTP 401)" >&2; exit 4; }
 case "$*" in
   "api user --jq .login")
@@ -163,6 +165,7 @@ def run(origin, tmp_path):
             "summary": read("summary"),
             "output": read("output"),
             "gh": read("gh.log").splitlines(),
+            "hosts": set(read("gh.log.host").splitlines()),
             "body": json.loads(read("gh.log.body"))["body"] if read("gh.log.body") else None,
             "work": work,
         }
@@ -211,6 +214,7 @@ def test_only_the_tokens_own_comment_is_edited(run):
     r = run(WHEELGAP_COMMENT="true", GH_COMMENTS=json.dumps(listing))
     assert r["code"] == 1
     assert writes(r) == ["api -X PATCH repos/o/r/issues/comments/4"]
+    assert "the response must not reach the log" not in r["log"]
     r = run(WHEELGAP_COMMENT="true", GH_COMMENTS=json.dumps(listing[:3]))
     assert writes(r) == ["api -X POST repos/o/r/issues/7/comments"]
 
@@ -300,7 +304,7 @@ def test_a_ref_without_a_pull_request_only_writes_the_summary(run):
         ),
         ({"WHEELGAP_COMMENT": "yes"}, "comment must be true or false"),
         ({"WHEELGAP_HEAD_SHA": "abc; rm -rf /"}, "the pull_request event has no head commit"),
-        ({"WHEELGAP_HEAD_SHA": "0" * 40}, "needs actions/checkout's default merge commit"),
+        ({"WHEELGAP_COMMENT_AUTHOR": "my app"}, "comment-author must be a GitHub login"),
         ({"WHEELGAP_ARGS": "-p 3.13 uv.lock"}, "args must start with the lockfile's path"),
         ({"WHEELGAP_ARGS": "diff uv.lock"}, "args must start with the lockfile's path"),
         ({"WHEELGAP_ARGS": "nope.lock -p 3.13"}, "and that file must exist"),
@@ -333,3 +337,69 @@ def test_a_file_named_like_the_git_copy_is_refused(run):
     shutil.copy(FIXTURES / "head" / "uv.lock", run.work / "HEAD:." / "uv.lock")
     r = run(WHEELGAP_COMPARE_TO="HEAD")
     assert r["code"] == 2 and "named like the git ref and lockfile" in r["log"]
+
+
+@pytest.mark.parametrize(
+    "overrides, says",
+    [
+        ({"WHEELGAP_HEAD_SHA": "0" * 40}, "needs actions/checkout's default merge commit"),
+        ({"GITHUB_SHA": "0" * 40}, "needs actions/checkout's default merge commit"),
+        ({"BREAK_ORIGIN": "1"}, "couldn't fetch the base commit"),
+    ],
+)
+def test_late_refusals_also_update_an_old_comment(run, overrides, says):
+    if overrides.pop("BREAK_ORIGIN", None):
+        git(run.work, "remote", "set-url", "origin", "file:///nonexistent/wheelgap")
+    r = run(**overrides)
+    assert r["code"] == 2 and r["log"].startswith("::error::wheelgap: ") and says in r["log"].splitlines()[0]
+    assert "The check couldn't run" in r["summary"] and says in html.unescape(r["summary"])
+    assert r["output"].startswith("report=") and writes(r) == []
+    r = run(WHEELGAP_COMMENT="true", GH_COMMENTS=json.dumps([mine(9, MARK)]), **overrides)
+    assert r["code"] == 2 and writes(r) == ["api -X PATCH repos/o/r/issues/comments/9"]
+    assert "The check couldn't run" in r["body"] and "Nothing got worse" not in r["body"]
+
+
+def test_comment_author_picks_an_apps_comment(run):
+    listing = [mine(4, MARK), {"id": 6, "user": {"login": "my-app[bot]", "type": "Bot"}, "body": MARK}]
+    r = run(WHEELGAP_COMMENT="true", WHEELGAP_COMMENT_AUTHOR="my-app[bot]", GH_COMMENTS=json.dumps(listing))
+    assert writes(r) == ["api -X PATCH repos/o/r/issues/comments/6"]
+    assert "api user --jq .login" not in r["gh"]
+
+
+def test_a_login_with_an_underscore_is_its_own(run):
+    listing = [mine(4, MARK), {"id": 8, "user": {"login": "mona_octo", "type": "User"}, "body": MARK}]
+    r = run(WHEELGAP_COMMENT="true", GH_ME="mona_octo", GH_COMMENTS=json.dumps(listing))
+    assert writes(r) == ["api -X PATCH repos/o/r/issues/comments/8"]
+
+
+def test_gh_talks_only_to_the_servers_https_host(run):
+    r = run(WHEELGAP_COMMENT="true", GITHUB_SERVER_URL="https://ghe.example.com")
+    assert writes(r) == ["api -X POST repos/o/r/issues/7/comments"] and r["hosts"] == {"ghe.example.com"}
+    r = run(WHEELGAP_COMMENT="true")
+    assert r["hosts"] == {"github.com"}
+
+
+@pytest.mark.parametrize("url", ["http://ghe.example.com", "https://ghe.example.com/x?y", "ftp://github.com", ""])
+def test_no_comment_without_an_https_server(run, url):
+    r = run(WHEELGAP_COMMENT="true", GITHUB_SERVER_URL=url) if url else run(WHEELGAP_COMMENT="true")
+    if not url:  # unset outside Actions: github.com
+        assert r["hosts"] == {"github.com"}
+        return
+    assert r["code"] == 1 and r["gh"] == []
+    assert "::warning::wheelgap: GITHUB_SERVER_URL isn't an https URL, so no comment was posted." in r["log"]
+
+
+def test_a_lockfile_named_like_an_option_is_refused(run):
+    shutil.copy(FIXTURES / "head" / "uv.lock", run.work / "-uv.lock")
+    r = run(WHEELGAP_COMPARE_TO="HEAD", WHEELGAP_ARGS="-uv.lock -p 3.13")
+    assert r["code"] == 2 and "args must start with the lockfile's path" in r["log"]
+
+
+def test_args_are_not_globbed(run):
+    r = run(WHEELGAP_COMPARE_TO="HEAD", WHEELGAP_ARGS="uv.loc? -p 3.13")
+    assert r["code"] == 2 and "and that file must exist" in r["log"]
+
+
+def test_summary_false_skips_the_summary_but_not_the_output(run):
+    r = run(WHEELGAP_SUMMARY="false")
+    assert r["code"] == 1 and r["summary"] == "" and r["output"].startswith("report=")
