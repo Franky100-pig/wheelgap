@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- The Python API's `Result` has `reasons`, the text `--explain` prints for each `source` or `missing` target (which wheels were rejected and why), and `via`, the dependency path that pulls the package in (`app → pandas → numpy`), filled by `check_lockfile()` for lockfiles with a dependency graph. `to_dict()` adds them as `"reasons"` and `"via"`; the existing keys are unchanged, and `wheelgap-mcp`'s `check_package` tool returns them too. (#PR)
+- The Python API's `Result` has `reasons`, the text `--explain` prints for each `source` or `missing` target (which wheels were rejected and why), and `via`, the dependency path that pulls the package in (`app → pandas → numpy`), filled by `check_lockfile()` for lockfiles with a dependency graph. `to_dict()` adds them as `"reasons"` and `"via"`; the existing keys are unchanged, and `wheelgap-mcp`'s `check_package` tool returns them too. (#241)
 
 ## 0.9.0 (2026-11-12)
 

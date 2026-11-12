@@ -257,7 +257,7 @@ def explain_lines(
     files: list[str], target: Target, limit: int | None = None, dim: Callable[[str], str] = lambda text: text
 ) -> list[str]:
     """What --explain says under a gap on `target`: each rejected wheel and why (the closest misses first, at most
-    `limit` of them), or that none were published, and that the target can't build the sdist if it can't.
+    `limit` of them), or that none were published, and a note when the target can't build the sdist there is.
 
     The command line indents these lines and dims the reasons; the Python API joins them into Result.reasons.
     """
