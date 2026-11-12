@@ -86,8 +86,8 @@ A wrong answer from wheelgap that pip proves wrong is the most useful report the
    ```
 
    - **Other targets:**
-     - for `linux-aarch64` and the other Linux arches, change the arch and stop the loop at 17 (`seq 36 -1 17`), with only `manylinux2014_<arch>` after it, since there are no older manylinux tags for them; for `linux-armv7l`, also pass `--platform linux_armv7l`;
-     - for `musl-aarch64`, pass `--platform musllinux_1_2_aarch64 --platform musllinux_1_1_aarch64`;
+     - for `linux-aarch64` and the other Linux arches, change the arch and stop the loop at 17 (`seq 36 -1 17`), with only `manylinux2014_<arch>` after it, since there are no older manylinux tags for them; for `linux-armv7l`, also pass `--platform linux_armv7l` (pip takes plain `linux_<arch>` wheels on every Linux arch, but PyPI only allows them for 32-bit ARM);
+     - for `musl-aarch64`, pass `--platform musllinux_1_2_aarch64 --platform musllinux_1_1_aarch64 --platform musllinux_1_0_aarch64`;
      - for Windows, pass one tag (`win_amd64`, `win_arm64`);
      - for macOS, pass the target's version (`macosx_14_0_arm64` for wheelgap's default, `--macos 14.0`). pip widens macOS tags to older versions itself.
    - **Other glibc or musl versions:** if you pass `--glibc` or `--musl` to wheelgap, start the list from that version. `wheelgap --list-targets` shows each target's floor.
