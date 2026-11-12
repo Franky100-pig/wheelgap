@@ -56,7 +56,7 @@ release) or a `(name, version)` pair.
 ### `check_lockfile()`
 
 ```python
-check_lockfile(path, targets=None, *, online=False, offline=False, pyodide_locks=())
+check_lockfile(path, targets=None, *, online=False, offline=False, pyodide_locks=(), environment=None)
 ```
 
 Check every package a lockfile (or a project directory) installs on at least one target. Environment markers and the
@@ -69,6 +69,8 @@ lock's files if a lookup fails).
   list, and skips the re-check for Python versions outside the lock's `requires-python` (so those versions may show
   false gaps).
 - The two can't be combined.
+- After 0.9.0, `environment=` picks a `pixi.lock` environment (default: `default`); for a project directory it makes
+  `pixi.lock` the lockfile read. Naming one for any other lockfile raises `SourceError`.
 
 `check_lockfile()` doesn't read `pyproject.toml` as an input.
 

@@ -25,6 +25,7 @@ from .check import CELL, EXPLAIN_LIMIT, Row, Status, check, explain, explain_lin
 from .dockerfile import DockerfileError, read_dockerfile
 from .github import github_annotations
 from .junit import write_junit
+from .logsafe import guarded_output, write_command
 from .offline import require_offline, undo_offline
 from .pyodide import (
     PyodideLock,
@@ -124,7 +125,7 @@ def make_parser() -> argparse.ArgumentParser:
         nargs="*",
         metavar="INPUT",
         help=(
-            "uv.lock, pylock.toml, poetry.lock, Pipfile.lock, requirements.txt, "
+            "uv.lock, pylock.toml, poetry.lock, Pipfile.lock, pixi.lock, requirements.txt, "
             "pyproject.toml (direct dependencies), a directory, or package specs (default: .)"
         ),
     )
@@ -191,6 +192,11 @@ def make_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--only-group", action="append", metavar="NAME", help="check only the named dependency groups (repeatable)"
+    )
+    p.add_argument(
+        "--environment",
+        metavar="NAME",
+        help="the pixi.lock environment to check (default: default)",
     )
     p.add_argument(
         "--online", action="store_true", help="re-check lockfile packages against PyPI instead of trusting the lockfile"
@@ -904,7 +910,7 @@ def render_markdown(
     if bundled and pyodide_lock:
         out += [_md(bundled_line(bundled, pyodide_lock)), ""]
     if skipped:
-        names = ", ".join(f"{_code(p.name)} ({p.skip})" for p in skipped)
+        names = skipped_list(skipped, _code)
         out += [f"Skipped {len(skipped)} non-index package{'s' * (len(skipped) != 1)}: {names}", ""]
     if ignored:
         out += [f"Ignored: {ignored_list(ignored, _code)}", ""]
@@ -916,6 +922,19 @@ def render_markdown(
         lines = render_explain(gaps, targets, plain)
         out += ["<details><summary>Why (rejected wheels)</summary>", "", "```", *lines, "```", "", "</details>", ""]
     return out
+
+
+# A pixi environment often has 100+ conda packages: past this many, text and Markdown count them (--json lists them).
+CONDA_LISTED = 5
+
+
+def skipped_list(skipped: list[Package], name: Callable[[str], str] = str) -> str:
+    """Each skipped package and why, with more than CONDA_LISTED conda packages counted rather than listed."""
+    conda = sum(1 for p in skipped if p.skip == "conda")
+    items = [f"{name(p.name)} ({p.skip})" for p in skipped if p.skip != "conda" or conda <= CONDA_LISTED]
+    if conda > CONDA_LISTED:
+        items.append(f"{conda} conda packages (not on PyPI)")
+    return ", ".join(items)
 
 
 def ignored_list(ignored: list[tuple[str, list[str] | None]], name: Callable[[str], str] = str) -> str:
@@ -1028,6 +1047,20 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 reconfigure(errors="replace")
     argv = sys.argv[1:] if argv is None else argv
+    # `wheelgap mcp`: the MCP server (as `wheelgap-mcp`), so MCP registries can start it from the `wheelgap` package
+    # (`uvx wheelgap@VERSION mcp`). Unlike diff, a file or folder named mcp here doesn't make it an input: the MCP
+    # client picks the working directory, often a project with an mcp/ folder. `wheelgap ./mcp` checks such a folder,
+    # and `wheelgap mcp==1.0` the PyPI package. Its stdout is the protocol, not a log, so it isn't guarded.
+    if argv[:1] == ["mcp"]:
+        from .mcp import main as mcp_main
+
+        return mcp_main(argv[1:], prog="wheelgap mcp")
+    # Lockfile text must never run as a GitHub Actions workflow command in a CI log (see logsafe).
+    with guarded_output():
+        return _main(argv)
+
+
+def _main(argv: list[str]) -> int:
     # `wheelgap diff OLD NEW`: a subcommand only when "diff" comes first and isn't a file or folder here, so
     # `wheelgap ./diff` still checks a folder named diff (and `wheelgap diff==1.0` the PyPI package).
     if argv[:1] == ["diff"]:
@@ -1039,14 +1072,6 @@ def main(argv: list[str] | None = None) -> int:
             "wheelgap: note: reading ./diff as an input; for the comparison, run python -m wheelgap.diff",
             file=sys.stderr,
         )
-    # `wheelgap mcp`: the MCP server (as `wheelgap-mcp`), so MCP registries can start it from the `wheelgap` package
-    # (`uvx wheelgap@VERSION mcp`). Unlike diff, a file or folder named mcp here doesn't make it an input: the MCP
-    # client picks the working directory, often a project with an mcp/ folder. `wheelgap ./mcp` checks such a folder,
-    # and `wheelgap mcp==1.0` the PyPI package.
-    if argv[:1] == ["mcp"]:
-        from .mcp import main as mcp_main
-
-        return mcp_main(argv[1:], prog="wheelgap mcp")
     parser = make_parser()
     args = parser.parse_args(argv)
     if args.json and args.markdown:
@@ -1150,7 +1175,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
         else:
             check_index_url()  # WHEELGAP_INDEX_URL only matters for the JSON API
-        sources = load_inputs(args.inputs or ["."])
+        sources = load_inputs(args.inputs or ["."], args.environment)
+        for source in sources:
+            if source.passed_over is not None and not quiet:
+                print(
+                    f"wheelgap: note: {source.path} was checked; {source.passed_over} is in the same folder too "
+                    "(pass it, or --environment, to check it instead)",
+                    file=sys.stderr,
+                )
         extra_names = args.extra if args.extra is not None else config.get("extras")
         group_names = args.group if args.group is not None else config.get("groups")
         if args.only_group:
@@ -1356,8 +1388,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.github_annotations:
         # Workflow commands work on stdout and stderr alike; stderr keeps --json and --markdown output clean.
+        # These are wheelgap's own (escaped in github.workflow_command), so they go past the logsafe guard.
         for command in github_annotations(rows, targets, sources, failing, advisory):
-            print(command, file=sys.stderr if args.json or args.markdown else sys.stdout)
+            write_command(command, sys.stderr if args.json or args.markdown else sys.stdout)
 
     if args.json:
         print(report_json(rows, targets, source_labels, skipped, ignored, args.explain, pyodide_lock, advisory))
@@ -1421,7 +1454,7 @@ def main(argv: list[str] | None = None) -> int:
         print(style.dim(bundled_line(bundled, pyodide_lock)))
 
     if skipped:
-        names = ", ".join(f"{p.name} ({p.skip})" for p in skipped)
+        names = skipped_list(skipped)
         print(style.dim(f"skipped {len(skipped)} non-index package{'s' * (len(skipped) != 1)}: {names}"))
 
     if ignored:

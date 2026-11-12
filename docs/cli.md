@@ -125,6 +125,12 @@ Leave out the `dev` group (`uv.lock`, Poetry 2.x `poetry.lock`, `pdm.lock`).
 `--only-group NAME`: check only the named dependency groups, without the project's own dependencies or default
 groups. Repeatable; combine it with `--group` to add more groups, but not with `--extra` or `--all-extras`.
 
+### `--environment` {#environment}
+
+**After 0.9.0.** `--environment NAME`: the `pixi.lock` environment to check (default: `default`). It also makes a
+directory's `pixi.lock` the lockfile read. Naming one for any other input is an error. See
+[pixi.lock](inputs.md#pixilock).
+
 ## Index access
 
 ### `--online` {#online}
@@ -137,7 +143,8 @@ to PyPI. Can't be combined with `--offline`.
 ### `--offline` {#offline}
 
 Never contact an index, for CI and coding agents without network. Inputs that need a lookup (requirements files,
-`pyproject.toml`, `Pipfile.lock`, package names, lockfile entries with no file list) make it exit 2 with an error
+`pyproject.toml`, `Pipfile.lock`, package names, lockfile entries with no file list, and after 0.9.0 `pixi.lock`)
+make it exit 2 with an error
 naming the packages, so use a lockfile instead. A `--pyodide-lock` URL is refused too: pass a downloaded copy. The
 [`requires-python` re-check](inputs.md#uvlock) is skipped, with a note that those Pythons may show false gaps.
 `offline = true` in `[tool.wheelgap]` makes it the project default; `--online` overrides that for one run.

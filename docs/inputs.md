@@ -17,6 +17,7 @@ wheelgap psycopg2 numpy==2.3.4    # package names, with or without a version
 | [`poetry.lock`](#poetrylock) | yes, if it lists files | lock-version before 2.1 only |
 | [`pdm.lock`](#pdmlock) | yes, if it lists files | no |
 | [`Pipfile.lock`](#pipfilelock) | no | no |
+| [`pixi.lock`](#pixilock) (after 0.9.0) | no | no |
 | [requirements files](#requirements-files) | no | no |
 | [`pyproject.toml`](#pyprojecttoml) | no | no |
 | [package names](#package-names) | no | no |
@@ -29,8 +30,10 @@ needs no index lookup (except when its `requires-python` leaves out a Python you
 ## Which file is read
 
 A **directory** is searched for, in this order, `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`,
-`Pipfile.lock`, `requirements.txt` and `requirements.lock`, and the first one found is read. A directory with none of
-them is an error; if it has a `pyproject.toml` with a `[project]` table, the error suggests checking that file
+`Pipfile.lock`, `requirements.txt` and `requirements.lock` (and, after 0.9.0, `pixi.lock`), and the first one found is
+read. After 0.9.0, `--environment` makes a directory's `pixi.lock` the one read, and when a directory has `pixi.lock`
+next to another lockfile, a note on stderr names the `pixi.lock` it passed over. A directory with none of them is an
+error; if it has a `pyproject.toml` with a `[project]` table, the error suggests checking that file
 instead. wheelgap doesn't switch to `pyproject.toml` on its own.
 
 A **file** is read by its name:
@@ -42,6 +45,7 @@ A **file** is read by its name:
 | `poetry.lock` | `poetry.lock` |
 | `pdm.lock` | `pdm.lock` |
 | `Pipfile.lock` | `Pipfile.lock` |
+| `pixi.lock` (after 0.9.0) | `pixi.lock` |
 | `requirements*.lock`, `*.txt`, `*.in` | a requirements file |
 | `pyproject.toml` | a project's direct dependencies |
 
@@ -160,6 +164,34 @@ the same scheme, host and port, so another repository on the same Artifactory or
 index has to serve PyPI's JSON API, including pinned versions (`<WHEELGAP_INDEX_URL>/<name>/<version>/json`); on a
 mirror that only serves the simple API, such as the Tsinghua or Aliyun mirrors, those packages come back as lookup
 errors like `not on index` instead. `--index-url` lookups don't use this.
+
+## pixi.lock
+
+!!! note "After 0.9.0"
+    `pixi.lock` input and `--environment` are not in 0.9.0.
+
+wheelgap checks the PyPI packages of one pixi environment: `default`, or the one `--environment NAME` names. Lock
+versions 6 and 7 are read (pixi writes 7 since 0.68); a lock version wheelgap doesn't know, or YAML outside the plain
+subset pixi writes, is an error rather than a guess.
+
+**Read:** the environment's PyPI packages and their pinned versions. pixi records just the one file it picked for each
+of the lock's platforms, for the environment's Python and pixi's own glibc and macOS floors, so that can't answer
+other targets: each PyPI package is also looked up on PyPI for its pinned version, a failed lookup is `unknown`, and
+`--offline` refuses the file.
+
+**Skipped:** conda packages (`conda`), since wheelgap checks PyPI wheels only; past five, the text and Markdown output
+count them instead of listing them (`--json` lists each one). A package from another index is skipped
+(`private index`) unless `WHEELGAP_INDEX_URL` points at that same index, as are Git, path and direct-URL packages. A
+direct URL that points at a file on `files.pythonhosted.org` can't be told apart from a package that came from PyPI, so
+it's checked as one.
+
+**Platforms:** a package the lock leaves out on one of its platforms (say `pywin32`, locked for `win-64` only) shows
+`n/a` on targets with that platform's `sys_platform`, `platform_machine` and Python, and still counts everywhere else.
+Platforms that share those (a `linux-64` and a `linux-64-cuda` with the same subdir) hide a package only when it's
+missing from all of them.
+
+`check_lockfile()` takes `environment=` too; the MCP tools and `[tool.wheelgap]` read the `default` environment only.
+Naming an environment for any other lockfile is an error.
 
 ## Requirements files
 

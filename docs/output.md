@@ -153,6 +153,21 @@ Skipped 2 non-index packages: `demo` (editable), `gitdep` (git)
 
 `--json` and `--markdown` can't be used together.
 
+## In GitHub Actions logs
+
+!!! note "After 0.9.0"
+    This guard is not in 0.9.0.
+
+The Actions runner treats a line that starts with `::`, or contains `##[`, as a workflow command, and a lockfile in a
+pull request could put such text in a package name or version. So everything `wheelgap` and `wheelgap diff` print goes
+through a guard that writes a line's leading `::` as `\u003a:` and `##[` as `\u0023#[`. In `--json` output those are
+JSON escapes, so the decoded values are unchanged; in text and Markdown the escape shows. Normal output never contains
+either, so it's never changed, and neither are the `::error`/`::warning` lines `--github-annotations` writes.
+
+Output to a pipe or a file is always UTF-8, even with `PYTHONIOENCODING` set, because the runner reads the log as
+UTF-8. Package names in `uv.lock`, `poetry.lock`, `pdm.lock`, `pylock.toml`, `Pipfile.lock` and the PyPI packages of
+`pixi.lock` must be valid PEP 508 names: anything else is an input error (exit 2) naming the file.
+
 ## JUnit XML {#junit-xml}
 
 `--junit PATH` also writes a JUnit XML file that GitLab, Jenkins, Azure Pipelines and CircleCI can show as a test

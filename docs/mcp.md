@@ -212,3 +212,29 @@ package's wheels that target can't use, closest misses first, each with the
 reason (such as `abi3 wheels can't be used on free-threaded Python (only
 abi3t ones can)`), and `rejected_omitted` counting any it left out. Without
 `explain`, the result has only the statuses, which keeps it small.
+
+## Protocol versions
+
+In releases after 0.9.0, the server speaks every MCP revision from 2024-11-05 to
+2026-07-28, so it works with older and newer clients alike (0.9.0 speaks the
+`initialize` handshake of 2024-11-05 to 2025-11-25 only):
+
+- **2024-11-05, 2025-03-26, 2025-06-18 and 2025-11-25** start with the
+  `initialize` handshake. Results include `structuredContent` from 2025-06-18 on.
+- **2026-07-28** has no handshake: each request carries its protocol version and
+  the client's capabilities in `_meta`, and a client may first ask
+  `server/discover` which versions the server speaks. A client that supports both
+  probes with `server/discover` and gets an answer, so it stays on 2026-07-28. A
+  request for a version the server doesn't speak gets error `-32022` listing the
+  ones it does. These requests are stateless, and the server can't send requests
+  of its own. So when a client that shares roots passes a relative path, the server
+  answers with `resultType: "input_required"` asking for `roots/list`, and the
+  client retries the call with its roots in `inputResponses`. The official
+  Python SDK's client does this for you. The path must then be inside one of
+  those roots (`..` can't leave it): if it isn't, the call is an error saying to
+  pass an absolute path, rather than a check of a same-named file in the server's
+  working directory. A relative `pyodide_lock` is looked for the same way. A
+  client that answers with no roots gets the working directory.
+
+The server picks the version for each request, so clients of both kinds can
+share one server process.

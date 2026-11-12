@@ -54,9 +54,9 @@ requirements file (from `uv pip compile`, `pip-compile` or `uv export`) for the 
 ## Does it need network access?
 
 Not for lockfiles that record their files (`uv.lock`, `pylock.toml`, and most `poetry.lock` and `pdm.lock` files), as
-long as their `requires-python` includes the Pythons you check. Requirements files, `Pipfile.lock`, `pyproject.toml`
-and package names are looked up on PyPI or the index you choose. `--offline` guarantees no index is contacted. See
-[Index lookups](how-it-works.md#index-lookups).
+long as their `requires-python` includes the Pythons you check. Requirements files, `Pipfile.lock`, `pyproject.toml`,
+package names and (after 0.9.0) `pixi.lock` are looked up on PyPI or the index you choose. `--offline` guarantees no
+index is contacted. See [Index lookups](how-it-works.md#index-lookups).
 
 ## Why does a Windows-only package show `–` on Linux?
 

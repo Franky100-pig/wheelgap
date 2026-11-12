@@ -88,8 +88,9 @@ repos:
 ```
 
 The hook runs when `uv.lock`, `poetry.lock`, `pdm.lock`, `pylock.toml`, `Pipfile.lock`, or a `requirements*.txt` or
-`requirements*.lock` file changes. Put your targets in `[tool.wheelgap]` in `pyproject.toml` so the hook checks the
-right platforms. Pass extra options with `args:`, for example `args: [--fail-on, missing]`.
+`requirements*.lock` file changes, and after 0.9.0 also `pixi.lock`. Put your targets in `[tool.wheelgap]` in
+`pyproject.toml` so the hook checks the right platforms. Pass extra options with `args:`, for example
+`args: [--fail-on, missing]`.
 
 ## GitLab CI
 
