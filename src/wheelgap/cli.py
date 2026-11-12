@@ -23,6 +23,7 @@ from . import __version__, cache
 from .api import running_python
 from .check import CELL, Row, Status, check, explain, has_sdist, marker_holds, reachable
 from .dockerfile import DockerfileError, read_dockerfile
+from .github import github_annotations
 from .junit import write_junit
 from .offline import require_offline, undo_offline
 from .pyodide import (
@@ -242,6 +243,11 @@ def make_parser() -> argparse.ArgumentParser:
         "the run; TARGET must be a checked target, and a group like all means the checked ones among its members",
     )
     p.add_argument("--exit-zero", action="store_true", help="exit 0 even when gaps are found")
+    p.add_argument(
+        "--github-annotations",
+        action="store_true",
+        help="also mark each gap on its lockfile line in GitHub Actions (to stderr with --json or --markdown)",
+    )
     p.add_argument(
         "--fail-on",
         choices=FAIL_ON,
@@ -1355,6 +1361,11 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as e:
             print(f"wheelgap: error: {e}", file=sys.stderr)
             return input_error_json(e) if args.json else 2
+
+    if args.github_annotations:
+        # Workflow commands work on stdout and stderr alike; stderr keeps --json and --markdown output clean.
+        for command in github_annotations(rows, targets, sources, failing, advisory):
+            print(command, file=sys.stderr if args.json or args.markdown else sys.stdout)
 
     if args.json:
         print(report_json(rows, targets, source_labels, skipped, ignored, args.explain, pyodide_lock, advisory))

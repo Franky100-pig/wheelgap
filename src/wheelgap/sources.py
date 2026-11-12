@@ -119,6 +119,10 @@ class Source:
     pdm_pyproject: Path | None = None
     # poetry.lock after a group selection: the packages it left out, which were still read (for --ignore notes).
     unselected_keys: set[str] = field(default_factory=set)
+    # The file this source was read from (None for package names on the command line) and which reader read it
+    # (a key of READERS), for --github-annotations.
+    path: Path | None = None
+    kind: str | None = None
 
 
 def pythons_outside_lock(source: Source, targets: Iterable[Target], *, bounds_only: bool = True) -> list[str]:
@@ -933,29 +937,46 @@ def _read_requirements(
     return pkgs
 
 
+READERS = {
+    "pyproject": parse_pyproject,
+    "uv": parse_uv_lock,
+    "pylock": parse_pylock,
+    "poetry": parse_poetry_lock,
+    "pdm": parse_pdm_lock,
+    "pipfile": parse_pipfile_lock,
+    "requirements": parse_requirements,
+}
 PARSERS = {
-    "uv.lock": parse_uv_lock,
-    "pylock.toml": parse_pylock,
-    "poetry.lock": parse_poetry_lock,
-    "pdm.lock": parse_pdm_lock,
-    "Pipfile.lock": parse_pipfile_lock,
+    "uv.lock": "uv",
+    "pylock.toml": "pylock",
+    "poetry.lock": "poetry",
+    "pdm.lock": "pdm",
+    "Pipfile.lock": "pipfile",
 }
 
 
 def load_file(path: Path) -> Source:
+    kind = file_kind(path)
+    source = READERS[kind](path)
+    source.path, source.kind = path, kind
+    return source
+
+
+def file_kind(path: Path) -> str:
+    """Which reader (a key of READERS) reads this file, by its name."""
     name = path.name
     if name == "pyproject.toml":
-        return parse_pyproject(path)
+        return "pyproject"
     if name in PARSERS:
-        return PARSERS[name](path)
+        return PARSERS[name]
     if name.startswith("pylock.") and name.endswith(".toml"):
-        return parse_pylock(path)
+        return "pylock"
     if name.startswith("requirements") and name.endswith(".lock"):
-        return parse_requirements(path)
+        return "requirements"
     if name.endswith(".lock") and "uv" in name:
-        return parse_uv_lock(path)
+        return "uv"
     if name.endswith((".txt", ".in")):
-        return parse_requirements(path)
+        return "requirements"
     raise SourceError(
         f"don't know how to read {path} "
         "(expected uv.lock, pylock.toml, poetry.lock, pdm.lock, Pipfile.lock, requirements.lock, requirements.txt "
