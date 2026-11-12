@@ -1050,7 +1050,7 @@ def main(argv: list[str] | None = None) -> int:
             group_names = [name for name in group_names if canonicalize_name(name) != "dev"]
         from_cli = args.extra is not None or args.group is not None or args.all_extras or args.no_dev
         # pyproject.toml inputs take --extra / --all-extras for [project] optional-dependencies. Configured
-        # extras stay uv.lock-only, and [dependency-groups] isn't read.
+        # extras don't apply to them, and [dependency-groups] isn't read.
         pyproject_sources = [s for s in sources if s.pyproject_extras is not None]
         lock_sources = [s for s in sources if s.pyproject_extras is None]
         if pyproject_sources:
@@ -1108,11 +1108,10 @@ def main(argv: list[str] | None = None) -> int:
     if not quiet:
         note_unpinned_requirements(sources)
         for source in sources:
-            if source.poetry_extras_unsure:
+            if source.poetry_extras_unsure is not None:
                 print(
-                    f"wheelgap: note: {source.label}: in an extra and, with a marker, in the project's dependencies: "
-                    f"{', '.join(source.poetry_extras_unsure)}. Poetry 2.0-2.2 and 2.3+ install these (and what they "
-                    "depend on) differently without the extra, so extras leave no package out of this lock",
+                    f"wheelgap: note: {source.label}: {source.poetry_extras_unsure}, so Poetry 2.0-2.2 and 2.3+ may "
+                    "install different packages without an extra; extras leave no package out of this lock",
                     file=sys.stderr,
                 )
     for source in sources:

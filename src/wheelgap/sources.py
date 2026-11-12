@@ -117,9 +117,9 @@ class Source:
     poetry_pyproject: Path | None = None
     # poetry.lock only: the extras in its [extras] table, which `poetry install --extras` accepts.
     poetry_lock_extras: list[str] = field(default_factory=list)
-    # poetry.lock after a selection: dependencies whose lock markers Poetry versions read differently (see
-    # _poetry_conditional_and_extra), so extras didn't leave anything out. Named in a note.
-    poetry_extras_unsure: list[str] = field(default_factory=list)
+    # poetry.lock after a selection: why Poetry versions may disagree on what its extras install (see
+    # _poetry_extras_declared_elsewhere), so extras didn't leave anything out. Shown in a note.
+    poetry_extras_unsure: str | None = None
     # pdm.lock only: each package's `groups` list (None for a package that records none, as before PDM 2.x),
     # kept so --group/--only-group/--no-dev can pick packages. None when the input isn't a pdm.lock.
     pdm_groups: list[list[str] | None] | None = None
@@ -266,7 +266,7 @@ def select_uv_dependencies(
         and (selection.extras or selection.all_extras)
         and (not sources or any(source.poetry_tables is None for source in sources))
     ):
-        raise SourceError("--only-group cannot be combined with --extra or --all-extras")
+        raise SourceError("--only-group cannot be combined with --extra or --all-extras for uv.lock inputs")
     if selection.no_dev and "dev" in selection.groups | selection.only_groups:
         raise SourceError("--no-dev cannot be combined with an explicit dev group")
     if strict and (not sources or any(source.uv_packages is None for source in sources)):
@@ -278,7 +278,11 @@ def select_uv_dependencies(
                     "extra selection requires uv.lock or poetry.lock inputs (pdm.lock supports groups only)"
                 )
         else:
-            raise SourceError("extra/group selection requires uv.lock inputs")
+            unsupported = [s.label for s in others if s.poetry_tables is None and s.pdm_groups is None]
+            raise SourceError(
+                "extra/group selection requires uv.lock, Poetry 2.x poetry.lock or pdm.lock inputs "
+                f"(not {', '.join(unsupported) or 'no input'})"
+            )
     for source in sources:
         if source.pdm_groups is not None:
             # A lock without package groups or inherit_metadata: configured groups leave it as it is.
@@ -354,11 +358,15 @@ def _select_poetry(source: Source, selection: UvSelection) -> None:
     known = {"main"} | {canonicalize_name(g) for t in tables for g in t["groups"]}
     optional: set[str] = set()
     pyproject = source.poetry_pyproject
+    if known_extras and (pyproject is None or not pyproject.is_file()):
+        # Can't check what declares its extras' dependencies: never let extras leave a package out of it.
+        source.poetry_extras_unsure = "no pyproject.toml beside it to show how its extras are declared"
+        extras = None
     if pyproject is not None and pyproject.is_file():
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-        if unsure := _poetry_conditional_and_extra(data):
-            # Their extras-free markers are lost in the lock: never let extras leave a package out of it.
-            source.poetry_extras_unsure = unsure
+        if elsewhere := _poetry_extras_declared_elsewhere(data):
+            # The lock's markers for these can be wrong for Poetry 2.0-2.2: never let extras leave a package out.
+            source.poetry_extras_unsure = f"{', '.join(elsewhere)} in an extra and declared elsewhere in pyproject.toml"
             extras = None
         # PEP 735 groups (Poetry 2.2+): an empty one is in no package's groups, but it's still a known group.
         pep735 = data.get("dependency-groups")
@@ -396,11 +404,13 @@ def _select_poetry(source: Source, selection: UvSelection) -> None:
     source.poetry_tables = None
 
 
-def _poetry_conditional_and_extra(data: dict) -> list[str]:
-    """Main dependencies with a marker that are also in an extra, such as `requests; python_version < '3.11'` that an
-    extra lists too. Poetry 2.5 locks them, and what they depend on, with only the extra's marker (`extra == "s3"`):
-    Poetry 2.3 and later install from the lock's markers and leave them out without the extra, but Poetry 2.0 to 2.2
-    re-resolve (installer.re-resolve) and install them. Checked with Poetry 2.5.1."""
+def _poetry_extras_declared_elsewhere(data: dict) -> list[str]:
+    """Names in an extra that pyproject.toml also declares somewhere else: in the main dependencies (in any form), in
+    a group, or in another extra entry that isn't the same plain requirement. Poetry 2.x can lock these, and what they
+    depend on, with only the extra's marker (`requests; python_version < '3.11'` that an extra also lists becomes
+    `extra == "s3"`), and then Poetry 2.3 and later (which install from the lock's markers) leave them out where
+    Poetry 2.0 to 2.2 (which re-resolve, as installer.re-resolve does) install them. Found with Poetry 2.5.1 locks
+    installed by Poetry 2.0.1, 2.2.1 and 2.5.1. The same plain requirement in several extras locks correctly."""
 
     def table(value: object) -> dict:
         return value if isinstance(value, dict) else {}
@@ -408,31 +418,52 @@ def _poetry_conditional_and_extra(data: dict) -> list[str]:
     def strings(value: object) -> list[str]:
         return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
 
-    def requirements(specs: list[str]) -> list[Requirement]:
-        out = []
+    def names(specs: list[str]) -> list[str]:
+        out: list[str] = []
         for spec in specs:
             try:
-                out.append(Requirement(spec))
+                out.append(canonicalize_name(Requirement(spec).name))
             except InvalidRequirement:
                 continue
         return out
 
     project = table(data.get("project"))
-    conditional = {canonicalize_name(r.name) for r in requirements(strings(project.get("dependencies"))) if r.marker}
     poetry = table(table(data.get("tool")).get("poetry"))
-    for name, spec in table(poetry.get("dependencies")).items():
-        specs = spec if isinstance(spec, list) else [spec]
-        dicts = [s for s in specs if isinstance(s, dict)]
-        if name.lower() != "python" and any(s.get("optional") is not True for s in dicts):
-            if isinstance(spec, list) or any("markers" in s or "python" in s for s in dicts):
-                conditional.add(canonicalize_name(name))
-    in_extras = {
-        canonicalize_name(r.name)
-        for specs in table(project.get("optional-dependencies")).values()
-        for r in requirements(strings(specs))
-    }
-    in_extras |= {canonicalize_name(name) for names in table(poetry.get("extras")).values() for name in strings(names)}
-    return sorted(conditional & in_extras)
+    legacy = {canonicalize_name(name): spec for name, spec in table(poetry.get("dependencies")).items()}
+    # Each extra entry, as (name, what it says): a repeated entry is safe only if it's the same plain requirement.
+    entries: list[tuple[str, str | None]] = []
+    for specs in table(project.get("optional-dependencies")).values():
+        for spec in strings(specs):
+            try:
+                req = Requirement(spec)
+            except InvalidRequirement:
+                continue
+            entries.append((canonicalize_name(req.name), None if req.marker else str(req)))
+    pep621 = {name for name, _ in entries}
+    for specs in table(poetry.get("extras")).values():
+        for legacy_name in map(canonicalize_name, strings(specs)):
+            dependency = legacy.get(legacy_name)
+            plain = isinstance(dependency, dict) and not {"markers", "python", "platform"} & dependency.keys()
+            entries.append((legacy_name, f"tool.poetry {legacy_name}" if plain else None))
+    in_extras = {name for name, _ in entries}
+    elsewhere: set[str] = set()
+    for name in in_extras:
+        said = [what for n, what in entries if n == name]
+        if len(said) > 1 and (None in said or len(set(said)) > 1):
+            elsewhere.add(name)
+    # Main dependencies. A [tool.poetry.dependencies] table with optional = true is how a legacy extra declares its
+    # dependency, so only that doesn't count; any form counts for a [project] optional-dependencies name.
+    elsewhere |= in_extras & set(names(strings(project.get("dependencies"))))
+    for name, declared in legacy.items():
+        own = isinstance(declared, dict) and declared.get("optional") is True and name not in pep621
+        if name != "python" and not own:
+            elsewhere.add(name)
+    # Groups.
+    tables = [table(poetry.get("dev-dependencies"))]
+    tables += [table(table(g).get("dependencies")) for g in table(poetry.get("group")).values()]
+    elsewhere |= {canonicalize_name(name) for t in tables for name in t}
+    elsewhere |= {name for group in table(data.get("dependency-groups")).values() for name in names(strings(group))}
+    return sorted(elsewhere & in_extras)
 
 
 def _select_pdm_groups(source: Source, selection: UvSelection) -> None:
