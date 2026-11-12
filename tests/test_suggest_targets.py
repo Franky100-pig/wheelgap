@@ -728,15 +728,15 @@ JOB = "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
         (("--- on: push\n" + JOB), [], [(1, "uses YAML this scanner doesn't read: --- on: push")]),
         ((JOB + "---\n" + JOB), [], [(4, "uses YAML this scanner doesn't read: ---")]),
         ((JOB + "...\nname: x\n"), [], [(4, "uses YAML this scanner doesn't read: ...")]),
-        ((JOB + "jobs:\n  b:\n    runs-on: windows-latest\n"), [], [(4, "jobs is set twice")]),
+        ((JOB + "jobs:\n  b:\n    runs-on: windows-latest\n"), [], [(4, NOT_READ + "jobs:")]),
         (("name: x\n"), [], [(None, "no jobs")]),
         (("jobs: {test: {runs-on: ubuntu-latest}}\n"), [("linux-x86_64", ".github/workflows/ci.yml", 1)], []),
         (("jobs:\n  - test\n"), [], [(1, "can't read the jobs")]),
         (("jobs:\n\ttest:\n"), [], [(2, "uses YAML this scanner doesn't read: test:")]),
         (
             (JOB + "  test:\n    runs-on: windows-latest\n  other:\n    runs-on: macos-14\n"),
-            [("macos-arm64", ".github/workflows/ci.yml", 7)],
-            [(2, "job test is defined more than once"), (4, "job test is defined more than once")],
+            [],
+            [(4, NOT_READ + "test:")],
         ),
         (('name: "a\n  b"\n' + JOB), [], [(1, "uses YAML this scanner doesn't read: name: \"a")]),
         (("env:\n  A: 'x\n    y'\n" + JOB), [], [(2, "uses YAML this scanner doesn't read: A: 'x")]),
@@ -747,9 +747,9 @@ JOB = "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
         ),
         (("name: [a,\n  b\n"), [], [(1, "uses YAML this scanner doesn't read: name: [a,")]),
         (
-            ("jobs:\n  test: *job\n"),
+            ("defs: &job\n  a: b\njobs:\n  test: *job\n"),
             [],
-            [(2, "job test: can't read the job (neither its runner nor its Python is read)")],
+            [(4, "job test: can't read the job (neither its runner nor its Python is read)")],
         ),
         (
             ("jobs:\n  test:\n    <<: *defaults\n    runs-on: ubuntu-latest\n"),
@@ -774,9 +774,9 @@ JOB = "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
             ],
         ),
         (
-            (JOB + "    steps: *steps\n"),
+            ("defs: &steps\n  - run: x\n" + JOB + "    steps: *steps\n"),
             [],
-            [(4, "job test: steps: *steps isn't read (neither its runner nor its Python is read)")],
+            [(6, "job test: steps: *steps isn't read (neither its runner nor its Python is read)")],
         ),
         (
             (JOB + "    steps:\n      - { uses: actions/setup-python@v6, with: {python-version: '3.13'} }\n"),
@@ -1369,7 +1369,7 @@ WHOLE_JOB = " (neither its runner nor its Python is read)"
     ("steps", "refused"),
     [
         # A setup step whose uses can't be read might set the architecture: the job isn't read at all.
-        ("      - uses: *sp\n", (5, "can't read the uses: *sp of a step")),
+        ("      - name: &sp\n          a: b\n      - uses: *sp\n", (7, "can't read the uses: *sp of a step")),
         ("      - uses: >-\n          actions/setup-python@v6\n", (5, "can't read the uses: >- of a step")),
         (
             "      - uses:\n          actions/setup-python@v6\n",
@@ -1379,7 +1379,6 @@ WHOLE_JOB = " (neither its runner nor its Python is read)"
             '      - uses: "actions\\x2fsetup-python@v6"\n',
             (5, 'can\'t read the uses: "actions\\x2fsetup-python@v6" of a step'),
         ),
-        ("      - uses: actions/setup-python@v6\n        with: {}\n        with:\n", (7, "with is set twice")),
         (
             "      - uses: actions/setup-python@v6\n        with:\n"
             "          architecture: x64\n          Architecture: x86\n",
@@ -1789,11 +1788,11 @@ def test_a_refusal_partway_through_the_matrix_keeps_no_targets(tmp_path):
         ("        os: []\n", (5, "job test: matrix.os is an empty list" + JOB_NOT_READ)),
         (
             "        include:\n          - os: ubuntu-latest\n            os: windows-latest\n",
-            (8, "job test: os is set twice" + JOB_NOT_READ),
+            (8, NOT_READ + "os: windows-latest"),
         ),
         (
             "        os: [ubuntu-latest]\n        os: [windows-latest]\n",
-            (7, "job test: os is set twice" + JOB_NOT_READ),
+            (7, NOT_READ + "os: [windows-latest]"),
         ),
         ("        os: {a: b}\n", (5, "job test: the matrix has values that aren't a plain list" + JOB_NOT_READ)),
         (
@@ -1911,6 +1910,12 @@ on:
     paths: *paths
 env:
   WINDOWS_PATH: "C:\\\\tools\\\\bin"
+x-defs:
+  runner: &runner
+    - windows-latest
+  strategy: &strategy
+    matrix:
+      os: [a]
 jobs:
   test:
     runs-on: windows-latest
@@ -1928,15 +1933,15 @@ jobs:
     runs-on: "windows\\u002dlatest"
 """,
     )
-    assert targets == [("win-amd64", CI, 11)]
+    assert targets == [("win-amd64", CI, 17)]
     assert [f.value for f in found.pythons] == ["3.13"]
     assert refused == [
-        (18, "job aliased: runs-on: an alias isn't read"),
+        (24, "job aliased: runs-on: an alias isn't read"),
         (
-            21,
+            27,
             "job strategy: strategy: *strategy is an alias, which isn't read" + JOB_NOT_READ,
         ),
-        (23, "job escaped: runs-on: a quoted value with escapes isn't read"),
+        (29, "job escaped: runs-on: a quoted value with escapes isn't read"),
     ]
 
 
@@ -1971,3 +1976,132 @@ def test_every_comparison_in_an_exclude_is_made(tmp_path):
     assert refused == [
         (9, "job test: can't tell whether GitHub counts '3.13' and '3.13' as the same value" + JOB_NOT_READ)
     ]
+
+
+X86_ON_WINDOWS = "jobs:\n  test:\n    runs-on: windows-latest\n    steps:\n"
+
+
+@pytest.mark.parametrize(
+    ("steps", "line"),
+    [
+        # Nothing may be indented under `key: {...}` or `key: {}` (PyYAML rejects it, and it would add entries).
+        (
+            "      - uses: actions/setup-python@v6\n        with: {python-version: '3.12'}\n"
+            "           architecture: x86\n",
+            7,
+        ),
+        ("      - uses: actions/setup-python@v6\n        with: {}\n          architecture: x86\n", 7),
+        # An alias with no anchor before it.
+        ("      - uses: actions/setup-python@v6\n        with: *nope\n", 6),
+        # A block scalar whose later line dedents below its first one, but not to the key.
+        ("      - run: |\n          echo a\n        echo b\n", 7),
+        ("      - run: |2\n          echo a\n         echo b\n", 7),  # |2: its lines are at the key's column + 2
+        ("      - run: |4\n          echo a\n", 6),
+        # A multi-line flow list closed with junk after `]`, or a tab where an item's indentation ends.
+        ("      - run: x\n        env: [\n          a,\n        ]x\n", 8),
+        ("      - run: x\n        env: [\n          \ta,\n        ]\n", 7),
+        # A tab where a plain value's further line starts.
+        ("      - run: echo\n          \tmore\n", 6),
+    ],
+)
+def test_more_lines_outside_the_grammar(tmp_path, steps, line):
+    targets, refused, _ = read(tmp_path, X86_ON_WINDOWS + steps)
+    assert targets == []
+    assert [r[0] for r in refused] == [line]
+    assert refused[0][1].startswith(NOT_READ)
+
+
+def test_an_alias_after_its_anchor_is_accepted(tmp_path):
+    targets, refused, _ = read(tmp_path, "defs: &d\n  a: b\nalso: *d\n" + JOB)
+    assert targets == [("linux-x86_64", CI, 6)]
+    assert refused == []
+
+
+def test_a_comment_after_the_last_item_of_a_multi_line_list(tmp_path):
+    targets, refused, _ = read(
+        tmp_path,
+        "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [\n"
+        "          ubuntu-latest, # one\n          macos-latest # two\n        ]\n",
+    )
+    assert refused == []
+    assert targets == [("linux-x86_64", CI, 7), ("macos-arm64", CI, 8)]
+
+
+def test_block_scalars_are_skipped_up_to_the_key_column(tmp_path):
+    # The block scalar ends at `uses:`, which is at the column of `run:` (not the `-`): the step after it is read.
+    targets, refused, _ = read(
+        tmp_path,
+        X86_ON_WINDOWS + "      - run: |\n          echo hi\n        uses: actions/setup-python@v6\n"
+        "        with:\n          python-version: '3.12'\n          architecture: x86\n",
+    )
+    assert targets == [("win32", CI, 3)]
+    assert refused == []
+
+
+@pytest.mark.parametrize(
+    ("with_", "reason"),
+    [
+        ("        with: *w\n", "with: *w isn't read"),
+        ('        with: "a\\tb"\n', 'with: "a\\tb" isn\'t read'),
+        ("        with: |\n          architecture: x86\n", "with: | isn't read"),
+    ],
+)
+def test_a_setup_step_whose_with_isnt_read_refuses_the_job(tmp_path, with_, reason):
+    targets, refused, found = read(
+        tmp_path, "defs: &w\n  a: b\n" + X86_ON_WINDOWS + "      - uses: actions/setup-python@v6\n" + with_
+    )
+    assert targets == [] and found.pythons == []
+    assert refused == [(8, f"job test: {reason}{JOB_NOT_READ}")]
+
+
+@pytest.mark.parametrize(
+    ("architecture", "reason"),
+    [
+        ("*x86", "architecture: *x86 isn't read"),
+        ('"x\\u0038\\u0036"', 'architecture: "x\\u0038\\u0036" isn\'t read'),
+        ("|\n            x86", "architecture: | isn't read"),
+    ],
+)
+def test_an_architecture_that_isnt_read_refuses_the_target(tmp_path, architecture, reason):
+    targets, refused, found = read(
+        tmp_path,
+        "defs: &x86\n  a: b\n" + X86_ON_WINDOWS + "      - uses: actions/setup-python@v6\n        with:\n"
+        f"          python-version: '3.12'\n          architecture: {architecture}\n",
+    )
+    assert targets == []
+    assert [f.value for f in found.pythons] == ["3.12"]
+    assert refused == [(10, f"job test: {reason}, so the job's target isn't read")]
+
+
+@pytest.mark.parametrize(
+    ("include", "targets", "refused"),
+    [
+        # An include of objects still makes a combination when it's a non-empty list...
+        ("        include:\n          - {cfg: {a: b}}\n", [("linux-x86_64", CI, 3)], []),
+        # ...but not when it isn't a list.
+        ("        include: {cfg: {a: b}}\n", [], [(5, "job test: can't read the matrix's include" + JOB_NOT_READ)]),
+    ],
+)
+def test_a_matrix_of_objects_runs_only_with_a_combination_for_sure(tmp_path, include, targets, refused):
+    got_targets, got_refused, _ = read(
+        tmp_path, "jobs:\n  test:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n" + include
+    )
+    assert got_targets == targets
+    assert got_refused == refused
+
+
+@pytest.mark.parametrize(
+    ("text", "line"),
+    [
+        # A key twice in one mapping, or an anchor defined twice: invalid YAML to PyYAML (GitHub's reading of it
+        # isn't certain), so the file isn't read.
+        (JOB + "  test:\n    runs-on: windows-latest\n", 4),
+        (X86_ON_WINDOWS + "      - uses: actions/setup-python@v6\n        with: {}\n        with:\n", 7),
+        ("a: &x\n  b: c\nd: &x\n  e: f\n" + JOB, 3),
+    ],
+)
+def test_keys_and_anchors_twice_refuse_the_file(tmp_path, text, line):
+    targets, refused, _ = read(tmp_path, text)
+    assert targets == []
+    assert [r[0] for r in refused] == [line]
+    assert refused[0][1].startswith(NOT_READ)

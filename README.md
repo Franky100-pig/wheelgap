@@ -440,7 +440,7 @@ There's no YAML parser in the standard library, so a workflow is read only when 
   - a flow list over several lines, as Prettier writes it, with `[` ending its line (or alone on the next), one item per line, and `]` on its own line.
 - **Accepted but never read.** Anchors and aliases (`&paths`, `*paths`), double-quoted values with escapes, and plain values continued on more-indented lines (long `if:` and `run:` lines) are accepted where they aren't needed, and refused where wheelgap would read them.
 
-Everything else isn't read: multi-line quoted values, anchors or tags inside a value, `? ` keys, `<<` merge keys, a second document, flow collections in other layouts, and line breaks other than `\n` and `\r\n`. Non-ASCII spaces such as NBSP are ordinary characters, as they are to YAML.
+Everything else isn't read: multi-line quoted values, anchors or tags inside a value, an alias with no anchor before it, a key or anchor used twice, lines indented under a value (including `key: {...}`), `? ` keys, `<<` merge keys, a second document, flow collections in other layouts, and line breaks other than `\n` and `\r\n`. Non-ASCII spaces such as NBSP are ordinary characters, as they are to YAML.
 
 In a file that is read, anything wheelgap can't be sure of is still listed under "Couldn't read" with its file and line, and never guessed:
 

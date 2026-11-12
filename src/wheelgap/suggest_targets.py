@@ -217,14 +217,13 @@ class _Node:
     value: object = None
     raw: str = ""  # the value as written, for messages
     children: list[_Node] = field(default_factory=list)
+    sealed: bool = False  # its children came from a flow mapping on its line: nothing may be indented under it
 
     def get(self, key: str) -> _Node | None:
         if self.value is _ALIAS:
             raise _Unsure(f"{self.key}: {self.raw} is an alias, which isn't read", self.line)
-        found = [c for c in self.children if c.key == key]
-        if len(found) > 1:
-            raise _Unsure(f"{key} is set twice", found[1].line)
-        return found[0] if found else None
+        # (A key is never in a mapping twice: the grammar refuses that.)
+        return next((c for c in self.children if c.key == key), None)
 
 
 @dataclass(frozen=True)
@@ -427,7 +426,7 @@ def _flow_children(mapping: dict[str, object], line: int, indent: float) -> list
     """A flow mapping's entries as the nodes a block mapping would have."""
     children = []
     for key, value in mapping.items():
-        node = _Node(line, indent + 1, key, value, value.text if isinstance(value, _Scalar) else "...")
+        node = _Node(line, indent + 1, key, value, value.text if isinstance(value, _Scalar) else "...", sealed=True)
         if isinstance(value, dict):
             node.children, node.value = _flow_children(value, line, indent + 1), None
         children.append(node)
@@ -442,8 +441,10 @@ def _parse_tree(text: str) -> _Node:
     stack = [root]
     lines = [raw.removesuffix("\r") for raw in text.split("\n")]
     block_column: int | None = None  # skipping a block scalar's lines indented more than this
+    block_content: int | None = None  # and the indentation of its first line
     plain: tuple[_Node, int] | None = None  # a plain scalar's node and column, while its lines may continue
     started = directive = False
+    anchors: set[str] = set()
     number = 0
 
     def content(i: int) -> bool:
@@ -454,12 +455,14 @@ def _parse_tree(text: str) -> _Node:
         while stack[-1].indent >= node.indent:
             stack.pop()
         parent = stack[-1]
-        if parent.value is not None:  # a further line under a key or item that has its value already
+        if parent.value is not None or parent.sealed:  # a further line under a key or item with its value already
             raise _NotRead(node.line, lines[node.line - 1])
         if parent.children and (
             parent.children[0].indent != node.indent or (parent.children[0].key is None) != (node.key is None)
         ):
             raise _NotRead(node.line, lines[node.line - 1])  # indentation that doesn't line up, or keys and items
+        if node.key is not None and any(c.key == node.key for c in parent.children):
+            raise _NotRead(node.line, lines[node.line - 1])  # a key twice in one mapping: invalid YAML
         parent.children.append(node)
         stack.append(node)
 
@@ -474,7 +477,7 @@ def _parse_tree(text: str) -> _Node:
             if not content(i - 1):
                 continue
             indent, body = len(line) - len(line.lstrip(" ")), line.strip(_WS)
-            if "\t" in line[:indent] or line[indent : indent + 1] == "\t":
+            if line[indent : indent + 1] == "\t":  # a tab where the indentation ends
                 raise _NotRead(i, line)
             if body.startswith("]"):
                 if indent < base or not _comment_only(body[1:]):
@@ -485,9 +488,10 @@ def _parse_tree(text: str) -> _Node:
                 raise _NotRead(i, line)
             flow = _Flow(body, i)
             items.append(flow.value())
+            end = flow.pos  # the comment (if any) after the item needs the space before it
             flow.spaces()
             closed = flow.peek() == ","
-            if not _comment_only(body[flow.pos + closed :]):
+            if not _comment_only(body[flow.pos + 1 :] if closed else body[end:]):
                 raise _NotRead(i, line)
         raise _NotRead(node.line, lines[node.line - 1])  # never closed
 
@@ -496,14 +500,21 @@ def _parse_tree(text: str) -> _Node:
         number += 1
         indent = len(line) - len(line.lstrip(" "))
         if block_column is not None:
-            if not line.strip(_WS) or indent > block_column:
+            if not line.strip(_WS):
+                continue
+            if indent > block_column:
+                # Its lines are indented as its first one; a line between that and the key is invalid YAML.
+                if block_content is None:
+                    block_content = indent
+                elif indent < block_content:
+                    raise _NotRead(number, line)
                 continue
             block_column = None
         if plain is not None:
             # A plain scalar goes on over more-indented lines (a comment ends it). Nothing under a scalar can be a key,
             # so these lines are text whatever they look like; only `: ` would make the YAML invalid.
             if content(number - 1) and indent > plain[1]:
-                if "\t" in line[:indent] or re.search(r":(?:[ \t]|$)", line.split(" #")[0].rstrip(_WS)):
+                if line[indent : indent + 1] == "\t" or re.search(r":(?:[ \t]|$)", line.split(" #")[0].rstrip(_WS)):
                     raise _NotRead(number, line)
                 plain[0].value = _LINES
                 if re.search(r"[ \t]#", line):
@@ -552,8 +563,16 @@ def _parse_tree(text: str) -> _Node:
                 column = indent
         except _NotRead as e:
             raise _NotRead(number, line) from e
+        if node.raw.startswith("&"):
+            if node.raw[1:] in anchors:
+                raise _NotRead(number, line)  # an anchor defined twice
+            anchors.add(node.raw[1:])
+        elif node.value is _ALIAS and node.raw[1:] not in anchors:
+            raise _NotRead(number, line)  # an alias with no anchor before it
         if node.value is _BLOCK:
-            block_column = column
+            block_column, block_content = column, None
+            if digit := re.search(r"[1-9]", node.raw):
+                block_content = column + int(digit.group())
         elif node.value is _OPEN:
             node.value = None
             number = flow_lines(node, number)
@@ -568,8 +587,9 @@ def _parse_tree(text: str) -> _Node:
                 elif not below.startswith(("-", "#")) and _split_key(below) is None and _plain(below) is not None:
                     plain = node, column  # a plain scalar starting on the line after its key
                     node.raw = below
-        if isinstance(node.value, dict):  # `key: {a: b}` is the mapping a: b
+        if isinstance(node.value, dict):  # `key: {a: b}` is the mapping a: b, with nothing indented under it
             node.children, node.value = _flow_children(node.value, node.line, node.indent), None
+            node.sealed = True
     return root
 
 
@@ -593,12 +613,7 @@ def _data(node: _Node) -> object:
         raise _Unsure(f"{node.key or 'a list item'} has no value", node.line)
     if all(c.key is None for c in node.children):
         return [_data(c) for c in node.children]
-    out: dict[str, object] = {}
-    for c in node.children:
-        if c.key in out:
-            raise _Unsure(f"{c.key} is set twice", c.line)
-        out[str(c.key)] = _data(c)
-    return out
+    return {str(c.key): _data(c) for c in node.children}
 
 
 def _same(a: _Scalar, b: _Scalar) -> bool:
@@ -694,7 +709,8 @@ def _matrix_runs(job: _Node) -> None:
         if not isinstance(data, dict) or "exclude" in data:
             raise
         dims = [v for k, v in data.items() if k not in ("include", "exclude")]
-        if not all(isinstance(v, list) and v for v in dims) or not (dims or data.get("include")):
+        include = data.get("include")
+        if not all(isinstance(v, list) and v for v in dims) or not (dims or isinstance(include, list) and include):
             raise
         return
     if not every:
@@ -979,12 +995,8 @@ def read_workflow_text(text: str, name: str, out: Suggestions) -> None:
     except _Unsure as e:
         out.unreadable.append(Unreadable(name, e.line, e.reason))
         return
-    ids = [j.key for j in jobs.children]
     for job in jobs.children:
-        if ids.count(job.key) > 1:
-            out.unreadable.append(Unreadable(name, job.line, f"job {job.key} is defined more than once"))
-        else:
-            _read_job(job, name, out)
+        _read_job(job, name, out)
 
 
 def _container_kind(name: str) -> str | None:
