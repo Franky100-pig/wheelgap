@@ -87,6 +87,68 @@ uvloop 0.21.0 on win-arm64: ● source
 Other inputs have no dependency graph, so they show no path. If you think wheelgap got a package wrong, this output
 (or `--json --explain`) is all a bug report needs, with no need to share your lockfile.
 
+### conda-forge hint {#conda-forge}
+
+!!! note "After 0.9.0"
+    `--conda-forge` is not in 0.9.0.
+
+`--conda-forge` adds a hint to `--explain`: for a package with a gap on a glibc Linux, macOS or Windows target, it asks
+[anaconda.org](https://anaconda.org/conda-forge) whether conda-forge has a package with exactly the same (canonical)
+name and a build of the same version that fits that target. For example, `wheelgap numpy==2.3.4 -p 3.14t -t
+linux-ppc64le --explain --conda-forge` adds:
+
+```
+numpy: conda-forge has a package named numpy with 2.3.4 builds for linux-ppc64le
+```
+
+A build fits when all of these hold:
+
+- It's on conda-forge's `main` label and not marked broken.
+- It's for the target's conda subdir (`linux-64`, `linux-aarch64`, `linux-ppc64le`, `linux-riscv64`, `osx-64`,
+  `osx-arm64`, `win-64`, `win-arm64`) or `noarch`.
+- Its `__glibc` and `__osx` minimums hold for the target's glibc and macOS versions (`--glibc`, `--macos`);
+  conda-forge's riscv64 builds need glibc 2.39, for example. A `noarch` build that depends on `__win`, `__unix`,
+  `__linux`, `__osx` or `__glibc` fits only those OSes, and one that needs another virtual package (such as `__cuda`)
+  never counts.
+- It's for the target's Python:
+  - a compiled build by its `python_abi` dependency: the same version and ABI, free-threaded or not;
+  - an abi3 build (`_python_abi3_support`) for any non-free-threaded CPython its `cpython` constraint admits;
+  - a `noarch` build by its `python` constraints.
+
+  A build whose Python can't be told doesn't count.
+
+musl, Pyodide, iOS and Android targets never match, and neither do `linux-i686`, `linux-armv7l`, `linux-s390x` and
+`win32`, where conda-forge builds no current Python. With `--json --explain`, the package gets a `conda_forge` object:
+`"conda_forge": {"name": "numpy", "version": "2.3.4", "builds": {"linux-ppc64le": ["linux-ppc64le"]}}`, keyed by target
+label like `rejected`, with the subdirs of the builds that fit.
+
+It's only a hint, so it never changes a status, the summary or the exit code: a conda-forge build doesn't make `pip
+install` work, and conda names don't always match PyPI's (PyPI's `torch` is `pytorch` there). Without the flag nothing
+is looked up. With it, only names known to be on PyPI are sent to anaconda.org. Either a lockfile package's registry or
+index is exactly `https://pypi.org/simple` (`uv.lock`, `pylock.toml`), or this run found the package on pypi.org and
+nothing points pip or uv at another index:
+
+- **The input names no other index.** That's package names, a requirements file with no `-i`/`--index-url`,
+  `--extra-index-url`, `-f`/`--find-links` or `--no-index` option (in any form pip reads, in it or in the files it pulls
+  in with `-r` and `-c`), a `pyproject.toml` with no index or sources in `[tool.uv]`, `[tool.uv.pip]`, `[tool.poetry]`,
+  `[tool.pdm]` or `[tool.pixi.pypi-options]`, or a `Pipfile.lock` whose sources are all PyPI. A `-c` file that isn't
+  read (a URL or `${VAR}`) or an abbreviated `--requirement`/`--constraint` option counts as naming one.
+- **No `uv.toml`, `pyproject.toml` or `pdm.toml` sets an index** in the input's folder or a folder above it, up to the
+  repository root (the first with a `.git`). One that can't be read counts as setting one.
+- **No environment variable sets one:** `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`, `PIP_FIND_LINKS`, `PIP_NO_INDEX`,
+  `PIP_CONFIG_FILE` (any case after `PIP_`), `UV_INDEX_URL`, `UV_DEFAULT_INDEX`, `UV_INDEX`, `UV_EXTRA_INDEX_URL`,
+  `UV_FIND_LINKS`, `UV_NO_INDEX`, `UV_CONFIG_FILE` or any `UV_INDEX_*`.
+
+User and system settings aren't read: a `pip.conf` or `pip.ini`, `~/.config/uv/uv.toml`, `/etc/uv/uv.toml` and `.netrc`.
+If those point pip or uv at a private index, don't use `--conda-forge` (or set one of the variables above). Others, such
+as `pdm.lock`, `poetry.lock` and `pixi.lock` packages, aren't looked up, and a note on stderr names them. A run with
+`--index-url`, `index-url` or `WHEELGAP_INDEX_URL` looks nothing up, and `--offline` refuses the flag. Each request is
+tried once (with a 15-second socket timeout), all of them together get 30 seconds, and the first that can't reach
+anaconda.org stops the rest. Answers over 16 MB (pyarrow's is about 60 MB) are refused, so at most about 250 MB is in
+use. When a lookup fails or is dropped, a note on stderr says no hint isn't a "no". Answers, including "too large" and
+"no such package", are cached for 24 hours like pinned lookups (`--no-cache` skips the cache); failures aren't.
+
+
 ## --json {#json}
 
 `--json` prints one object. Its shape is described by

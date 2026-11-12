@@ -55,11 +55,12 @@ kept in `wheelgap/pinned-v1` inside `~/.cache` on Linux (or `$XDG_CACHE_HOME`), 
 index URL (without any credentials in it), the package and the version; on Linux and macOS, wheelgap creates the
 folder and its entries readable by you only.
 
-`--online` always asks the index again and saves the fresh answer, so later runs use it; `--no-cache` neither reads
-nor saves the cache for one run. Entries older than 24 hours are deleted, at most once a day, and
-`wheelgap --clear-cache` deletes all of them (add inputs to check them right after). Both touch only wheelgap's own
-entry files, and never follow a link. Unpinned names, version ranges and `--index-url` lookups aren't cached, and
-neither are lookups from the Python API.
+`--online` always asks the index again and saves the fresh answer, so later runs use it; `--no-cache` neither reads nor
+saves the cache for one run. Entries older than 24 hours are deleted, at most once a day, and `wheelgap --clear-cache`
+deletes all of them (add inputs to check them right after). Both touch only wheelgap's own entry files, and never follow
+a link. After 0.9.0, `--conda-forge` answers are kept the same way, cut down to the subdir, Python, ABI and
+virtual-package needs of each build of the checked version. Unpinned names, version ranges and `--index-url` lookups
+aren't cached, and neither are lookups from the Python API.
 
 ## Private indexes
 

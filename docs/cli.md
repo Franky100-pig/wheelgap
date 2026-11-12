@@ -180,6 +180,14 @@ combine it with quiet mode. See [Output](output.md#explain).
 
 After 0.9.0, a wheel that would fit but whose release was yanked is named with the reason `yanked`.
 
+### `--conda-forge` {#conda-forge}
+
+**After 0.9.0.** With `--explain`, also say when conda-forge has a package with exactly the same name and a build of
+the same version that fits a gap's target. Only glibc Linux, macOS and Windows targets with a current conda-forge
+Python can match, and it never changes a status, the summary or the exit code. Only names known to be on PyPI are sent
+to anaconda.org; a run with `--index-url` or `WHEELGAP_INDEX_URL` looks nothing up, and `--offline` refuses the flag.
+See [conda-forge hint](output.md#conda-forge).
+
 ### `-q`, `--quiet`, `--no-quiet` {#quiet}
 
 Print only the gap summary and the affected package names. Clean runs without ignored packages are silent, and JSON

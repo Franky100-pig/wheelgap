@@ -148,6 +148,21 @@
                     "description": "Present with --explain: dependency path that installs the package, keyed by target label, for the same targets as rejected (uv.lock, and poetry.lock before lock-version 2.1). Empty object when the input has no graph.",
                     "additionalProperties": {"type": "array", "items": {"type": "string"}}
                 },
+                "conda_forge": {
+                    "description": "Present with --explain --conda-forge, in versions after 0.9.0, when conda-forge has a package with exactly this package's canonical name and a build of this version that fits at least one of the targets in rejected: on the main label and not marked broken, for the target's conda subdir or noarch, and for its Python version and ABI (free-threaded or not). A hint only: it doesn't change results, summary or the exit code, and the conda package may be another project. Left out when nothing fits, the package's index isn't known to be PyPI (its name isn't sent), or the lookup failed (a note on stderr says so).",
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name", "version", "builds"],
+                    "properties": {
+                        "name": {"type": "string", "description": "The conda-forge package name that was looked up (the canonical PyPI name)."},
+                        "version": {"type": "string", "description": "The checked version, which every build counted is of."},
+                        "builds": {
+                            "type": "object",
+                            "description": "For each target label with a build that fits: the conda subdirs of those builds, its own (such as linux-aarch64 or osx-arm64) and/or noarch.",
+                            "additionalProperties": {"type": "array", "items": {"type": "string"}}
+                        }
+                    }
+                },
                 "bundled": {
                     "description": "Present with --pyodide-lock when this package is bundled on a Pyodide target: the version Pyodide ships.",
                     "type": "string"
