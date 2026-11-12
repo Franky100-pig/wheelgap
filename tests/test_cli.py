@@ -2777,7 +2777,9 @@ def test_github_annotations_pdm_lock_first_entry(capsys, fake_pypi, tmp_path, mo
     "text",
     [
         '{"default": {"nowheels": {"version": "==0.9"}, "nowheels": {"version": "==0.9"}}}',  # a duplicate key
-        '{"default": {"nowheels": {"version": "==0.9"}},\n "default": {"nowheels": {"version": "==0.9"}}}',
+        # "default" twice: json.loads keeps the second, so the nowheels on line 1 isn't the entry the parser read.
+        '{"default": {"nowheels": {"version": "==0.9"}},\n "default": {"purewheel": {"version": "==3.1"}},\n'
+        ' "develop": {"nowheels": {"version": "==0.9"}}}',
         '{"_meta": {},\r"default": {\n"nowheels": {"version": "==0.9"}}}',  # a CR on its own
     ],
 )
