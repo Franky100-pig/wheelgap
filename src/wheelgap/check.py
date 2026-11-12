@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import re
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from functools import lru_cache
 
 from packaging.markers import InvalidMarker, Marker
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -87,16 +89,20 @@ class Row:
         return any(s is not Status.NOT_NEEDED for s in self.results.values())
 
 
+# A wheel's tags, or None if its filename doesn't parse. --explain asks again for every file on every target,
+# so parse each name once. lru_cache is thread-safe (also on free-threaded Python). The bound counts entries,
+# a few MB with realistic names (about 4 MB, keys included), and keeps a long-running process (wheelgap-mcp)
+# from growing without limit; one release's wheels fit many times over.
+@lru_cache(maxsize=16384)
+def _parsed_tags(filename: str) -> frozenset[Tag] | None:
+    try:
+        return parse_wheel_filename(filename)[3]
+    except InvalidWheelFilename:
+        return None
+
+
 def wheel_tags(files: list[str]) -> list[frozenset[Tag]]:
-    out = []
-    for f in files:
-        if not f.endswith(".whl"):
-            continue
-        try:
-            out.append(parse_wheel_filename(f)[3])
-        except InvalidWheelFilename:
-            continue
-    return out
+    return [tags for f in files if f.endswith(".whl") and (tags := _parsed_tags(f)) is not None]
 
 
 def has_sdist(files: list[str]) -> bool:
@@ -189,14 +195,13 @@ def _platform_reason(plat: str, target: Target) -> str:
 
 def rejection(filename: str, target: Target) -> str | None:
     """Why `target` can't install this wheel, or None if it can."""
-    try:
-        wheel = parse_wheel_filename(filename)[3]
-    except InvalidWheelFilename:
+    wheel = _parsed_tags(filename)
+    if wheel is None:
         return "unparseable wheel filename"
     if target.accepts(wheel):
         return None
     platforms = sorted({t.platform for t in wheel})
-    if "any" in platforms or set(platforms) & set(target.platform_tags()):
+    if "any" in platforms or not target.platform_tag_set.isdisjoint(platforms):
         if target.freethreaded:
             stable = [t for t in wheel if t.abi == "abi3t"]
             if stable:  # PEP 803: the free-threaded stable ABI, cpXY-abi3t works on CPython X.Y+ only
@@ -227,13 +232,12 @@ _OS_PREFIX: dict[str, tuple[str, ...]] = {
 
 def _closeness(filename: str, target: Target) -> tuple[int, int, str]:
     """Sort key: right platform first, then same arch, then same OS, then nearest Python version."""
-    try:
-        wheel = parse_wheel_filename(filename)[3]
-    except InvalidWheelFilename:
+    wheel = _parsed_tags(filename)
+    if wheel is None:
         return (3, 99, filename)
     platforms = {t.platform for t in wheel}
     family, arch = PLATFORMS[target.platform]
-    if "any" in platforms or platforms & set(target.platform_tags()):
+    if "any" in platforms or not target.platform_tag_set.isdisjoint(platforms):
         group = 0
     elif any(p.endswith(arch) or (p.endswith("universal2") and family == "macos") for p in platforms):
         group = 1
@@ -246,10 +250,54 @@ def _closeness(filename: str, target: Target) -> tuple[int, int, str]:
     return (group, distance, filename)
 
 
-def explain(files: list[str], target: Target) -> list[tuple[str, str]]:
-    """(filename, reason) for every wheel `target` rejects, the closest misses first."""
-    out = [(f, r) for f in files if f.endswith(".whl") and (r := rejection(f, target))]
+def explain(files: list[str], target: Target, yanked: frozenset[str] = frozenset()) -> list[tuple[str, str]]:
+    """(filename, reason) for every wheel `target` rejects, the closest misses first.
+
+    A wheel the target accepts but status_for() leaves out because it's yanked (the release has other files the
+    target can use) is listed with the reason "yanked".
+    """
+    skips_yanked = bool(yanked) and _installable([f for f in files if f not in yanked], target)
+    out = []
+    for f in files:
+        if not f.endswith(".whl"):
+            continue
+        reason = rejection(f, target)
+        if reason is None and skips_yanked and f in yanked:
+            reason = "yanked"
+        if reason:
+            out.append((f, reason))
     return sorted(out, key=lambda fr: _closeness(fr[0], target))
+
+
+# How many rejected wheels --explain's text (and wheelgap-mcp's check_package) lists per cell.
+EXPLAIN_LIMIT = 8
+
+
+def explain_lines(
+    files: list[str],
+    target: Target,
+    *,
+    yanked: frozenset[str] = frozenset(),
+    limit: int | None = None,
+    dim: Callable[[str], str] = lambda text: text,
+    align: bool = False,
+) -> list[str]:
+    """What --explain says under a gap on `target`: each rejected wheel and why (the closest misses first, at most
+    `limit` of them), or that none were published, and a note when the target can't build the sdist there is.
+
+    The command line aligns the reasons in a column, dims them and indents each line; Result.reasons joins them
+    unaligned (one space-separated "file  reason" per line) and with no limit.
+    """
+    rejected = explain(files, target, yanked)
+    out = [] if rejected else [dim("no wheels published for this version")]
+    shown = rejected[:limit]
+    width = max((len(f) for f, _ in shown), default=0) if align else 0
+    out += [f"{f.ljust(width)}  {dim(reason)}" for f, reason in shown]
+    if len(rejected) > len(shown):
+        out.append(dim(f"… and {len(rejected) - len(shown)} more (--json lists them all)"))
+    if not target.builds_sdists and has_sdist(files):
+        out.append(dim(f"there is an sdist, but {target.platform} can't build packages from source"))
+    return out
 
 
 _marker_cache: dict[str, Marker | None] = {}

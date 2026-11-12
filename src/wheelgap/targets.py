@@ -406,6 +406,11 @@ class Target:
             return list(tags.android_platforms(self.android_api, arch))
         return [arch]
 
+    @cached_property
+    def platform_tag_set(self) -> frozenset[str]:
+        """platform_tags() as a set, worked out once per target: --explain asks for every rejected wheel."""
+        return frozenset(self.platform_tags())
+
     @property
     def unknown_markers(self) -> frozenset[str]:
         """Marker names whose value this target doesn't decide (on top of check.py's _UNKNOWABLE)."""

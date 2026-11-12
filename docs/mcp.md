@@ -149,3 +149,22 @@ it. The server's working directory may not be your project, so the agent should
 pass an absolute path or a `file://` URI. A relative path such as `uv.lock`
 works only when the client shares its
 [roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots).
+
+`check_lockfile` and `check_dockerfile` apply the project's `[tool.wheelgap]`
+settings. Their `ok` is true only when no package has a gap on any target;
+`passes` is the command line's verdict (exit code 0), which also accepts gaps on
+the project's advisory targets (`advisory = [...]`) and, with
+`fail-on = "missing"`, source builds. The result lists the advisory targets
+under `advisory`, and each entry in `gaps` has `advisory_gaps`: which of its
+`gaps` are on advisory targets.
+
+To ask why a package has no wheel for a target, try:
+
+> Why doesn't numpy 2.3.4 have a wheel for Python 3.14t on Alpine ARM64?
+
+The agent should call `check_package` with `explain` set to `true`. The
+result then adds `rejected`: for each target with a gap, up to 8 of the
+package's wheels that target can't use, closest misses first, each with the
+reason (such as `abi3 wheels can't be used on free-threaded Python (only
+abi3t ones can)`), and `rejected_omitted` counting any it left out. Without
+`explain`, the result has only the statuses, which keeps it small.

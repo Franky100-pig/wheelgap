@@ -43,7 +43,7 @@ from packaging.version import InvalidVersion, Version
 
 from . import __version__, pypi
 from .api import Result, check_package, make_targets, running_python
-from .check import Status
+from .check import EXPLAIN_LIMIT, Status
 from .dockerfile import DockerfileError, read_dockerfile
 from .pyodide import PyodideLockError, load_pyodide_lock
 from .sources import SourceError
@@ -132,7 +132,9 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Check whether one PyPI package has a prebuilt wheel for each target platform and Python. Returns each "
             "target's status, the targets with a gap, ok (true only if every target installs without building) and "
-            "the libc and macOS versions assumed. " + _STATUS_HELP
+            "the libc and macOS versions assumed. With explain: true, also says why: rejected lists, for each "
+            f"source or missing target, up to {EXPLAIN_LIMIT} wheels it can't use and the reason for each, closest "
+            "misses first (rejected_omitted counts any more), as wheelgap --json --explain does. " + _STATUS_HELP
         ),
         "inputSchema": {
             "type": "object",
@@ -147,6 +149,11 @@ TOOLS: list[dict[str, Any]] = [
                 "targets": _TARGETS_PROP,
                 **_VERSION_PROPS,
                 "pyodide_lock": _PYODIDE_LOCK_PROP,
+                "explain": {
+                    "type": "boolean",
+                    "description": "Also return rejected (and via, always empty for one package): why each source "
+                    "or missing target can't use the published wheels. Default: false.",
+                },
             },
             "required": ["name"],
             "additionalProperties": False,
@@ -165,7 +172,11 @@ TOOLS: list[dict[str, Any]] = [
             "Notes and errors name command-line flags (--offline is the offline argument here). "
             "Packages from git, paths, URLs or private indexes are listed under "
             "'skipped': they were NOT checked. 'notes' says when an answer may be incomplete. Requirements files are "
-            "looked up on the index. With two Pythons checked, one newer (e.g. python '3.14,next'), "
+            "looked up on the index. 'ok' is true only when no package has a gap; 'passes' is the command line's "
+            "verdict (exit code 0), which also accepts gaps on the project's advisory targets (listed in 'advisory'; "
+            "each gap's 'advisory_gaps' says which of its 'gaps' are on them) and, with fail-on = \"missing\", "
+            "source builds. "
+            "With two Pythons checked, one newer (e.g. python '3.14,next'), "
             "'blocking_newer_python' names the packages with a gap on the newer one only; it leaves out packages "
             "that couldn't be checked. " + _STATUS_HELP
         ),
@@ -338,6 +349,11 @@ def _lock_spec(args: dict[str, Any]) -> str:
 
 def _check_package(args: dict[str, Any]) -> dict[str, Any]:
     _check_keys("check_package", args)
+    explain = args.get("explain")
+    if explain is None:  # absent or null: like the other optional arguments
+        explain = False
+    if not isinstance(explain, bool):
+        raise ToolError("'explain' must be true or false")
     name = (_string(args, "name", required=True) or "").strip()
     if not _NAME_RE.fullmatch(name):
         raise ToolError(f"{name!r} isn't a package name: pass the name alone, and an exact version as 'version'")
@@ -363,7 +379,14 @@ def _check_package(args: dict[str, Any]) -> dict[str, Any]:
         result: Result = check_package(name, version, targets, pyodide_locks=locks)
     except PyodideLockError as e:  # a lock for a Python no pyodide target uses
         raise ToolError(str(e)) from e
-    out: dict[str, Any] = result.to_dict()
+    out: dict[str, Any] = result.to_dict(explain=explain)
+    if explain:  # as many wheels per cell as --explain's text shows, so a reply stays small
+        out["rejected_omitted"] = {
+            label: len(wheels) - EXPLAIN_LIMIT
+            for label, wheels in out["rejected"].items()
+            if len(wheels) > EXPLAIN_LIMIT
+        }
+        out["rejected"] = {label: wheels[:EXPLAIN_LIMIT] for label, wheels in out["rejected"].items()}
     out["ok"] = result.ok
     out["gaps"] = [t.label(True) for t in result.gaps]
     out["targets"] = [t.label(True) for t in targets]
@@ -512,6 +535,8 @@ def _run_cli(argv: list[str], path: Path) -> dict[str, Any]:
     label = {t["label"]: f"{t['python']} {t['platform']}" for t in data["targets"]}
     platform_of = {t["label"]: t["platform"] for t in data["targets"]}
     ignored_on = {i["name"]: set(i["platforms"]) for i in data["ignored_targets"]}
+    # Older wheelgap JSON has no "advisory" key; it's always there now, but stay readable either way.
+    advisory = [label[cell] for cell in data.get("advisory", [])]
     gaps = []
     for package in data["packages"]:
         cells = [
@@ -521,7 +546,8 @@ def _run_cli(argv: list[str], path: Path) -> dict[str, Any]:
         ]
         if cells:
             results = {label[cell]: status for cell, status in package["results"].items()}
-            gaps.append(package | {"results": results, "gaps": cells})
+            on_advisory = [cell for cell in cells if cell in advisory]
+            gaps.append(package | {"results": results, "gaps": cells, "advisory_gaps": on_advisory})
     # A bundled build at another version still passes, as in the CLI, but a pin micropip can't install must be said.
     differs = [p for p in data["packages"] if p.get("bundled_version_differs")]
     for p in differs:
@@ -537,6 +563,10 @@ def _run_cli(argv: list[str], path: Path) -> dict[str, Any]:
         "targets": list(label.values()),
         "packages": data["summary"]["packages"],
         "ok": not gaps,
+        # The command line's verdict: gaps on advisory targets (and, with fail-on = "missing", source builds) don't
+        # fail it, so this can be true while ok is false.
+        "passes": code == 0,
+        "advisory": advisory,
         "unknown": sum(1 for g in gaps if Status.UNKNOWN.value in g["results"].values()),
         "bundled_version_differs": [
             {"name": p["name"], "version": p["version"], "bundled": p["bundled"]} for p in differs
