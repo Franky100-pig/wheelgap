@@ -27,6 +27,7 @@ LOCKFILES = (
     "Pipfile.lock",
     "requirements.txt",
     "requirements.lock",
+    "pixi.lock",
 )
 
 
@@ -58,12 +59,28 @@ class Package:
     # uv.lock / pylock.toml: the sdist's URL and sha256, as the lock records them (for --build-info).
     sdist_url: str | None = None
     sdist_sha256: str | None = None
-    # The JSON API index (pypi.index_url()) this run took the files from, for a package the input listed none for.
-    looked_up_on: str | None = None
+    # This run found the package on pypi.org's JSON API (pypi.fill), so its name is public there.
+    found_on_pypi: bool = False
+    # `files` are only some of the release's files (pixi.lock records the one it picked per platform), so the
+    # package is looked up on its index anyway, and skipped as a private index if it can't be.
+    partial_files: bool = False
 
     @property
     def key(self) -> str:
         return canonicalize_name(self.name)
+
+
+# PEP 508's package name. pip and uv can't install anything else, and the CLI prints names at the start of lines,
+# where a lockfile's `::error::...` would otherwise read as a workflow command in a GitHub Actions log.
+_NAME_RE = re.compile(r"[A-Z0-9]|[A-Z0-9][A-Z0-9._-]*[A-Z0-9]", re.IGNORECASE | re.ASCII)
+
+
+def package_name(path: Path, name: object) -> str:
+    """A lockfile's package name, or SourceError naming the file if it isn't a valid one."""
+    if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
+        what = "has no name" if name is None else f"has the name {name!r}, which isn't a valid package name (PEP 508)"
+        raise SourceError(f"{path.name}: a package {what}")
+    return name
 
 
 # A dependency edge in a lockfile graph: (name, version or None, marker or None)
@@ -128,6 +145,11 @@ class Source:
     # (a key of READERS), for --github-annotations.
     path: Path | None = None
     kind: str | None = None
+    # The input names no index but PyPI, so a package this run found on pypi.org is a PyPI package (for --conda-forge,
+    # which sends only such names). False when unsure: lockfiles rely on each package's registry instead.
+    pypi_only: bool = False
+    # A project directory with pixi.lock as well as the lockfile that was picked: the pixi.lock, for a note.
+    passed_over: Path | None = None
 
 
 def pythons_outside_lock(source: Source, targets: Iterable[Target], *, bounds_only: bool = True) -> list[str]:
@@ -206,7 +228,7 @@ def parse_uv_lock(path: Path) -> Source:
     source.uv_pyproject = path.with_name("pyproject.toml")
     for p in data.get("package", []):
         src = p.get("source", {})
-        pkg = Package(p["name"], p.get("version"), origin=path.name)
+        pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name)
         kind = next((k for k in ("editable", "virtual", "git", "path", "directory", "url") if k in src), None)
         if kind and "registry" not in src:
             pkg.skip = kind
@@ -436,7 +458,7 @@ def parse_pylock(path: Path) -> Source:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     pkgs = []
     for p in data.get("packages", []):
-        pkg = Package(p["name"], p.get("version"), origin=path.name, registry=p.get("index"))
+        pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name, registry=p.get("index"))
         if p.get("marker"):
             pkg.markers = [p["marker"]]
         if any(k in p for k in ("vcs", "directory", "archive")) and "wheels" not in p and "sdist" not in p:
@@ -471,7 +493,7 @@ def parse_poetry_lock(path: Path) -> Source:
     pkgs: list[Package] = []
     edges: dict[int, list[Edge]] = {}
     for p in data.get("package", []):
-        pkg = Package(p["name"], p.get("version"), origin=path.name)
+        pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name)
         markers = p.get("markers")
         if isinstance(markers, str):
             pkg.markers = [markers]
@@ -641,7 +663,7 @@ def parse_pdm_lock(path: Path) -> Source:
     # Each package's groups, merged over its entries (PDM writes one per extras variant).
     groups: dict[tuple[str, str | None], list[str] | None] = {}
     for p in data.get("package", []):
-        pkg = Package(p["name"], p.get("version"), origin=path.name)
+        pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name)
         recorded = p.get("groups")
         recorded = [g for g in recorded if isinstance(g, str)] if isinstance(recorded, list) else None
         key = (pkg.key, pkg.version)
@@ -706,6 +728,7 @@ def parse_pipfile_lock(path: Path) -> Source:
     }
     for section in sections:
         for name, p in data[section].items():
+            package_name(path, name)
             if not isinstance(p, dict):
                 raise SourceError(f"{path.name}: {section}.{name} isn't a package entry")
             version = p.get("version")
@@ -725,7 +748,11 @@ def parse_pipfile_lock(path: Path) -> Source:
                 elif not _is_public_pypi(url):
                     pkg.registry = url  # pypi.fill_all skips it, unless WHEELGAP_INDEX_URL is that index
             _add_once(pkgs, seen, pkg)
-    return Source(path.name, pkgs)
+    # A package with no "index" comes from the Pipfile's default source, which may be private: only a lock whose
+    # sources are all PyPI says where every package came from.
+    urls = [s.get("url") if isinstance(s, dict) else None for s in (sources if isinstance(sources, list) else [])]
+    only_pypi = bool(urls) and all(_is_public_pypi(u) for u in urls) and not _nearby_config_names_an_index(path)
+    return Source(path.name, pkgs, pypi_only=only_pypi)
 
 
 def _is_public_pypi(url: str | None) -> bool:
@@ -740,6 +767,63 @@ def _pinned_version(req: Requirement) -> str | None:
     if len(specs) == 1 and specs[0].operator in ("==", "===") and "*" not in specs[0].version:
         return specs[0].version
     return None
+
+
+# uv settings (in [tool.uv], [tool.uv.pip] or uv.toml) that point it at an index or a folder of distributions.
+_UV_INDEX_KEYS = ("index", "sources", "index-url", "extra-index-url", "find-links", "no-index", "default-index")
+
+
+def _table(data: object, name: str) -> dict:
+    value = data.get(name) if isinstance(data, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+def _uv_names_an_index(uv: dict) -> bool:
+    return any(k in uv for k in _UV_INDEX_KEYS) or any(k in _table(uv, "pip") for k in _UV_INDEX_KEYS)
+
+
+def _names_an_index(pyproject: dict) -> bool:
+    """Whether a pyproject.toml configures an index or source for an installer (uv, Poetry, PDM, pixi's PyPI options),
+    so its dependencies may come from somewhere other than PyPI."""
+    tool = _table(pyproject, "tool")
+    pixi = _table(_table(tool, "pixi"), "pypi-options")
+    return (
+        _uv_names_an_index(_table(tool, "uv"))
+        or "source" in _table(tool, "poetry")
+        or "source" in _table(tool, "pdm")
+        or any(k in pixi for k in ("index-url", "extra-index-urls", "find-links"))
+    )
+
+
+def _pdm_names_an_index(pdm: dict) -> bool:
+    """pdm.toml: [pypi] (url, or a named [pypi.<name>] index) or a source."""
+    return "pypi" in pdm or "source" in pdm
+
+
+# Project config files an installer reads from the input's folder or a folder above it, and how to tell whether one
+# points it at an index.
+_CONFIG_FILES = {"uv.toml": _uv_names_an_index, "pyproject.toml": _names_an_index, "pdm.toml": _pdm_names_an_index}
+
+
+def _nearby_config_names_an_index(path: Path) -> bool:
+    """Whether a uv.toml, pyproject.toml or pdm.toml in the input's folder, or a folder above it up to the
+    repository root (the first with a .git), configures an index: uv applies [tool.uv] to `uv pip install -r` and
+    looks in parent folders, and `uv pip compile` writes no index lines. One that can't be read counts as naming
+    one. User and system settings (pip.conf, ~/.config/uv/uv.toml, /etc/uv/uv.toml, .netrc) aren't read."""
+    folder = path.resolve().parent
+    for directory in (folder, *folder.parents):
+        for name, names_an_index in _CONFIG_FILES.items():
+            config = directory / name
+            if not config.is_file():
+                continue
+            try:
+                if names_an_index(tomllib.loads(config.read_text(encoding="utf-8-sig"))):
+                    return True
+            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+                return True
+        if (directory / ".git").exists():
+            break
+    return False
 
 
 def parse_pyproject(path: Path) -> Source:
@@ -788,7 +872,12 @@ def parse_pyproject(path: Path) -> Source:
                 "(PEP 685)"
             )
         extras[key] = list(lines)
-    source = Source(path.name, pyproject_extras=extras, pyproject_dynamic_extras="optional-dependencies" in dynamic)
+    source = Source(
+        path.name,
+        pyproject_extras=extras,
+        pyproject_dynamic_extras="optional-dependencies" in dynamic,
+        pypi_only=not (_names_an_index(data) or _nearby_config_names_an_index(path)),
+    )
     if isinstance(requires_python := project.get("requires-python"), str):
         source.requires_python = requires_python
     if isinstance(name := project.get("name"), str):
@@ -885,10 +974,39 @@ _INCLUDE_RE = re.compile(r"^(?:-r|--requirement)(?:\s+|=)?(\S.*)$")
 _CONSTRAINT_RE = re.compile(r"^(?:-c(?:\s+|=)?|--constraint(?:\s+|=))(\S.*)$")
 
 
+# pip options that point at an index or a folder of distributions other than PyPI's (or turn PyPI off).
+_INDEX_OPTIONS = ("--index-url", "--extra-index-url", "--find-links", "--no-index")
+
+
+def _names_index_option(line: str) -> bool:
+    """Whether a requirements line has an index option anywhere on it, as pip reads them: `-i URL`, `-iURL`,
+    `--index-url=URL`, `-f`, `--find-links`, `--extra-index-url`, `--no-index`, or an abbreviation of a long one
+    (optparse accepts unambiguous prefixes)."""
+    for token in line.split():
+        if token.startswith(("-i", "-f")) and not token.startswith("--"):
+            return True
+        option = token.split("=", 1)[0]
+        if len(option) > 2 and option.startswith("--") and any(name.startswith(option) for name in _INDEX_OPTIONS):
+            return True
+    return False
+
+
+def _abbreviated_include(line: str) -> bool:
+    """An abbreviation of --requirement or --constraint (`--requirem f`, `--cons f`), which pip reads but wheelgap
+    doesn't follow: the file it names may set an index."""
+    option = line.split(None, 1)[0].split("=", 1)[0]
+    return (
+        len(option) > 2
+        and option not in ("--requirement", "--constraint")
+        and any(name.startswith(option) for name in ("--requirement", "--constraint"))
+    )
+
+
 def parse_requirements(path: Path) -> Source:
     constraints: list[Package] = []
     seen: dict[bool, set[Path]] = {False: set(), True: set()}  # requirement files, constraint files
-    pkgs = _read_requirements(path, seen, constraints)
+    index_options: list[str] = []
+    pkgs = _read_requirements(path, seen, constraints, index_options=index_options)
     by_name: dict[str, list[Package]] = {}
     for entry in constraints:
         by_name.setdefault(entry.key, []).append(entry)
@@ -909,31 +1027,47 @@ def parse_requirements(path: Path) -> Source:
             for entry in entries:
                 spec &= SpecifierSet(entry.spec or "")
             pkg.spec = str(spec) or None
-    return Source(path.name, pkgs, requirements=True)
+    return Source(
+        path.name, pkgs, requirements=True, pypi_only=not index_options and not _nearby_config_names_an_index(path)
+    )
 
 
 def _read_requirements(
-    path: Path, seen: dict[bool, set[Path]], constraints: list[Package], constraint: bool = False
+    path: Path,
+    seen: dict[bool, set[Path]],
+    constraints: list[Package],
+    constraint: bool = False,
+    index_options: list[str] | None = None,
 ) -> list[Package]:
+    """`index_options` collects the lines that may point pip at another index: index options (--index-url,
+    --extra-index-url, --find-links, --no-index), includes that aren't read, and abbreviated include options."""
     path = path.resolve()
     if path in seen[constraint]:
         return []
     seen[constraint].add(path)
     pkgs: list[Package] = []
     append = constraints.append if constraint else pkgs.append
-    lines = path.read_text(encoding="utf-8").replace("\\\n", " ").splitlines()
+    # utf-8-sig: a byte order mark (Windows editors) mustn't hide an option on the first line.
+    lines = path.read_text(encoding="utf-8-sig").replace("\\\n", " ").splitlines()
     for raw in lines:
         line = _COMMENT_RE.split(raw, 1)[0].strip()  # " # note" or "<TAB># note"
         if not line or line.startswith("#"):
             continue
+        if index_options is not None and (_names_index_option(line) or _abbreviated_include(line)):
+            index_options.append(line)
         if m := _CONSTRAINT_RE.match(line):
             target = m.group(1).strip()
-            # A URL (-c https://releases.openstack.org/...) or ${VAR} is left to pip: it's skipped, as before.
+            # A URL (-c https://releases.openstack.org/...) or ${VAR} is left to pip: it's skipped, as before. Unread,
+            # it may name an index, so the input isn't PyPI-only.
             if "://" not in target and "${" not in target:
-                _read_requirements(path.parent / target, seen, constraints, True)
+                _read_requirements(path.parent / target, seen, constraints, True, index_options)
+            elif index_options is not None:
+                index_options.append(line)
             continue
         if m := _INCLUDE_RE.match(line):  # -r file, -rfile, --requirement file, --requirement=file
-            pkgs.extend(_read_requirements(path.parent / m.group(1).strip(), seen, constraints, constraint))
+            pkgs.extend(
+                _read_requirements(path.parent / m.group(1).strip(), seen, constraints, constraint, index_options)
+            )
             continue
         if line.startswith("-e ") or line.startswith("--editable"):
             name = line.split("#egg=", 1)[1] if "#egg=" in line else line.split(None, 1)[-1]
@@ -960,6 +1094,403 @@ def _read_requirements(
     return pkgs
 
 
+class _YamlError(Exception):
+    def __init__(self, number: int, message: str):
+        super().__init__(f"line {number}: {message}")
+
+
+class _BlockYaml:
+    """The block-style YAML subset pixi writes (serde_yaml): mappings, sequences (also "indentless" ones under a
+    key), plain and quoted one-line scalars, and the empty `[]` and `{}`. Scalars stay strings. Anything else
+    (anchors, aliases, tags, block scalars, flow collections, multi-line scalars, comments, tabs) is an error rather
+    than a guess at what YAML would make of it."""
+
+    _ESCAPES = {'"': '"', "\\": "\\", "/": "/", "n": "\n", "t": "\t", "r": "\r", "0": "\0"}
+    # Tabs, control characters (libyaml refuses most of them), line breaks other than \n and \r (which
+    # str.splitlines would also split on), a byte order mark after the start, lone surrogates, and the
+    # noncharacters U+FFFE and U+FFFF, which libyaml refuses too.
+    _BAD_CHAR = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029\ufeff\ud800-\udfff\ufffe\uffff]")
+
+    def __init__(self, text: str):
+        self.lines: list[tuple[int, int, str]] = []  # (line number, indent, content)
+        for number, raw in enumerate(text.replace("\r\n", "\n").replace("\r", "\n").split("\n"), 1):
+            if bad := self._BAD_CHAR.search(raw):
+                raise _YamlError(number, f"unsupported character {bad.group()!r} (tabs and control characters)")
+            line = raw.rstrip(" ")
+            if not line:
+                continue
+            content = line.lstrip(" ")
+            if content.startswith("#") or (line == content and content.startswith(("---", "..."))):
+                raise _YamlError(number, "comments and document markers aren't supported")
+            self.lines.append((number, len(line) - len(content), content))
+        self.i = 0
+
+    def read(self) -> object:
+        if not self.lines:
+            return None
+        value = self._node(0)
+        if self.i < len(self.lines):
+            raise _YamlError(self.lines[self.i][0], "unexpected indentation")
+        return value
+
+    def _node(self, indent: int) -> object:
+        number, at, content = self.lines[self.i]
+        if at != indent:
+            raise _YamlError(number, "unexpected indentation")
+        return self._sequence(indent) if self._is_item(content) else self._mapping(indent)
+
+    @staticmethod
+    def _is_item(content: str) -> bool:
+        return content == "-" or content.startswith("- ")
+
+    def _sequence(self, indent: int) -> list:
+        items: list = []
+        while self.i < len(self.lines):
+            number, at, content = self.lines[self.i]
+            if at < indent or (at == indent and not self._is_item(content)):
+                break
+            if at > indent or content == "-":
+                raise _YamlError(number, "unexpected indentation")
+            rest = content[2:].lstrip(" ")
+            if self._is_item(rest) or self._split_key(rest, number) is not None:
+                # "- key: value": a mapping whose first line is this one, at the item's column
+                if self._is_item(rest):
+                    raise _YamlError(number, "nested sequences aren't supported")
+                self.lines[self.i] = (number, at + len(content) - len(rest), rest)
+                items.append(self._mapping(at + len(content) - len(rest)))
+            else:
+                items.append(self._scalar(rest, number))
+                self.i += 1
+        return items
+
+    def _mapping(self, indent: int) -> dict:
+        out: dict = {}
+        while self.i < len(self.lines):
+            number, at, content = self.lines[self.i]
+            if at < indent:
+                break
+            if at > indent or self._is_item(content):
+                raise _YamlError(number, "unexpected indentation")
+            split = self._split_key(content, number)
+            if split is None:
+                raise _YamlError(number, "expected `key: value`")
+            key, rest = split
+            if key in out:
+                raise _YamlError(number, f"duplicate key {key!r}")
+            self.i += 1
+            if rest:
+                out[key] = self._scalar(rest, number)
+            elif self.i < len(self.lines) and self.lines[self.i][1] > indent:
+                out[key] = self._node(self.lines[self.i][1])
+            elif self.i < len(self.lines) and self.lines[self.i][1] == indent and self._is_item(self.lines[self.i][2]):
+                out[key] = self._sequence(indent)
+            else:
+                out[key] = None
+        return out
+
+    def _split_key(self, content: str, number: int) -> tuple[str, str] | None:
+        """(key, rest of the line) for `key: rest` or `key:`, else None."""
+        if content[0] in "'\"":
+            end = self._quoted_end(content, number)
+            if end is None or not (content[end:] == ":" or content[end:].startswith(": ")):
+                return None
+            return self._key(content[:end], number), content[end + 1 :].strip(" ")
+        if content.endswith(":"):
+            key, rest = content[:-1], ""
+        elif ": " in content:
+            key, rest = content.split(": ", 1)
+            rest = rest.strip(" ")
+        else:
+            return None
+        return self._key(key, number), rest
+
+    def _key(self, text: str, number: int) -> str:
+        if text != text.strip(" "):
+            raise _YamlError(number, f"unsupported key {text!r} (a space before the colon)")
+        key = self._scalar(text, number)
+        if not isinstance(key, str):
+            raise _YamlError(number, f"unsupported key {text!r}")
+        return key
+
+    @staticmethod
+    def _quoted_end(text: str, number: int) -> int | None:
+        """Where the quoted scalar that starts `text` ends (just past its closing quote), or None if it isn't closed
+        on this line."""
+        quote, i = text[0], 1
+        while i < len(text):
+            if quote == '"' and text[i] == "\\":
+                i += 2
+                continue
+            if text[i] == quote:
+                if quote == "'" and text[i + 1 : i + 2] == "'":
+                    i += 2
+                    continue
+                return i + 1
+            i += 1
+        return None
+
+    def _scalar(self, text: str, number: int) -> object:
+        if not text:
+            raise _YamlError(number, "empty key")
+        if text in ("[]", "{}"):
+            return [] if text == "[]" else {}
+        if text[0] in "'\"":
+            if self._quoted_end(text, number) != len(text):
+                raise _YamlError(number, "a quoted string must end on its own line")
+            if text[0] == "'":
+                return text[1:-1].replace("''", "'")
+            return self._unescape(text[1:-1], number)
+        if (
+            text[0] in "[]{}&*!|>%@`#?,:"
+            or text == "-"
+            or text.startswith("- ")
+            or " #" in text
+            or ": " in text
+            or text[-1] == ":"
+        ):
+            raise _YamlError(number, f"unsupported YAML: {text[:40]!r}")
+        return text
+
+    def _unescape(self, text: str, number: int) -> str:
+        out, i = [], 0
+        while i < len(text):
+            c = text[i]
+            if c != "\\":
+                out.append(c)
+                i += 1
+                continue
+            code = text[i + 1 : i + 2]
+            width = {"x": 2, "u": 4, "U": 8}.get(code)
+            if code in self._ESCAPES:
+                out.append(self._ESCAPES[code])
+                i += 2
+            elif (
+                width and re.fullmatch(r"[0-9A-Fa-f]+", digits := text[i + 2 : i + 2 + width]) and len(digits) == width
+            ):
+                point = int(digits, 16)
+                if point > 0x10FFFF or 0xD800 <= point <= 0xDFFF:
+                    raise _YamlError(number, f"escape \\{code}{digits} isn't a Unicode character")
+                out.append(chr(point))
+                i += 2 + width
+            else:
+                raise _YamlError(number, f"unsupported escape \\{code}")
+        return "".join(out)
+
+
+# pixi.lock versions this reader knows (rattler_lock's FileFormatVersion, crates/rattler_lock/src/file_format_version.rs
+# in conda/rattler): 6, and 7, which pixi writes since 0.68. A newer pixi rewrites an older lock when it locks again;
+# a newer version may change what a field means, so it's refused rather than guessed at.
+PIXI_LOCK_VERSIONS = ("6", "7")
+# conda subdir -> (sys_platform, platform_machine) of the Python that runs there. 32-bit x86 and Arm are left out:
+# their platform_machine is the machine's (see targets._UNKNOWN_MACHINE_ARCHES), so no target matches them for sure.
+_CONDA_MARKERS = {
+    "linux-64": ("linux", "x86_64"),
+    "linux-aarch64": ("linux", "aarch64"),
+    "linux-ppc64le": ("linux", "ppc64le"),
+    "linux-s390x": ("linux", "s390x"),
+    "linux-riscv64": ("linux", "riscv64"),
+    "osx-64": ("darwin", "x86_64"),
+    "osx-arm64": ("darwin", "arm64"),
+    "win-64": ("win32", "AMD64"),
+    "win-arm64": ("win32", "ARM64"),
+}
+_PIXI_ENV_KEYS = {"channels", "indexes", "find-links", "options", "packages"}
+_PIXI_PYPI_KEYS = {
+    "6": {"pypi", "name", "version", "sha256", "md5", "requires_dist", "requires_python", "editable"},
+    "7": {"pypi", "name", "version", "sha256", "md5", "index", "requires_dist", "requires_python"}
+    | {"build_packages", "host_packages"},
+}
+_CONDA_ARCHIVE_RE = re.compile(r"^(.+)-([^-]+)-([^-]+)\.(?:conda|tar\.bz2)$")
+
+
+def _pixi_conda_name(location: str, selector: dict, entry: dict | None) -> tuple[str, str | None]:
+    """A conda package's name and version, from what the lock records or its archive's filename."""
+    for record in (selector, entry or {}):
+        if isinstance(record.get("name"), str):
+            version = record.get("version")
+            return record["name"], version if isinstance(version, str) else None
+    if m := _CONDA_ARCHIVE_RE.match(unquote(Path(urlparse(location).path).name)):
+        return m.group(1), m.group(2)
+    return location.split("[", 1)[0].split(" @ ", 1)[0].strip() or location, None
+
+
+def _pixi_pypi_package(entry: dict, indexes: list[str], where: str) -> tuple[Package, tuple[str, str]]:
+    """A pixi.lock `pypi:` entry as a Package, and the key that merges it with the same package on other platforms."""
+    location, name = entry["pypi"], package_name(Path(where), entry.get("name"))
+    pkg = Package(name, entry.get("version"), origin=where)
+    scheme = m.group(1).lower() if (m := re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://", location)) else None
+    if scheme in ("http", "https"):
+        url = urlparse(location)
+        filename = unquote(Path(url.path).name)
+        index = entry.get("index")
+        if isinstance(index, str):
+            pkg.registry = index  # v7 records the index for a package that didn't come from PyPI
+        elif url.hostname == "files.pythonhosted.org":
+            pass  # PyPI's own file host: the release is on PyPI
+        elif all(i.rstrip("/") == "https://pypi.org/simple" for i in indexes):
+            pkg.skip = "url"  # PyPI serves files only from files.pythonhosted.org, so this is a direct URL
+        else:
+            pkg.skip = "private index"  # another index, or a direct URL: the lock doesn't say which
+        if not pkg.skip:
+            if pkg.version is None:
+                raise SourceError(f"{where}: {name} comes from an index but has no version")
+            pkg.files, pkg.partial_files = [filename], True
+            return pkg, (pkg.key, pkg.version)
+    elif scheme is None or scheme == "file":
+        pkg.skip = "editable" if entry.get("editable") == "true" else "path"
+    elif "+" in scheme:
+        pkg.skip = scheme.split("+", 1)[0]  # git+https://..., hg+..., svn+...
+    else:
+        raise SourceError(f"{where}: {name} has a location wheelgap can't read: {location!r}")
+    return pkg, (pkg.key, f"{pkg.skip} {location}")
+
+
+def parse_pixi_lock(path: Path, environment: str | None = None) -> Source:
+    """One environment of a pixi.lock (`default` unless named): its PyPI packages with the files pixi picked for
+    each platform, and its conda packages, skipped. A package missing from some of the lock's platforms gets a
+    marker that hides it on those platforms (for the environment's Python there) and nowhere else."""
+    try:
+        text = path.read_text(encoding="utf-8-sig")  # serde_yaml takes a leading byte order mark too
+    except UnicodeDecodeError as e:
+        raise SourceError(f"{path.name}: not valid UTF-8 (byte {e.start}), so it can't be read for sure") from None
+    top = re.search(r"^version:[ ]*(.*?)[ ]*$", text, re.MULTILINE)
+    if top is None:
+        raise SourceError(f"{path.name}: no top-level `version`, so this isn't a pixi.lock wheelgap can read")
+    version = top.group(1).strip("'\"")
+    if version not in PIXI_LOCK_VERSIONS:
+        raise SourceError(
+            f"{path.name}: pixi.lock version {top.group(1)!r} isn't supported (wheelgap reads versions "
+            f"{' and '.join(PIXI_LOCK_VERSIONS)}); run `pixi lock` with a pixi that writes one of them, or update "
+            "wheelgap"
+        )
+    try:
+        data = _BlockYaml(text).read()
+    except _YamlError as e:
+        raise SourceError(f"{path.name}: can't read it for sure: {e}") from None
+
+    def bad(what: str) -> SourceError:
+        return SourceError(f"{path.name}: can't read it for sure: {what}")
+
+    if not isinstance(data, dict) or data.get("version") != version:
+        raise bad("the top level isn't a mapping with that `version`")
+    allowed = {"version", "environments", "packages"} | ({"platforms"} if version == "7" else set())
+    if unknown := sorted(set(data) - allowed):
+        raise bad(f"unknown top-level key {unknown[0]!r} for version {version}")
+    subdirs: dict[str, str] = {}  # platform name -> conda subdir
+    if version == "7":
+        for p in data.get("platforms") or []:
+            if not isinstance(p, dict) or not isinstance(p.get("name"), str):
+                raise bad("a `platforms` entry has no name")
+            subdir = p.get("subdir", p["name"])
+            if not isinstance(subdir, str):
+                raise bad(f"platform {p['name']!r} has a `subdir` that isn't a string")
+            subdirs[p["name"]] = subdir
+    environments, entries = data.get("environments"), data.get("packages") or []
+    if not isinstance(environments, dict) or not isinstance(entries, list):
+        raise bad("`environments` must be a mapping and `packages` a list")
+    name = "default" if environment is None else environment
+    if not name:
+        raise SourceError(f"{path.name}: the environment name is empty")
+    env = environments.get(name)
+    if env is None:
+        names = ", ".join(sorted(environments)) or "none"
+        raise SourceError(f"{path.name}: no environment {name!r} (it has: {names}); pick one with --environment")
+    if not isinstance(env, dict):
+        raise bad(f"environment {name!r} isn't a mapping")
+    if unknown := sorted(set(env) - _PIXI_ENV_KEYS):
+        raise bad(f"environment {name!r} has an unknown key {unknown[0]!r}")
+    indexes = env.get("indexes")
+    if indexes is not None and not (isinstance(indexes, list) and all(isinstance(i, str) for i in indexes)):
+        raise bad(f"environment {name!r}: `indexes` must be a list of URLs")
+    per_platform = env.get("packages") or {}
+    if not isinstance(per_platform, dict):
+        raise bad(f"environment {name!r}: `packages` must be a mapping of platforms")
+
+    pypi: dict[str, dict] = {}
+    conda: dict[str, dict] = {}
+    for entry in entries:
+        kinds = [k for k in ("conda", "pypi", "conda_source")[: 3 if version == "7" else 2] if k in (entry or {})]
+        if not isinstance(entry, dict) or len(kinds) != 1 or not isinstance(entry[kinds[0]], str):
+            raise bad("a `packages` entry isn't exactly one of conda, pypi" + (", conda_source" * (version == "7")))
+        if kinds[0] != "pypi":
+            conda[entry[kinds[0]]] = entry
+            continue
+        if unknown := sorted(set(entry) - _PIXI_PYPI_KEYS[version]):
+            raise bad(f"PyPI package {entry['pypi']!r} has an unknown key {unknown[0]!r}")
+        for field_name in ("name", "version", "index", "editable"):
+            if field_name in entry and not isinstance(entry[field_name], str):
+                raise bad(f"PyPI package {entry['pypi']!r}: `{field_name}` isn't a string")
+        if "name" not in entry or (version == "6" and "version" not in entry):
+            raise bad(f"PyPI package {entry['pypi']!r} has no name" + (" or version" * (version == "6")))
+        if entry["pypi"] in pypi:
+            raise bad(f"two PyPI packages at {entry['pypi']!r}")
+        pypi[entry["pypi"]] = entry
+
+    pythons: dict[str, str] = {}  # platform -> the environment's Python there ("3.12")
+    found: dict[tuple[str, str], tuple[Package, set[str]]] = {}
+    skipped: dict[str, Package] = {}  # by name: one row however many builds or versions
+    for platform, selectors in per_platform.items():
+        if version == "7" and platform not in subdirs:
+            raise bad(f"environment {name!r} uses platform {platform!r}, which `platforms` doesn't list")
+        if not isinstance(selectors, list):
+            raise bad(f"environment {name!r}: {platform} must list packages")
+        for s in selectors:
+            kinds = [k for k in ("conda", "pypi", "conda_source") if isinstance(s, dict) and k in s]
+            if len(kinds) != 1 or not isinstance(s[kinds[0]], str) or (kinds[0] == "conda_source" and version != "7"):
+                raise bad(f"environment {name!r}: a {platform} package isn't exactly one of conda, pypi")
+            location = s[kinds[0]]
+            if kinds[0] != "pypi":
+                conda_name, conda_version = _pixi_conda_name(location, s, conda.get(location))
+                if canonicalize_name(conda_name) == "python" and conda_version:
+                    if m := re.match(r"(\d+)\.(\d+)", conda_version):
+                        pythons[platform] = f"{m.group(1)}.{m.group(2)}"
+                pkg = Package(conda_name, conda_version, skip="conda", origin=path.name)
+                skipped.setdefault(pkg.key, pkg)
+                continue
+            if len(s) != 1:  # a PyPI selector is its location alone
+                raise bad(f"environment {name!r}: {platform} PyPI package {location!r} has other keys")
+            entry = pypi.get(location)
+            if entry is None:
+                raise bad(
+                    f"environment {name!r}: {platform} lists PyPI package {location!r}, which isn't in `packages`"
+                )
+            pkg, key = _pixi_pypi_package(entry, list(indexes or []), path.name)
+            if not pkg.skip and indexes is None:
+                raise bad(f"environment {name!r} has PyPI packages but no `indexes`")
+            if key not in found:
+                found[key] = (pkg, set())
+            first, platforms = found[key]
+            platforms.add(platform)
+            if first.files is not None and pkg.files and pkg.files[0] not in first.files:
+                first.files.append(pkg.files[0])
+            if first.registry != pkg.registry:
+                first.skip, first.files = "private index", None  # from two indexes: no single lookup is safe
+
+    # Locked platforms by the markers pip would see there: sys_platform, platform_machine and the environment's
+    # Python. Platforms that share them (linux-64 and a linux-64-cuda with subdir linux-64, say) are one group.
+    groups: dict[tuple[str, str, str], set[str]] = {}
+    # Platforms whose Python isn't known (no conda `python` package, or one built from source), by their markers:
+    # one of them may be the same Python as a group, so a package it installs is never hidden on that machine.
+    unknown_python: dict[tuple[str, str], set[str]] = {}
+    for platform in per_platform:
+        machine = _CONDA_MARKERS.get(subdirs[platform] if platform in subdirs else platform)
+        if machine and platform in pythons:
+            groups.setdefault((*machine, pythons[platform]), set()).add(platform)
+        elif machine:
+            unknown_python.setdefault(machine, set()).add(platform)
+    # A package missing from every platform of a group isn't installed for those markers. Hide it on exactly them;
+    # every other target, such as another Python or a platform the lock doesn't cover, still counts it.
+    for pkg, platforms in found.values():
+        clauses = [
+            f"(sys_platform != '{sys_platform}' or platform_machine != '{machine}' or python_version != '{python}')"
+            for (sys_platform, machine, python), members in groups.items()
+            if not members & platforms and not unknown_python.get((sys_platform, machine), set()) & platforms
+        ]
+        pkg.markers = [" and ".join(clauses)] if clauses else None
+    pkgs = [pkg for pkg, _ in found.values()]
+    return Source(path.name, pkgs + sorted(skipped.values(), key=lambda p: p.key))
+
+
 READERS = {
     "pyproject": parse_pyproject,
     "uv": parse_uv_lock,
@@ -968,6 +1499,7 @@ READERS = {
     "pdm": parse_pdm_lock,
     "pipfile": parse_pipfile_lock,
     "requirements": parse_requirements,
+    "pixi": parse_pixi_lock,
 }
 PARSERS = {
     "uv.lock": "uv",
@@ -975,14 +1507,29 @@ PARSERS = {
     "poetry.lock": "poetry",
     "pdm.lock": "pdm",
     "Pipfile.lock": "pipfile",
+    "pixi.lock": "pixi",
 }
 
 
-def load_file(path: Path) -> Source:
+def load_file(path: Path, environment: str | None = None) -> Source:
+    """Read one input file. `environment` picks a pixi.lock environment (default: `default`)."""
     kind = file_kind(path)
-    source = READERS[kind](path)
+    source = parse_pixi_lock(path, environment) if kind == "pixi" else READERS[kind](path)
     source.path, source.kind = path, kind
+    _check_field_types(path, source)
     return source
+
+
+def _check_field_types(path: Path, source: Source) -> None:
+    """SourceError for a package field of the wrong type (`version = 1`, a list of markers), which would otherwise
+    crash later, far from the file."""
+    for pkg in source.packages:
+        for what, value in (("version", pkg.version), ("index", pkg.registry)):
+            if value is not None and not isinstance(value, str):
+                raise SourceError(f"{path.name}: package {pkg.name} has a {what} that isn't a string")
+        for what, values in (("marker", pkg.markers), ("file name", pkg.files)):
+            if values is not None and not all(isinstance(v, str) for v in values):
+                raise SourceError(f"{path.name}: package {pkg.name} has a {what} that isn't a string")
 
 
 def file_kind(path: Path) -> str:
@@ -1002,12 +1549,15 @@ def file_kind(path: Path) -> str:
         return "requirements"
     raise SourceError(
         f"don't know how to read {path} "
-        "(expected uv.lock, pylock.toml, poetry.lock, pdm.lock, Pipfile.lock, requirements.lock, requirements.txt "
-        "or pyproject.toml)"
+        "(expected uv.lock, pylock.toml, poetry.lock, pdm.lock, Pipfile.lock, pixi.lock, requirements.lock, "
+        "requirements.txt or pyproject.toml)"
     )
 
 
-def find_lockfile(directory: Path) -> Path:
+def find_lockfile(directory: Path, pixi: bool = False) -> Path:
+    """The directory's lockfile, in LOCKFILES order; pixi.lock first with `pixi` (an environment was named)."""
+    if pixi and (directory / "pixi.lock").is_file():
+        return directory / "pixi.lock"
     for name in LOCKFILES:
         candidate = directory / name
         if candidate.is_file():
@@ -1027,20 +1577,27 @@ def _has_project_table(pyproject: Path) -> bool:
         return False
 
 
-def load_inputs(inputs: list[str]) -> list[Source]:
-    """Each input is a file, a directory (lockfile auto-detected) or a requirement like 'numpy==2.3.4'."""
+def load_inputs(inputs: list[str], environment: str | None = None) -> list[Source]:
+    """Each input is a file, a directory (lockfile auto-detected) or a requirement like 'numpy==2.3.4'.
+    `environment` picks the pixi.lock environment; with no pixi.lock input it's an error."""
+    if environment == "":
+        raise SourceError("--environment needs a name")
     sources: list[Source] = []
-    adhoc = Source("command line")
+    adhoc = Source("command line", pypi_only=True)  # names to look up on PyPI
     for item in inputs:
         p = Path(item)
         if p.is_dir():
-            sources.append(load_file(find_lockfile(p)))
+            sources.append(load_file(find_lockfile(p, environment is not None), environment))
+            if sources[-1].kind != "pixi" and (p / "pixi.lock").is_file():
+                sources[-1].passed_over = p / "pixi.lock"
         elif p.is_file():
-            sources.append(load_file(p))
+            sources.append(load_file(p, environment))
         elif "/" in item or item.endswith((".lock", ".txt", ".toml")):
             raise SourceError(f"{item}: no such file")
         else:
             adhoc.packages.append(requirement_to_package(item, "command line"))
     if adhoc.packages:
         sources.append(adhoc)
+    if environment is not None and not any(s.kind == "pixi" for s in sources):
+        raise SourceError("--environment applies to pixi.lock inputs only")
     return sources

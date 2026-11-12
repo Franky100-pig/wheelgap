@@ -1,5 +1,6 @@
-"""A small on-disk cache of pinned index lookups (/<name>/<version>/json), so a repeat run needn't ask again, and of
-what a release's sdist needs to build (--explain's build info).
+"""A small on-disk cache of pinned index lookups (/<name>/<version>/json), so a repeat run needn't ask again,
+of --conda-forge lookups (a version's conda-forge builds, cut down to what matching needs), and of --build-info
+answers (what a release's sdist says about its build).
 
 A cache that can't be read or written is only ever a miss: it never fails a run.
 """
@@ -43,32 +44,30 @@ def cache_dir() -> Path:
     return Path(base) / "wheelgap" / "pinned-v1"
 
 
-def _path(index: str, name: str, version: str, kind: str = "") -> Path:
+def _path(index: str, name: str, version: str) -> Path:
     # Credentials in the index URL (WHEELGAP_INDEX_URL=https://user:token@host/pypi) are left out of the key,
-    # and what's left is hashed, so no URL is written in clear text. `kind` keeps other entries for the same
-    # release (build info) apart from its file list.
+    # and what's left is hashed, so no URL is written in clear text.
     parts = urlsplit(index)
     index = urlunsplit(parts._replace(netloc=parts.netloc.rpartition("@")[2]))
-    key = f"{index}\n{name}\n{version}" + (f"\n{kind}" if kind else "")
-    return cache_dir() / f"{hashlib.sha256(key.encode()).hexdigest()}.json"
+    digest = hashlib.sha256(f"{index}\n{name}\n{version}".encode()).hexdigest()
+    return cache_dir() / f"{digest}.json"
 
 
-def _fresh(index: str, name: str, version: str, kind: str = "") -> dict | None:
-    """The entry if it's an object saved less than MAX_AGE ago, else None (a miss)."""
+def _load(index: str, name: str, version: str, key: str) -> object:
+    """The `key` value of a cache entry, or None: not cached, older than MAX_AGE, or unreadable."""
     try:
-        entry = json.loads(_path(index, name, version, kind).read_text(encoding="utf-8"))
+        entry = json.loads(_path(index, name, version).read_text(encoding="utf-8"))
         saved = entry["saved"]
         if isinstance(saved, bool) or not isinstance(saved, int | float) or not 0 <= _now() - saved < MAX_AGE:
             return None
-        return entry
+        return entry[key]
     except Exception:  # missing, corrupt or unreadable: a miss
         return None
 
 
 def load_files(index: str, name: str, version: str) -> list[dict] | None:
     """The cached file list of a pinned release, or None: not cached, older than MAX_AGE, or unreadable."""
-    entry = _fresh(index, name, version)
-    files = entry.get("files") if entry else None
+    files = _load(index, name, version, "files")
     if isinstance(files, list) and all(isinstance(f, dict) and isinstance(f.get("filename"), str) for f in files):
         return files
     return None
@@ -78,9 +77,54 @@ def save_files(index: str, name: str, version: str, files: list[dict]) -> None:
     """Store a pinned release's file list. Only `filename` and `yanked` are kept: they're all fill() reads,
     and a file's URL (which a private mirror may sign) never reaches the disk."""
     kept = [{k: f[k] for k in ("filename", "yanked") if k in f} for f in files]
-    _save(index, name, version, "", {"files": kept})
+    _save(index, name, version, "files", kept)
 
 
+# --conda-forge entries: keyed apart from PyPI's, and versioned, since what's kept may change.
+CONDA_FORGE_KEY = "condaforge-v3 https://api.anaconda.org/package/conda-forge"
+TOO_LARGE = "too large"  # the answer was over condaforge.MAX_BYTES
+
+
+def _str_or_none(value: object) -> bool:
+    return value is None or isinstance(value, str)
+
+
+def _strings(value: object) -> bool:
+    return isinstance(value, list) and all(isinstance(x, str) for x in value)
+
+
+def _is_build(b: object) -> bool:
+    """A condaforge.Build, as condaforge._build makes it."""
+    return (
+        isinstance(b, dict)
+        and set(b) == {"subdir", "abi", "python", "os", "glibc", "osx", "unknown"}
+        and isinstance(b["subdir"], str)
+        and _str_or_none(b["abi"])
+        and (b["python"] is None or _strings(b["python"]))
+        and _strings(b["os"])
+        and _str_or_none(b["glibc"])
+        and _str_or_none(b["osx"])
+        and isinstance(b["unknown"], bool)
+    )
+
+
+def load_builds(name: str, version: str) -> list[dict] | str | None:
+    """--conda-forge: the cached builds of a version ([] for none), TOO_LARGE, or None: not cached, older than
+    MAX_AGE, or unreadable."""
+    builds = _load(CONDA_FORGE_KEY, name, version, "builds")
+    if builds == TOO_LARGE:
+        return TOO_LARGE
+    if isinstance(builds, list) and all(_is_build(b) for b in builds):
+        return builds
+    return None
+
+
+def save_builds(name: str, version: str, builds: list[dict] | str) -> None:
+    _save(CONDA_FORGE_KEY, name, version, "builds", builds)
+
+
+# --build-info entries: keyed apart from the file lists of the same release, and by the sdist's sha256 as a lock gives
+# it ("" when the index gives the URL), so one lockfile can't answer for another's copy of a release.
 _BUILD_FIELDS: dict[str, type | tuple[type, ...]] = {
     "requires": list,
     "backend": (str, type(None)),
@@ -89,16 +133,15 @@ _BUILD_FIELDS: dict[str, type | tuple[type, ...]] = {
 }
 
 
-def _build_kind(sha256: str) -> str:
-    return f"build:{sha256}" if sha256 else "build"
+def _build_key(index: str, sha256: str) -> str:
+    return f"build-v1 {sha256} {index}"
 
 
 def load_build(index: str, name: str, version: str, sha256: str) -> dict | None:
     """A release's cached build info: {"answer": None} when its sdist gives no answer, else {"answer": {"requires",
-    "backend", "backend_path", "build_script"}} (see build.py). None for a miss. `sha256` is the sdist's, as a lock
-    gives it, or "" when the index gives the URL."""
-    entry = _fresh(index, name, version, _build_kind(sha256))
-    if entry is None or "answer" not in entry:
+    "backend", "backend_path", "build_script"}} (see build.py). None for a miss."""
+    entry = _load(_build_key(index, sha256), name, version, "build")
+    if not isinstance(entry, dict) or set(entry) != {"answer"}:
         return None
     answer = entry["answer"]
     if answer is None:
@@ -115,19 +158,19 @@ def load_build(index: str, name: str, version: str, sha256: str) -> dict | None:
 
 def save_build(index: str, name: str, version: str, sha256: str, answer: dict | None) -> None:
     """Store what a release's sdist says about its build, or None when it gives no answer for good."""
-    _save(index, name, version, _build_kind(sha256), {"answer": answer})
+    _save(_build_key(index, sha256), name, version, "build", {"answer": answer})
 
 
-def _save(index: str, name: str, version: str, kind: str, data: dict) -> None:
+def _save(index: str, name: str, version: str, key: str, value: object) -> None:
     try:
-        path = _path(index, name, version, kind)
+        path = _path(index, name, version)
         path.parent.parent.mkdir(mode=0o700, parents=True, exist_ok=True)  # private to the user (not on Windows)
         path.parent.mkdir(mode=0o700, exist_ok=True)
         # Written next to the target, then renamed over it, so a reader never sees half a file.
         fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-", suffix=".json")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump({"saved": _now(), **data}, f)
+                json.dump({"saved": _now(), key: value}, f)
             os.utime(tmp, (_now(), _now()))  # prune() reads the age from the mtime
             os.replace(tmp, path)
         except BaseException:

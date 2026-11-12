@@ -1,6 +1,6 @@
 """--explain --build-info: what a `source` build needs, from the [build-system] table of the sdist's pyproject.toml.
 
-Only sdists of releases that positively come from PyPI (or the WHEELGAP_INDEX_URL mirror) are read, the file is
+Only sdists of releases that positively come from PyPI (origin.known_pypi) are read, the file is
 the one pip would read (see pypi.fetch_sdist_pyproject), and where any of that is in doubt there is no answer.
 What is said is what the requirements prove: a requirement wheelgap doesn't map is shown by name, and "no compiler"
 only follows from a backend that can't run one.
@@ -20,9 +20,9 @@ from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import InvalidSdistFilename, canonicalize_name, parse_sdist_filename
 from packaging.version import Version
 
-from . import cache, pypi
+from . import cache, origin, pypi
 from .check import marker_holds
-from .sources import Package
+from .sources import Package, Source
 from .targets import Target
 
 RUST = "a Rust toolchain"
@@ -164,33 +164,29 @@ def _sdist(pkg: Package) -> str | None:
     return sdists[0]
 
 
-def _lock_url_host_ok(url: str) -> bool:
-    """A lock's sdist URL is fetched only from PyPI's file host, or the WHEELGAP_INDEX_URL mirror's host when one is
-    set: a lockfile doesn't get to choose where wheelgap connects to. PyPI never reuses a filename, so there the
-    name is the file."""
+def _on_pypi_files(url: str) -> bool:
+    """A lock's sdist URL is fetched only from PyPI's file host: a lockfile doesn't get to choose where wheelgap
+    connects to. PyPI never reuses a filename, so there the filename is the file."""
     parts = urlsplit(url)
-    hosts = {PYPI_FILES}
-    if pypi.index_url() != pypi.DEFAULT_INDEX:
-        hosts.add(urlsplit(pypi.index_url()).hostname or "")
-    return parts.scheme == "https" and parts.hostname in hosts and parts.port in (None, 443)
+    return parts.scheme == "https" and parts.hostname == PYPI_FILES and parts.port in (None, 443)
 
 
-def where(pkg: Package) -> tuple[Release, str | None] | None:
-    """(release, sdist URL) for a release whose sdist positively comes from PyPI or the WHEELGAP_INDEX_URL mirror,
-    or None. The URL is the lock's own (uv.lock, pylock.toml, from PyPI's file host), or None to ask the JSON API
-    the package was looked up on this run because the input listed no files for it. Anything else (a pdm.lock or
-    pylock.toml entry without an index, a private index, a direct URL) isn't looked up: its name may be private, and a
-    namesake on PyPI is another package."""
+def where(pkg: Package, source: Source, simple_index: str | None = None) -> tuple[Release, str | None] | None:
+    """(release, sdist URL) for a release whose sdist wheelgap may read, or None.
+
+    The package must be positively PyPI's (origin.known_pypi, the rule --conda-forge follows too): never a pdm.lock or
+    poetry.lock entry, a pylock.toml entry without an index, a private index or a direct URL, whose names may be
+    private and whose PyPI namesakes are other packages; and nothing in a run with --index-url or WHEELGAP_INDEX_URL.
+    Then the URL is the lock's own (uv.lock, pylock.toml), if it's on PyPI's file host and names this release's sdist,
+    or None to ask PyPI's JSON API for it."""
     sdist = _sdist(pkg)
-    if sdist is None or not pkg.version:
+    if sdist is None or not pkg.version or not origin.known_pypi(pkg, source, simple_index=simple_index):
         return None
-    if pkg.sdist_url and isinstance(pkg.registry, str) and pypi.may_look_up(pkg.registry):
-        if unquote(posixpath.basename(urlsplit(pkg.sdist_url).path)) != sdist or not _lock_url_host_ok(pkg.sdist_url):
+    if pkg.sdist_url and isinstance(pkg.registry, str):  # known_pypi says that registry is PyPI's
+        if unquote(posixpath.basename(urlsplit(pkg.sdist_url).path)) != sdist or not _on_pypi_files(pkg.sdist_url):
             return None
         return (pkg.registry.rstrip("/"), pkg.key, pkg.version, pkg.sdist_sha256 or ""), pkg.sdist_url
-    if pkg.looked_up_on is not None and pkg.looked_up_on == pypi.index_url():
-        return (pkg.looked_up_on, pkg.key, pkg.version, ""), None
-    return None
+    return (pypi.index_url(), pkg.key, pkg.version, ""), None
 
 
 class _Phase:
@@ -222,10 +218,17 @@ def _locate(release: Release, sdist: str, phase: _Phase) -> tuple[str | None, st
     return entry["url"], sha256 if isinstance(sha256, str) else None
 
 
-def lookup(pkg: Package, phase: _Phase, read_cache: bool = False, write_cache: bool = False) -> BuildInfo | None:
+def lookup(
+    pkg: Package,
+    source: Source,
+    phase: _Phase,
+    read_cache: bool = False,
+    write_cache: bool = False,
+    simple_index: str | None = None,
+) -> BuildInfo | None:
     """A release's build info, or None. Only an answer from a download that matched its sha256 is cached (a lock's
     URL with no sha256 never is); a network failure stops the lookups still to come."""
-    found, sdist = where(pkg), _sdist(pkg)
+    found, sdist = where(pkg, source, simple_index), _sdist(pkg)
     if found is None or sdist is None:
         return None
     release, url = found
@@ -262,27 +265,31 @@ def lookup(pkg: Package, phase: _Phase, read_cache: bool = False, write_cache: b
     return _info(answer)
 
 
-def release_of(pkg: Package) -> Release | None:
-    found = where(pkg)
-    return found[0] if found else None
-
-
 def lookup_all(
-    packages: list[Package], read_cache: bool = False, write_cache: bool = False
-) -> tuple[dict[Release, BuildInfo], str | None]:
-    """Build info by release (see where), one lookup per release however many targets or inputs list it, at most
-    WORKERS at a time and DEADLINE seconds in all. Also returns a note when the lookups stopped early, else None."""
-    todo: dict[Release, Package] = {}
-    for p in packages:
-        if (release := release_of(p)) is not None:
-            todo.setdefault(release, p)
+    packages: list[tuple[Package, Source]],
+    read_cache: bool = False,
+    write_cache: bool = False,
+    simple_index: str | None = None,
+) -> tuple[dict[int, BuildInfo], str | None]:
+    """Build info by id() of each (package, the source it was read from), one lookup per release (see where)
+    however many targets or inputs list it, at most WORKERS at a time and DEADLINE seconds in all. Also returns a
+    note when the lookups stopped early, else None."""
+    todo: dict[Release, tuple[Package, Source]] = {}
+    release_of: dict[int, Release] = {}
+    for p, s in packages:
+        if (found := where(p, s, simple_index)) is not None:
+            release_of[id(p)] = found[0]
+            todo.setdefault(found[0], (p, s))
     start = pypi._clock()
     phase = _Phase(start + DEADLINE)
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        infos = list(pool.map(lambda p: lookup(p, phase, read_cache, write_cache), todo.values()))
-    found = {release: info for release, info in zip(todo, infos, strict=True) if info is not None}
+        infos = list(
+            pool.map(lambda ps: lookup(ps[0], ps[1], phase, read_cache, write_cache, simple_index), todo.values())
+        )
+    by_release = {release: info for release, info in zip(todo, infos, strict=True) if info is not None}
+    found_infos = {key: by_release[r] for key, r in release_of.items() if r in by_release}
     if phase.stopped is None:
-        return found, None
+        return found_infos, None
     why = f"after {pypi._clock() - start:.0f} s" if phase.stopped == "time" else "after a connection failure"
     n = phase.not_read
-    return found, f"build info: stopped {why}; {n} package{'s' * (n != 1)} not read"
+    return found_infos, f"build info: stopped {why}; {n} package{'s' * (n != 1)} not read"
