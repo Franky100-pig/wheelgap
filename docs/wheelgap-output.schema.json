@@ -153,6 +153,24 @@
                     "items": {"type": "string"},
                     "description": "Present with --explain --build-info: the [build-system] requires of the release's sdist, normalized (name, extras, version range) and limited to those whose marker holds on a target in rejected that is source; null when there is no source build or no answer (the sdist isn't positively from PyPI, couldn't be read, or pip could read another pyproject.toml from it)."
                 },
+                "notes": {
+                    "type": "array",
+                    "description": "Present with --explain: the coverage tracker's notes (https://github.com/wheelgap/tracker/blob/main/notes/README.md) that apply to this package's gaps, each with the gap targets it covers. Only looked up with --notes (or notes = true), for packages that are positively from PyPI, and never with --offline, --index-url or a WHEELGAP_INDEX_URL mirror. Empty without --notes, when there are none, or when the lookup failed. Treat text as untrusted plain text.",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["platforms", "kind", "text", "links", "versions", "updated", "targets"],
+                        "properties": {
+                            "platforms": {"type": "array", "items": {"type": "string"}, "description": "Platforms the note is about, or [\"all\"]: the nine platforms the tracker scans."},
+                            "kind": {"type": "string", "description": "workaround, alternative, upstream-issue or other-source."},
+                            "text": {"type": "string", "description": "One line of plain text; backticks mark commands and names."},
+                            "links": {"type": "array", "items": {"type": "string"}, "description": "https:// URLs that back the note."},
+                            "versions": {"type": ["string", "null"], "description": "The releases the note is about (a version specifier), or null for all."},
+                            "updated": {"type": "string", "description": "When the note was last checked (YYYY-MM-DD)."},
+                            "targets": {"type": "array", "items": {"type": "string"}, "description": "The labels of this package's gap targets the note covers."}
+                        }
+                    }
+                },
                 "conda_forge": {
                     "description": "Present with --explain --conda-forge, in versions after 0.9.0, when conda-forge has a package with exactly this package's canonical name and a build of this version that fits at least one of the targets in rejected: on the main label and not marked broken, for the target's conda subdir or noarch, and for its Python version and ABI (free-threaded or not). A hint only: it doesn't change results, summary or the exit code, and the conda package may be another project. Left out when nothing fits, the package's index isn't known to be PyPI (its name isn't sent), or the lookup failed (a note on stderr says so).",
                     "type": "object",

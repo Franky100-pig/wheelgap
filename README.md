@@ -137,6 +137,16 @@ armlib 1.4.0 on musl-aarch64: ● source
 
 For `uv.lock` inputs, and `poetry.lock` files older than lock-version 2.1 (which wheelgap reads as a dependency graph), `--explain` also shows why the package is installed at all: the shortest dependency path from your project (or from a dependency group, shown as `(dev group)`) to the gap package. With extra/group selection it's a path the selection installs it through, not always the shortest. Paths are worked out per target, since markers can pull a package in on one platform only. With `--json --explain`, each package gets a matching `via` object keyed by target, like `rejected`: `"via": {"win-arm64": ["myapp", "uvicorn", "uvloop"]}`. Other inputs have no dependency graph, so they show no path (and `"via": {}`).
 
+With `--notes` (or `notes = true` in `[tool.wheelgap]`), `--explain` also shows the [coverage tracker](https://wheelgap.github.io/tracker/)'s [notes](https://github.com/wheelgap/tracker/blob/main/notes/README.md) for a package with a gap: what the scan can't know, such as a binary package to use instead, a system library to install first, or an upstream issue to follow. It's opt-in because it sends package names to wheelgap.github.io, and `--explain` on a lockfile otherwise makes no requests; when it would have something to look up, `--explain` says so in one dim line on stderr (not with `-q`). A note is shown once per package, under its explanation, with the gap platforms it covers and its links:
+
+```
+psycopg2 2.9.10: note from the wheelgap tracker for linux-x86_64 (alternative, checked 2026-11-11)
+  - psycopg2 has wheels for Windows x86-64 only. psycopg2-binary has wheels for these platforms (not for free-threaded Python): `pip install psycopg2-binary`. …
+    https://www.psycopg.org/docs/install.html#psycopg-vs-psycopg-binary
+```
+
+`--notes` needs `--explain`. Only notes for a platform with a gap are shown; a note for `all` platforms covers the nine the tracker scans (`linux-x86_64`, `linux-aarch64`, `musl-x86_64`, `musl-aarch64`, `macos-x86_64`, `macos-arm64`, `win-amd64`, `win-arm64` and `pyodide`), not other targets. The tracker checks the latest release, so a note limited to some releases (its `versions`) is shown only when your version is a plain release that matches them. With `--json --explain`, each package gets a `notes` list (empty without `--notes` or when there are none), each note with the tracker's `platforms`, `kind`, `text`, `links`, `versions` and `updated`, plus the `targets` (labels, like `rejected`'s keys) it covers. `--markdown` puts them in the collapsed section with the rejected wheels, as plain text. Notes come from a public repository, so treat their text as plain text, not markup. wheelgap shows only notes in the tracker's published format, as strictly as the tracker's own checker reads it, and drops any whose text or links could pass for a GitHub Actions workflow command (`##[`, or a word starting with `::`). **`--notes` sends the names of packages with gaps to wheelgap.github.io** (one small file per package, cached for 24 hours), and only for the names `--conda-forge` may send: the same rule (described under `--conda-forge` below), with one narrowing, that a registry or index of `https://pypi.org/simple` counts only from `uv.lock` and `pylock.toml`. So never `pdm.lock`, `poetry.lock` or `pixi.lock` entries, `pylock.toml` entries without an index, packages from another index, or git, path or URL packages, and not a found-on-pypi.org name whose input, folder configs or environment point pip or uv at another index. Nothing at all is sent with `--offline` (or `offline = true`), `--index-url` (or `index-url`), or `WHEELGAP_INDEX_URL` set to a mirror; `--notes` then says on stderr that notes are off. `--no-notes` overrides `notes = true` for one run. Each request gets one try with a 10-second timeout, all of them together get 15 seconds, and the first connection failure stops the rest, so a runner without internet access isn't held up: wheelgap then says on stderr that it couldn't reach wheelgap.github.io, or that it didn't answer in time, so notes may be missing (not with `-q`). A note that can't be fetched, or a package the tracker doesn't list, adds nothing, and the exit status never depends on notes.
+
 The shape of `--json` output is described by [`docs/wheelgap-output.schema.json`](https://github.com/wheelgap/wheelgap/blob/main/docs/wheelgap-output.schema.json). It matches the wheelgap version it ships with, and later versions may add keys. In `--json` output, `results`, `rejected` and `via` are all keyed by target label: just the platform (`"linux-x86_64"`) when one Python is checked, or Python and platform (`"3.13 linux-x86_64"`) with several. The top-level `targets` list gives each target's `label`, `python` and `platform`, so a script can look the key up instead of building it:
 
 ```python
@@ -226,16 +236,26 @@ unless `--only-group` is given;
 project extras are included only when requested. `--no-dev` removes `dev`, while `--only-group`
 excludes project dependencies and default groups. Combine `--only-group` with `--group` to add more
 groups, but not with `--extra`/`--all-extras`. An explicit `dev` group conflicts with `--no-dev`.
-Unknown extra/group names are errors. Command-line selectors need a `uv.lock` input, or for groups a Poetry 2.x
-`poetry.lock` or a `pdm.lock`, or for `--extra`/`--all-extras` a `pyproject.toml` (see below); configured `groups`
-apply to `uv.lock`, Poetry 2.x `poetry.lock` and `pdm.lock` inputs, and configured `extras` only to `uv.lock` inputs.
+Unknown extra/group names are errors. Command-line selectors need a `uv.lock` or Poetry 2.x `poetry.lock` input, or
+for groups a `pdm.lock`, or for `--extra`/`--all-extras` a `pyproject.toml` (see below); configured `groups` apply to
+`uv.lock`, Poetry 2.x `poetry.lock` and `pdm.lock` inputs, and configured `extras` to `uv.lock` and Poetry 2.x
+`poetry.lock` inputs.
 
-`poetry.lock` (Poetry 2.x) inputs accept `--group`, `--only-group` and `--no-dev` with Poetry's meanings, and
-configured `groups` apply to them too. `main` and every group not marked `optional = true` in
-`pyproject.toml` count; `--group` adds a group (like `poetry install --with`), `--no-dev` leaves out `dev`,
-and `--only-group` checks only the named groups (`main` only if named). A package counts if any of its groups is
-selected, with the markers of those groups. `--extra` isn't supported for `poetry.lock` yet, and a command-line
-selection on a Poetry 1.x lock (no per-package groups) is an error; configured `groups` leave a 1.x lock unfiltered.
+`poetry.lock` (Poetry 2.x) inputs accept every selector with Poetry's meanings, and configured `extras` and `groups`
+apply to them too. `main` and every group not marked `optional = true` in `pyproject.toml` count; `--group` adds a
+group (like `poetry install --with`), `--no-dev` leaves out `dev`, and `--only-group` checks only the named groups
+(`main` only if named). A package counts if any of its groups is selected, with the markers of those groups.
+`--extra NAME` and `--all-extras` work like `poetry install --extras NAME` and `--all-extras`, as Poetry 2.3 and
+later install with default settings: once any selector is used, a package whose lock markers are only extra
+comparisons (`extra == "s3"`) counts only if one of those extras is selected, and an extra that isn't in the lock's
+`[extras]` table is an error. Unlike `uv.lock`, `--only-group` combines with `--extra` here, as in
+`poetry install --only main --extras api`. Poetry 2.0-2.2 (and later versions with `installer.re-resolve`) can
+install more than the lock's markers say, so wheelgap checks a superset of what any Poetry 2.x installs where the lock
+alone can't tell: a package whose markers combine an extra with other conditions (`sys_platform == "win32" or
+extra == "a"`) is checked as if any extra might be selected, and when there's no `pyproject.toml` beside the lock, or
+it declares a name from an extra somewhere else too (in the dependencies, a group, or another extra with a marker) or
+has a requirement wheelgap can't read, extras leave no package out of the lock. A note says when either happens. A command-line selection on a Poetry
+1.x lock (no per-package groups) is an error; a configured selection leaves a 1.x lock unfiltered.
 
 `pdm.lock` inputs take the same selectors with PDM's meanings, and configured `groups` apply to them too. Every
 group the lock was made for (its `[metadata] groups`: `default`, the dev groups and any optional-dependencies groups
@@ -243,7 +263,8 @@ locked with `pdm lock -G`) counts, as with a plain `pdm install`; `--no-dev` lea
 `pdm install --without dev`), and `--only-group` checks only the named groups (`default` only if named), so PDM's
 `--prod` is `--only-group default` here. `--group` only checks that the group is locked, since it already counts. A
 group that's in `pyproject.toml` but not in the lock is an error (lock it with `pdm lock -G <name>`), as in PDM. A
-package counts if any of its groups is selected. `--extra` isn't supported for `pdm.lock`, and a command-line
+package counts if any of its groups is selected. `--extra` isn't supported for `pdm.lock` (PDM installs
+optional-dependencies as groups, with `pdm install -G NAME`, and they count once locked), and a command-line
 selection on a lock without package groups (one locked without the `inherit_metadata` strategy) is an error;
 configured `groups` leave such a lock unfiltered.
 
@@ -265,8 +286,9 @@ including local workspace dependencies, rather than enabling every extra of ever
 Unresolved marker conditions (including uv's synthetic conflict markers and unknown OS releases)
 remain conservative: wheelgap can still report a possible gap rather than silently hide one.
 Selection itself needs no network. Index refreshes (`--online`, or a target outside the lockfile's
-`requires-python`) only look up packages in the selected graph. Configured `extras` only apply to `uv.lock` inputs, and configured `groups` to `uv.lock`, Poetry 2.x
-`poetry.lock` and `pdm.lock` inputs; other inputs are checked as usual.
+`requires-python`) only look up packages in the selected graph. Configured `extras` only apply to `uv.lock` and
+Poetry 2.x `poetry.lock` inputs, and configured `groups` to those and `pdm.lock` inputs; other inputs are checked as
+usual.
 
 ### Check a library's direct dependencies
 
@@ -384,6 +406,35 @@ Each package with a gap is also marked on its own line of the lockfile in the pu
 
 To watch a platform before you support it, such as Windows on ARM, make it advisory: `-t linux-x86_64,win-arm64 --advisory win-arm64` (or `advisory = ["win-arm64"]` in `[tool.wheelgap]`). Its gaps are reported as usual but never fail the run: the column is headed `win-arm64 (advisory)` in the table and the Markdown report, the summary includes a line like `3 gaps in 2 packages on advisory targets linux-aarch64, win-arm64 don't fail the run.` (it counts each package once per advisory target, while the line above it counts packages), and `--json` lists the advisory target labels under `advisory`, while `packages`, `summary.with_gaps` and `summary.per_target` still count those gaps. Advisory works per platform, so it marks every Python checked on that platform (`"3.13 win-arm64"` and `"3.14t win-arm64"`): a free-threaded `3.14t` can't be made advisory on its own. `--advisory` takes anything `-t` does (aliases like `windows-arm64`, Docker names like `linux/arm64`), repeated or comma-separated, and replaces the configured list (`--advisory ""` clears it for one run). It only marks targets, so a target must also be checked: an `--advisory` target that isn't is an error (exit 2), while a configured one that a run doesn't check (`-t linux`, a `--dockerfile` image) gets a note on stderr. A group (`all`, `everything`, `mobile`) means whichever of its targets the run checks, so `--advisory all` makes every checked target advisory, and it's an error only when the run checks none of them. When every checked target is advisory, the run can't fail, not even when a lookup fails during an index outage, so a note on stderr says so (`-q` hides it). With `--fail-on missing`, a source build on a required target still passes and a missing package on one still fails, whatever the advisory targets show. An `--ignore NAME:TARGET` gap on an advisory target stays ignored and isn't counted as an advisory gap. In `--junit` reports an advisory gap is a skipped testcase with the message `advisory: source` (or `missing`, `unknown`), not a failure, so dashboards that mark a build unstable on failed tests don't. In the Action, put `--advisory` in `args`: the summary page shows the same marking. `wheelgap diff` has no `--advisory` yet.
 
+**Only fail when a pull request makes things worse** (after 0.9.0: until the next release, use `wheelgap/wheelgap@main`). With `compare-to: base`, the Action runs `wheelgap diff` between the lockfile on the pull request's base commit and the one in the checkout, so it fails only when a dependency bump (from Dependabot, Renovate or a person) loses a wheel or adds a package with a gap, not on gaps you already have:
+
+```yaml
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write  # only for comment: true
+jobs:
+  wheels:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: wheelgap/wheelgap@v0.9.0
+        with:
+          args: uv.lock -p 3.13 -t linux-x86_64,linux-aarch64,musl-aarch64
+          compare-to: base
+          comment: true
+```
+
+- `args` must then start with the lockfile's path, followed only by `-p` and `-t` (what `wheelgap diff` takes); anything else exits 2. The step exits 1 when something got worse and 0 when nothing did, but only when `wheelgap diff`'s exit code and its report agree; anything else, such as bad input or a run that printed no report, exits 2.
+- The lockfile must exist on both sides: one the pull request adds exits 2. A requirements file that includes others with `-r` or `-c` exits 2 too, because only the lockfile itself (and the `pyproject.toml` beside it) is read from git.
+- `compare-to: base` needs a `pull_request` event and the commit `actions/checkout` checks out for it by default: the merge of the pull request into its base branch. It compares with that merge commit's first parent, the base branch the pull request is merged onto, and fetches it if the checkout is shallow (the default; in a private repository with `persist-credentials: false`, check out with `fetch-depth: 0` instead). Any other event, or a checkout of anything but that merge commit (`GITHUB_SHA`), such as the pull request's head commit, exits 2; then give a git ref instead, such as `compare-to: origin/main` (fetch it first), or the merge base of the two.
+- The report goes to the job summary: a table of each package and target that got worse (`armlib 1.4.0 → 1.5.0`, `musl-aarch64`, `✓ → ● source`) and each new package's gaps. The action's `report` output is the path of the same Markdown file. wheelgap's own messages go to the log with anything the runner would read as a [workflow command](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands) defused, since they can quote the lockfile.
+- With `comment: true`, it also posts the table as a pull request comment when something got worse, and edits that one comment on every later run, whatever the result: to say nothing got worse, or that the check couldn't run and why (including when the checkout isn't the merge commit or the base commit can't be fetched). The comment names the commit it checked, so a run that finishes out of order shows. A hidden marker naming the lockfile finds the comment, so two lockfiles get two comments, and only a comment by the token's own identity is edited: `github-actions[bot]` for the default token, or a personal token's user. For a GitHub App's token, set `comment-author` to the app's login (such as `my-app[bot]`); without it, each run that finds something worse posts a new comment and leaves the older ones as they were. The token is only sent to the `https://` host in `GITHUB_SERVER_URL` (GitHub Enterprise Server included); if that isn't an `https://` URL, no comment is posted and the step warns. Package names and versions come from the pull request, so they're escaped and can't add links, @mentions or Markdown to the comment.
+- **Permissions.** Commenting needs `pull-requests: write` for the token (`github-token`, by default the workflow's `GITHUB_TOKEN`). Under `pull_request`, pull requests from forks get a read-only token (unless a private repository's settings send write tokens to them), and Dependabot's pull requests get one by default too, unless the workflow's `permissions:` asks for more as above. When the comment can't be posted, the step warns (naming the missing permission on HTTP 403) and the job summary still has the report; the result is the same either way. So for Dependabot and fork pull requests, the summary-only setup (`comment: false`, the default, with `contents: read`) is enough.
+- **Don't read the pull request's lockfile in a workflow that has a write token or secrets.** `pull_request_target` and `workflow_run` run the base branch's workflow with them, so a pull request's files there must be treated as hostile: checking out and running its code hands it the token, and even reading its lockfile can pull other files' contents into the output, through a `-r` include or a symlink. So `comment: true` is refused on those events, and `compare-to: base` needs `pull_request`.
+
 Outside the Action, `--markdown` prints the same report as Markdown, for a job summary (`wheelgap --markdown >> "$GITHUB_STEP_SUMMARY"`) or a PR comment. With `--explain`, the rejected wheels go in a collapsed section. `--junit PATH` also writes a JUnit XML file (one testsuite per target) that GitLab, Jenkins, Azure Pipelines and CircleCI can show as a test report, alongside whatever output mode you use.
 
 ### With pre-commit
@@ -486,7 +537,7 @@ Contributing to wheelgap with an agent? See [AGENTS.md](https://github.com/wheel
 - **Environment markers are respected.** A `pywin32 ; sys_platform == 'win32'` dependency won't show up as a Linux gap. For `uv.lock` the dependency graph is walked per target, so transitive platform-specific packages are handled too. On `win32`, `linux-i686`, `musl-i686`, `linux-armv7l` and `musl-armv7l` a `platform_machine` comparison counts as unknown, so the package is still checked. `platform_machine` reports the machine, not the Python: 32-bit Python on 64-bit Windows says `AMD64`, a `linux/386` container on an x86_64 host says `x86_64`, and 32-bit Raspberry Pi OS on a Pi 4 or 5 (which boots a 64-bit kernel) or a `linux/arm/v7` container on an arm64 host can say `aarch64`.
 - `--online` re-checks lockfile packages against PyPI. Packages the lock says came from another index keep their locked files, so their names are never sent to PyPI. Use it when a project has uploaded new wheels for an existing version since you locked, or if your `uv.lock` was generated with `environments` restrictions. A `uv.lock` or `pylock.toml` whose `requires-python` leaves out a target's Python (say `==3.13.*`, checked with `-p 3.14t`) may be missing wheels for it, because uv only keeps the wheels that can serve `requires-python`. Without `--online`, wheelgap then also looks up its PyPI packages on the index, keeps the lock's own files if a lookup fails, and prints a note (with `-q`, only when some packages couldn't be re-checked).
 - `--offline` never contacts an index, for CI and coding agents without network. Inputs that need a lookup (requirements files, `pyproject.toml`, `Pipfile.lock`, package names, lockfile entries with no file list) make it exit 2 with an error naming the packages, so use a lockfile instead. A `--pyodide-lock` URL is refused too: pass a downloaded copy. The `requires-python` re-check above is skipped, with a note that those Pythons may show false gaps. It can't be combined with `--online`. Set `offline = true` in `[tool.wheelgap]` to make it the project default; `--online` on the command line overrides it for one run.
-- **Cache:** lookups of a pinned version (`name==1.2.3`) are saved for 24 hours, so a repeat run needn't ask PyPI again. They're kept in `wheelgap/pinned-v1` inside `~/.cache` on Linux (or `$XDG_CACHE_HOME`), `~/Library/Caches` on macOS and `%LOCALAPPDATA%` on Windows. Each entry holds only the release's file names and yanked flags (or, for `--build-info`, its sdist's `[build-system]` table), named by a hash of the index URL (without any credentials in it), the package and the version; on Linux and macOS, wheelgap creates the folder and its entries readable by you only. `--online` always asks the index again and saves the fresh answer, so later runs use it; `--no-cache` neither reads nor saves the cache for one run. Entries older than 24 hours are deleted, at most once a day, and `wheelgap --clear-cache` deletes all of them (add inputs to check them right after). Both touch only wheelgap's own entry files, and never follow a link. `--conda-forge` answers are kept the same way, cut down to the subdir, Python, ABI and virtual-package needs of each build of the checked version. Unpinned names, version ranges and `--index-url` lookups aren't cached, and neither are lookups from the Python API.
+- **Cache:** lookups of a pinned version (`name==1.2.3`) are saved for 24 hours, so a repeat run needn't ask PyPI again. They're kept in `wheelgap/pinned-v1` inside `~/.cache` on Linux (or `$XDG_CACHE_HOME`), `~/Library/Caches` on macOS and `%LOCALAPPDATA%` on Windows. Each entry holds only the release's file names and yanked flags (or, for `--build-info`, its sdist's `[build-system]` table), named by a hash of the index URL (without any credentials in it), the package and the version; on Linux and macOS, wheelgap creates the folder and its entries readable by you only. `--online` always asks the index again and saves the fresh answer, so later runs use it; `--no-cache` neither reads nor saves the cache for one run. Entries older than 24 hours are deleted, at most once a day, and `wheelgap --clear-cache` deletes all of them (add inputs to check them right after). Both touch only wheelgap's own entry files, and never follow a link. `--conda-forge` answers are kept the same way, cut down to the subdir, Python, ABI and virtual-package needs of each build of the checked version. Unpinned names, version ranges and `--index-url` lookups aren't cached, and neither are lookups from the Python API. `--notes` lookups are cached in the same folder for 24 hours, a package the tracker doesn't list included, and follow `--no-cache` and `--online` too.
 - **Private indexes:** `--index-url URL` (or `index-url` in `[tool.wheelgap]`) sends the PyPI lookups described above to a simple index that serves the JSON form (PEP 691) instead. The URL must be https (plain http only for localhost). Credentials can go in the URL passed to `--index-url` (`https://user:token@host/simple`) and never appear in output; in CI, `--index-url "$PRIVATE_INDEX"` keeps them out of your repo. They're refused in `[tool.wheelgap]`, since `pyproject.toml` is committed. An index that only serves HTML (PEP 503) gets a clear error.
 
 ## Why this exists
