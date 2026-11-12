@@ -395,8 +395,9 @@ def may_look_up(registry: str | None, simple_index: str | None = None) -> bool:
 
 
 def keeps_locked_files(p: Package) -> bool:
-    """Under --online, a package from another index keeps the files in the lock: PyPI doesn't know it."""
-    return not p.skip and p.files is not None and not is_pypi(p.registry)
+    """Under --online, a package from another index keeps the files in the lock: PyPI doesn't know it. Never one with
+    partial_files (pixi.lock), whose locked files can't answer most targets: it's looked up or skipped instead."""
+    return not p.skip and p.files is not None and not p.partial_files and not is_pypi(p.registry)
 
 
 def recheck_lock(
@@ -449,7 +450,8 @@ def fill_all(
 ) -> int:
     """Look packages up on PyPI. A package the lock says came from another index is never looked up: PyPI doesn't
     know it. With refresh (--online) it keeps its locked files; with no files (an old poetry.lock, a Pipfile.lock)
-    it is skipped as a private index, unless WHEELGAP_INDEX_URL is that same index (see may_look_up).
+    it is skipped as a private index, unless WHEELGAP_INDEX_URL is that same index (see may_look_up). A package with
+    partial_files (pixi.lock) is always looked up, and skipped as a private index where it can't be.
     `python` limits range resolution to releases supporting that interpreter.
     With `simple_index` (--index-url), lookups go to that PEP 691 simple index instead of PyPI's JSON API.
     `read_cache` and `write_cache` read pinned JSON API lookups from, and save them to, the on-disk cache (see
@@ -461,11 +463,15 @@ def fill_all(
         base, auth = split_credentials(simple_index)  # validate first: a bad URL fails before any lookup
         fn = partial(fill_simple, base=base, auth=auth, python=python)
     for p in packages:
-        if p.files is None and not p.skip and not may_look_up(p.registry, simple_index):
+        if (p.files is None or p.partial_files) and not p.skip and not may_look_up(p.registry, simple_index):
             p.skip = "private index"  # the name is internal; a namesake on PyPI is another package
     kept = {id(p) for p in packages if refresh and keeps_locked_files(p)}
     # An error from parsing (a constraint wheelgap can't apply) stays unknown: a lookup would hide it.
-    todo = [p for p in packages if not p.skip and not p.error and id(p) not in kept and (refresh or p.files is None)]
+    todo = [
+        p
+        for p in packages
+        if not p.skip and not p.error and id(p) not in kept and (refresh or p.files is None or p.partial_files)
+    ]
     report = _progress.get()
     if todo:
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -476,4 +482,7 @@ def fill_all(
                 for done, future in enumerate(as_completed([pool.submit(fn, p) for p in todo]), 1):
                     future.result()
                     report(done, len(todo))
+    for p in todo:
+        if p.partial_files and p.error:
+            p.files = None  # never judged on the lock's partial files, not even by --explain
     return len(kept)
