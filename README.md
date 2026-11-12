@@ -314,6 +314,8 @@ Docker platform names also work with `-t`, for example `-t linux/amd64,linux/arm
 
 The job fails when a dependency would build from source on a target you ship, for example when a dependency bump drops ARM wheels. The gap table also goes to the run's summary page (set `summary: false` to turn that off).
 
+Each package with a gap is also marked on its own line of the lockfile in the pull request's diff, as a GitHub annotation: an error when it fails the check, or a warning for a source build that `--fail-on missing` allows. So a bump that drops a platform is flagged next to the line that bumped it. The Action passes `--github-annotations` for this; in your own workflow steps, pass it yourself. It respects `--ignore`, and `--exit-zero` still annotates. The annotations are printed before the usual output, or to stderr with `--json` and `--markdown` so their stdout stays the same. GitHub shows at most 10 errors and 10 warnings per step, so the tenth one says how many more packages have gaps. Paths are relative to `GITHUB_WORKSPACE` (or the current directory outside Actions). When wheelgap can't be sure which line a package is on (a name and version written twice, or a `pyproject.toml` input), the annotation names the file without a line.
+
 Outside the Action, `--markdown` prints the same report as Markdown, for a job summary (`wheelgap --markdown >> "$GITHUB_STEP_SUMMARY"`) or a PR comment. With `--explain`, the rejected wheels go in a collapsed section. `--junit PATH` also writes a JUnit XML file (one testsuite per target) that GitLab, Jenkins, Azure Pipelines and CircleCI can show as a test report, alongside whatever output mode you use.
 
 ### With pre-commit

@@ -2283,3 +2283,240 @@ def test_directory_without_lockfile_suggests_pyproject(capsys, fake_pypi, tmp_pa
     assert code == 2
     assert "no lockfile found" in err
     assert f"wheelgap {tmp_path / 'pyproject.toml'}" in err
+
+
+# --github-annotations
+
+
+def annotation_lines(text):
+    return [line for line in text.splitlines() if line.startswith("::")]
+
+
+def test_github_annotations_uv_lock(capsys, fake_pypi, fixtures, monkeypatch):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(fixtures))
+    code, out, _ = run(
+        capsys, str(fixtures / "uvproj"), "-p", "3.13", "-t", "linux-x86_64,win-arm64", "--github-annotations"
+    )
+    assert code == 1
+    lines = out.splitlines()
+    assert lines[:4] == [  # before the normal output
+        "::error file=uvproj/uv.lock,line=23,title=fastlib 2.0.0%3A builds from source::"
+        "fastlib 2.0.0 builds from source on win-arm64.",
+        "::error file=uvproj/uv.lock,line=37,title=nativeext 0.3%3A builds from source::"
+        "nativeext 0.3 builds from source on linux-x86_64, win-arm64.",
+        "::error file=uvproj/uv.lock,line=43,title=puresdist 1.0%3A builds from source::"
+        "puresdist 1.0 builds from source on linux-x86_64, win-arm64.",
+        "::error file=uvproj/uv.lock,line=58,title=winonly 311%3A can't install::"
+        "winonly 311 can't install on win-arm64.",
+    ]
+    assert lines[4].startswith("wheelgap ")
+    assert len(annotation_lines(out)) == 4
+    # Without the flag, nothing changes.
+    _, plain, _ = run(capsys, str(fixtures / "uvproj"), "-p", "3.13", "-t", "linux-x86_64,win-arm64")
+    assert plain.splitlines() == lines[4:]
+
+
+def test_github_annotations_requirements(capsys, fake_pypi, tmp_path, monkeypatch):
+    (tmp_path / "more").mkdir()
+    (tmp_path / "requirements.txt").write_text(
+        "# pinned, with hashes on the next line\n"
+        "fastlib==2.0.0 \\\n"
+        "    --hash=sha256:00\n"
+        "-r more/extra.txt\n"
+        "nowheels==0.9 ; sys_platform == 'linux'\n"
+        "nowheels==0.9 ; sys_platform == 'win32'\n"
+        "ranged>=1.9,<2  # 1.9 has only an sdist\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "more" / "extra.txt").write_text(
+        "--index-url https://pypi.org/simple\nwinonly==311\nranged==1.9\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    code, out, _ = run(
+        capsys, str(tmp_path / "requirements.txt"), "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--github-annotations"
+    )
+    assert code == 1
+    # The first line of a continued requirement; the same name and markers on two lines (ranged) get no line.
+    assert annotation_lines(out) == [
+        "::error file=requirements.txt,line=2,title=fastlib 2.0.0%3A builds from source::"
+        "fastlib 2.0.0 builds from source on win-amd64.",
+        "::error file=requirements.txt,line=5,title=nowheels 0.9%3A builds from source::"
+        "nowheels 0.9 builds from source on linux-x86_64.",
+        "::error file=requirements.txt,line=6,title=nowheels 0.9%3A builds from source::"
+        "nowheels 0.9 builds from source on win-amd64.",
+        *[  # one per line: requirements.txt line 7 and more/extra.txt line 3
+            "::error file=requirements.txt,title=ranged 1.9%3A builds from source::"
+            "ranged 1.9 builds from source on linux-x86_64, win-amd64."
+        ]
+        * 2,
+        "::error file=more/extra.txt,line=2,title=winonly 311%3A can't install::"
+        "winonly 311 can't install on linux-x86_64.",
+    ]
+
+
+@pytest.mark.parametrize(
+    "folder,expected",
+    [
+        ("pdmproj", [("fastlib", 9)]),
+        ("poetryproj", [("fastlib", 4)]),
+        ("pylockproj", [("fastlib", 5)]),
+        ("pipenvproj", [("fastlib", 8)]),  # the package's key in "default"
+    ],
+)
+def test_github_annotations_lockfile_lines(capsys, fake_pypi, fixtures, monkeypatch, folder, expected):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(fixtures / folder))
+    code, out, _ = run(capsys, str(fixtures / folder), "-p", "3.13", "-t", "win-amd64", "--github-annotations")
+    assert code == 1
+    found = []
+    for line in annotation_lines(out):
+        props = dict(item.split("=", 1) for item in line.split("::")[1].removeprefix("error ").split(","))
+        found.append((props["title"].split()[0], int(props["line"])))
+        assert props["file"] in ("pdm.lock", "poetry.lock", "pylock.toml", "Pipfile.lock")
+    assert found == expected
+
+
+def uv_lock(packages: list[tuple[str, str]], extra: str = "") -> str:
+    """A uv.lock whose project depends on each (name, version), all with only an sdist."""
+    deps = "".join(f'    {{ name = "{name}" }},\n' for name, _ in packages)
+    text = (
+        'version = 1\nrequires-python = ">=3.12"\n\n[[package]]\nname = "demo"\nversion = "0.1.0"\n'
+        f'source = {{ editable = "." }}\n{extra}dependencies = [\n{deps}]\n'
+    )
+    for name, version in packages:
+        text += (
+            f'\n[[package]]\nname = "{name}"\nversion = "{version}"\n'
+            'source = { registry = "https://pypi.org/simple" }\n'
+            f'sdist = {{ url = "https://files.example/{name}-{version}.tar.gz", hash = "sha256:00" }}\n'
+        )
+    return text
+
+
+@pytest.mark.parametrize("fail_on,level", [("source", "error"), ("missing", "warning")])
+def test_github_annotations_cap(capsys, fake_pypi, tmp_path, monkeypatch, fail_on, level):
+    # GitHub shows 10 errors and 10 warnings per step, so the 10th says how many more there are.
+    names = [f"pkg{i:02}" for i in range(12)]
+    (tmp_path / "uv.lock").write_text(uv_lock([(name, "1.0") for name in names]), encoding="utf-8")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    code, out, _ = run(
+        capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--github-annotations", "--fail-on", fail_on
+    )
+    assert code == (1 if fail_on == "source" else 0)
+    lines = annotation_lines(out)
+    assert len(lines) == 10
+    assert all(line.startswith(f"::{level} file=uv.lock,line=") for line in lines[:9])
+    assert [line.split("title=")[1].split("%3A")[0] for line in lines[:9]] == [f"{n} 1.0" for n in names[:9]]
+    assert lines[9] == (
+        f"::{level} title=wheelgap%3A 3 more packages with gaps::3 more packages with gaps; the log lists them all."
+    )
+    if level == "warning":
+        assert lines[0].endswith("Source builds are allowed (fail-on missing), so this doesn't fail the run.")
+
+
+def test_github_annotations_fail_on_missing_mixes_levels(capsys, fake_pypi, fixtures, monkeypatch):
+    # A package that can't install still fails the run, so it stays an error; source builds become warnings.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(fixtures))
+    code, out, _ = run(
+        capsys,
+        str(fixtures / "uvproj"),
+        "-p",
+        "3.13",
+        "-t",
+        "linux-x86_64,win-arm64",
+        "--github-annotations",
+        "--fail-on",
+        "missing",
+    )
+    assert code == 1
+    levels = [(line.split()[0], line.split("title=")[1].split()[0]) for line in annotation_lines(out)]
+    assert levels == [
+        ("::error", "winonly"),
+        ("::warning", "fastlib"),
+        ("::warning", "nativeext"),
+        ("::warning", "puresdist"),
+    ]
+
+
+def test_github_annotations_ignore_and_exit_zero(capsys, fake_pypi, fixtures, monkeypatch):
+    # --exit-zero only changes the exit code; ignored packages and targets get no annotation.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(fixtures))
+    code, out, _ = run(
+        capsys,
+        str(fixtures / "uvproj"),
+        "-p",
+        "3.13",
+        "-t",
+        "linux-x86_64,win-arm64",
+        "--github-annotations",
+        "--exit-zero",
+        "--ignore",
+        "nativeext,winonly:win-arm64,fastlib:win-arm64",
+    )
+    assert code == 0
+    assert annotation_lines(out) == [
+        "::error file=uvproj/uv.lock,line=43,title=puresdist 1.0%3A builds from source::"
+        "puresdist 1.0 builds from source on linux-x86_64, win-arm64.",
+    ]
+
+
+@pytest.mark.parametrize("flag", ["--json", "--markdown"])
+def test_github_annotations_keep_json_and_markdown_clean(capsys, fake_pypi, fixtures, monkeypatch, flag):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(fixtures))
+    argv = [str(fixtures / "uvproj"), "-p", "3.13", "-t", "linux-x86_64", flag]
+    code, out, err = run(capsys, *argv, "--github-annotations")
+    assert code == 1
+    assert "::" not in out.split("\n", 1)[0]
+    assert (code, out) == run(capsys, *argv)[:2]  # stdout is exactly what it is without the flag
+    assert [line.split(",")[0] for line in annotation_lines(err)] == ["::error file=uvproj/uv.lock"] * 2
+
+
+def test_github_annotations_without_a_line(capsys, fake_pypi, tmp_path, monkeypatch):
+    # Two entries of one name and version in a uv.lock could be either: the file, but no line.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    (tmp_path / "uv.lock").write_text(uv_lock([("twice", "1.0"), ("twice", "1.0"), ("once", "1.0")]), encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--github-annotations")
+    files = [line.split("title=")[0] for line in annotation_lines(out)]
+    assert files == [
+        "::error file=uv.lock,line=27,",
+        "::error file=uv.lock,",
+        "::error file=uv.lock,",
+    ]  # once, twice x2
+
+    # A [[package]] header inside a string throws the count off, so no line in the file is trusted.
+    trap = 'description = """\n[[package]]\nname = "once"\n"""\n'
+    (tmp_path / "uv.lock").write_text(uv_lock([("once", "1.0")], extra=trap), encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--github-annotations")
+    assert [line.split("title=")[0] for line in annotation_lines(out)] == ["::error file=uv.lock,"]
+
+    # A file outside the workspace can't be shown in the diff, and package names have no file at all.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path / "elsewhere"))
+    _, out, _ = run(capsys, str(tmp_path), "nowheels==0.9", "-p", "3.13", "-t", "linux-x86_64", "--github-annotations")
+    assert annotation_lines(out) == [
+        "::error title=nowheels 0.9%3A builds from source::nowheels 0.9 builds from source on linux-x86_64.",
+        "::error title=once 1.0%3A builds from source::"
+        f"once 1.0 builds from source on linux-x86_64. (in {tmp_path / 'uv.lock'})",
+    ]
+
+
+def test_github_annotations_escaping():
+    from wheelgap.github import workflow_command
+
+    # As @actions/core escapes them: %, CR and LF everywhere, and : and , in properties too.
+    assert workflow_command("warning", "50% done\r\nnext: a, b", "dir,x/a:b.txt", 3, "t%: 1,\n2") == (
+        "::warning file=dir%2Cx/a%3Ab.txt,line=3,title=t%25%3A 1%2C%0A2::50%25 done%0D%0Anext: a, b"
+    )
+    assert workflow_command("error", "plain") == "::error::plain"
+
+
+def test_github_annotations_pipfile_lock_entry_the_parser_kept(capsys, fake_pypi, tmp_path, monkeypatch):
+    # Listed in develop first and in default too: the parser keeps default's entry, so that's the line. A _meta
+    # key with the same name ("hash") isn't a package.
+    (tmp_path / "Pipfile.lock").write_text(
+        '{"_meta": {"hash": {"sha256": "00"}, "sources": [{"name": "pypi", "url": "https://pypi.org/simple"}]},\n'
+        ' "develop": {"nowheels": {"version": "==0.9"}},\n'
+        ' "default": {"purewheel": {"version": "==3.1"},\n'
+        '             "nowheels": {"version": "==0.9", "markers": "os_name == \\"posix\\""}}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    _, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--github-annotations")
+    assert [line.split(",title=")[0] for line in annotation_lines(out)] == ["::error file=Pipfile.lock,line=4"]

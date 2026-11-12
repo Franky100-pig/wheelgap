@@ -119,6 +119,8 @@ class Source:
     pdm_pyproject: Path | None = None
     # poetry.lock after a group selection: the packages it left out, which were still read (for --ignore notes).
     unselected_keys: set[str] = field(default_factory=set)
+    # The file this source was read from (None for package names on the command line), for --github-annotations.
+    path: Path | None = None
 
 
 def pythons_outside_lock(source: Source, targets: Iterable[Target], *, bounds_only: bool = True) -> list[str]:
@@ -943,6 +945,12 @@ PARSERS = {
 
 
 def load_file(path: Path) -> Source:
+    source = _load_file(path)
+    source.path = path
+    return source
+
+
+def _load_file(path: Path) -> Source:
     name = path.name
     if name == "pyproject.toml":
         return parse_pyproject(path)
