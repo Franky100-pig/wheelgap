@@ -3,12 +3,13 @@ from pathlib import Path
 
 import pytest
 
-from wheelgap import pypi
+from wheelgap import pypi, sources
 from wheelgap.check import Status, check
 from wheelgap.sources import (
     Source,
     SourceError,
     UvSelection,
+    _BlockYaml,
     find_lockfile,
     load_inputs,
     parse_pixi_lock,
@@ -1020,10 +1021,19 @@ PIXI_V7 = (Path(__file__).parent / "fixtures" / "pixiproj" / "pixi.lock").read_t
         ("  name: winonly\n", "  name: 'winonly\n", "must end on its own line"),
         ("  name: winonly\n", '  name: "win\\qonly"\n', "unsupported escape"),
         ("  name: winonly\n", "  name: winonly\n  name: other\n", "duplicate key 'name'"),
-        ("  name: winonly\n", "\tname: winonly\n", "tabs, comments"),
+        ("  name: winonly\n", "\tname: winonly\n", "unsupported character '\\t'"),
         ("  name: winonly\n", "  name: winonly\n  []: x\n", "unsupported key '[]'"),
-        ("version: 7\n", "version: 7\n# generated\n", "tabs, comments"),
-        ("version: 7\n", "version: 7\n---\n", "tabs, comments"),
+        ("version: 7\n", "version: 7\n# generated\n", "comments and document markers"),
+        ("version: 7\n", "version: 7\n---\n", "comments and document markers"),
+        # The version the reader checked must be the one the YAML says ('7\'\'' is the string "7'").
+        ("version: 7\n", "version: '7'''\n", "with that `version`"),
+        (
+            "- pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n  name: nowheels\n",
+            "- pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n  name: nowheels\n"
+            "  version: '0.9'\n"
+            "- pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n  name: nowheels\n",
+            "two PyPI packages at",
+        ),
         # Structure it can't be sure of
         ("platforms:", "platform:", "unknown top-level key 'platform'"),
         (
@@ -1092,3 +1102,280 @@ def test_pixi_lock_reads_quoted_scalars(tmp_path):
     )
     lock.write_text(text, encoding="utf-8")
     assert {"winonly", "pure'wheel"} <= set(by_name(parse_pixi_lock(lock)))
+
+
+@pytest.mark.parametrize(
+    "text,message",
+    [
+        # Tabs and control characters anywhere, which YAML would read differently or libyaml refuses
+        ("- true\t\n", "unsupported character '\\t'"),
+        ("- a,b\t# c\n", "unsupported character '\\t'"),
+        ("- a:\tb\n", "unsupported character '\\t'"),
+        ("k: \t\n", "unsupported character '\\t'"),
+        ("version: 311\t\n", "unsupported character '\\t'"),
+        ("a: 1\x0bb: 2\n", "unsupported character '\\x0b'"),
+        ("a: 1\x0cb: 2\n", "unsupported character '\\x0c'"),
+        ("a: 1\x1cb: 2\n", "unsupported character '\\x1c'"),
+        ("a: 1\x1db: 2\n", "unsupported character '\\x1d'"),
+        ("a: 1\x1eb: 2\n", "unsupported character '\\x1e'"),
+        ("a: 1\u2028b: 2\n", "unsupported character '\\u2028'"),
+        ("k: a\x01b\n", "unsupported character '\\x01'"),
+        ("k: a\x7f\n", "unsupported character '\\x7f'"),
+        ("k: a\x85\n", "unsupported character '\\x85'"),
+        ("k: 'a\x9fb'\n", "unsupported character '\\x9f'"),
+        ("\ufeffversion: 7\n", "unsupported character '\\ufeff'"),  # only parse_pixi_lock strips a leading one
+        ('k: "\\ud800"\n', "isn't a Unicode character"),
+        ('k: "\\U00110000"\n', "isn't a Unicode character"),
+        ('k: "\\q"\n', "unsupported escape"),
+        # A space before the colon, which YAML would leave out of the key
+        ("a : b\n", "a space before the colon"),
+        ("- 6 :\n", "a space before the colon"),
+        # Sequence indicators and document markers where a value or a key should be
+        ("k: -\n", "unsupported YAML: '-'"),
+        ("--- a: b\n", "comments and document markers"),
+        ("... a: b\n", "comments and document markers"),
+        ("# a comment\n", "comments and document markers"),
+        # Structure: lines left over, a first line that's indented, bare and nested items, junk after a quoted key
+        ("- a\nb: c\n", "line 2: unexpected indentation"),
+        ("  a: 1\nb: 2\n", "line 1: unexpected indentation"),
+        ("k:\n-\n", "line 2: unexpected indentation"),
+        ("k:\n- - a\n", "nested sequences"),
+        ("'a'x: b\n", "expected `key: value`"),
+        ("k:\n  a: 1\n    b: 2\n", "line 3: unexpected indentation"),
+        ("k: v\n  more\n", "line 2: unexpected indentation"),
+        # `k: a: b` is the key k with a value YAML refuses, not the key `k: a`
+        ("k: a: b\n", "unsupported YAML: 'a: b'"),
+        ("- 'a\n", "must end on its own line"),
+        ("[]: x\n", "unsupported key '[]'"),
+    ],
+)
+def test_block_yaml_refuses(text, message):
+    with pytest.raises(sources._YamlError) as e:
+        _BlockYaml(text).read()
+    assert message in str(e.value)
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("k: v   \nl: 'w'  \n", {"k": "v", "l": "w"}),  # trailing spaces aren't part of a value
+        ("a: 1\r\nb: 2\r\n", {"a": "1", "b": "2"}),
+        ("a: 1\rb: 2\r", {"a": "1", "b": "2"}),
+        (
+            "a:\n- x\n- y: 1\n  z: '2'\nb: {}\nc: []\nd:\n",
+            {"a": ["x", {"y": "1", "z": "2"}], "b": {}, "c": [], "d": None},
+        ),
+        ("a:\n  -x: 1\n", {"a": {"-x": "1"}}),  # "-x" is a key, not a sequence item
+        ("a:\n  b:\n  - 1\n  c: 2\n", {"a": {"b": ["1"], "c": "2"}}),
+        ("- a\n-   b: 1\n    c: 2\n", ["a", {"b": "1", "c": "2"}]),
+        ("url: https://x.org/a#b\n", {"url": "https://x.org/a#b"}),
+        ('k: "a\\tb\\u00e9\\x41\\U0001F600"\n', {"k": "a\tb\u00e9A\U0001f600"}),
+        ("'a: b': 'it''s'\n", {"a: b": "it's"}),
+    ],
+)
+def test_block_yaml_reads(text, expected):
+    assert _BlockYaml(text).read() == expected
+
+
+def test_pixi_lock_with_a_byte_order_mark(fixtures, tmp_path):
+    lock = tmp_path / "pixi.lock"
+    lock.write_bytes(b"\xef\xbb\xbf" + (fixtures / "pixiproj" / "pixi.lock").read_bytes())
+    assert "fastlib" in by_name(parse_pixi_lock(lock))
+
+
+def test_pixi_lock_empty_environment_name_is_an_error(fixtures):
+    with pytest.raises(SourceError, match="the environment name is empty"):
+        parse_pixi_lock(fixtures / "pixiproj" / "pixi.lock", "")
+    with pytest.raises(SourceError, match="--environment needs a name"):
+        load_inputs([str(fixtures / "pixiproj")], "")
+
+
+def python(subdir: str, version: str = "3.13.9") -> str:
+    return f"conda: https://conda.anaconda.org/conda-forge/{subdir}/python-{version}-h0123456_0_cp313.conda"
+
+
+def pypi_entry(location: str, name: str, version: str | None = None, *extra: str) -> str:
+    return "\n".join(
+        [f"- pypi: {location}", f"  name: {name}", *([f"  version: '{version}'"] if version else []), *extra]
+    )
+
+
+def write_pixi(tmp_path, platforms, entries, *, subdirs=None, indexes=("https://pypi.org/simple",)):
+    """A small version 7 pixi.lock: `platforms` maps each platform to its selectors, `entries` are PyPI entries."""
+    subdirs = subdirs or {}
+    lines = ["version: 7", "platforms:"]
+    for name in platforms:
+        lines += [f"- name: {name}"] + ([f"  subdir: {subdirs[name]}"] if name in subdirs else [])
+    lines += ["environments:", "  default:", "    channels:", "    - url: https://conda.anaconda.org/conda-forge/"]
+    lines += ["    indexes:", *(f"    - {i}" for i in indexes), "    packages:"]
+    for name, selectors in platforms.items():
+        lines += [f"      {name}:", *(f"      - {s}" for s in selectors)]
+    lines.append("packages:")
+    lines += [f"- {c}" for c in sorted({s for ss in platforms.values() for s in ss if s.startswith("conda: ")})]
+    lines += entries
+    path = tmp_path / "pixi.lock"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+FILES = "https://files.pythonhosted.org/packages/aa"
+PURE = (
+    f"pypi: {FILES}/purewheel-3.1-py3-none-any.whl",
+    pypi_entry(f"{FILES}/purewheel-3.1-py3-none-any.whl", "purewheel", "3.1"),
+)
+FAST = (f"pypi: {FILES}/fastlib-2.0.0.tar.gz", pypi_entry(f"{FILES}/fastlib-2.0.0.tar.gz", "fastlib", "2.0.0"))
+
+
+def results(lock, pythons, platforms, name):
+    """The statuses of package `name` (by its locked files, no lookup) on those targets."""
+    rows = [r for r in check([parse_pixi_lock(lock)], build_targets(pythons, platforms)) if r.package.name == name]
+    return [{t.platform: s.value for t, s in r.results.items()} for r in rows]
+
+
+def test_pixi_platforms_sharing_a_subdir_are_one_group(tmp_path):
+    # linux-64-cuda (subdir linux-64) installs fastlib, linux-64 doesn't: pip on linux x86_64 can be either, so
+    # fastlib still counts there (cuda-python's cuda_pathfinder locks linux-64-cuda-12 and -13 like this).
+    lock = write_pixi(
+        tmp_path,
+        {"linux-64": [python("linux-64"), PURE[0]], "linux-64-cuda": [python("linux-64"), PURE[0], FAST[0]]},
+        [PURE[1], FAST[1]],
+        subdirs={"linux-64-cuda": "linux-64"},
+    )
+    assert results(lock, ["3.13"], ["linux-x86_64"], "fastlib") == [{"linux-x86_64": "source"}]
+
+
+def test_pixi_two_versions_on_platforms_sharing_a_subdir(tmp_path):
+    old = f"{FILES}/forked-0.9.tar.gz"
+    new = f"{FILES}/forked-1.0.tar.gz"
+    lock = write_pixi(
+        tmp_path,
+        {"linux-64": [python("linux-64"), f"pypi: {old}"], "glibc-2-17": [python("linux-64"), f"pypi: {new}"]},
+        [pypi_entry(old, "forked", "0.9"), pypi_entry(new, "forked", "1.0")],
+        subdirs={"glibc-2-17": "linux-64"},
+    )
+    # Two packages (the merge key has the version), and neither is hidden on linux x86_64.
+    assert results(lock, ["3.13"], ["linux-x86_64"], "forked") == [{"linux-x86_64": "source"}] * 2
+
+
+def test_pixi_platform_markers(tmp_path):
+    # purewheel is locked on osx-arm64 only: n/a on each other locked platform's markers.
+    platforms = {s: [python(s)] for s in ("linux-64", "linux-aarch64", "win-64", "osx-64")}
+    platforms["osx-arm64"] = [python("osx-arm64"), PURE[0]]
+    lock = write_pixi(tmp_path, platforms, [PURE[1]])
+    assert results(
+        lock, ["3.13"], ["linux-x86_64", "linux-aarch64", "win-amd64", "macos-x86_64", "macos-arm64"], "purewheel"
+    ) == [
+        {
+            "linux-x86_64": "n/a",
+            "linux-aarch64": "n/a",
+            "win-amd64": "n/a",
+            "macos-x86_64": "n/a",
+            "macos-arm64": "wheel",
+        }
+    ]
+    # win-arm64 isn't locked, so it counts there
+    assert results(lock, ["3.13"], ["win-arm64"], "purewheel") == [{"win-arm64": "wheel"}]
+
+
+def test_pixi_platform_named_by_its_subdir(tmp_path):
+    lock = write_pixi(
+        tmp_path,
+        {"gpu": [python("linux-64")], "osx-arm64": [python("osx-arm64"), PURE[0]]},
+        [PURE[1]],
+        subdirs={"gpu": "linux-64"},
+    )
+    assert results(lock, ["3.13"], ["linux-x86_64"], "purewheel") == [{"linux-x86_64": "n/a"}]
+
+
+OPENSSL = "conda: https://conda.anaconda.org/conda-forge/win-64/openssl-3.6.0-h725018a_0.conda"
+
+
+def test_pixi_platform_without_python_hides_nothing(tmp_path):
+    # No conda python on win-64: which Python pixi locked for isn't known, so purewheel isn't hidden there.
+    lock = write_pixi(tmp_path, {"linux-64": [python("linux-64"), PURE[0]], "win-64": [OPENSSL]}, [PURE[1]])
+    assert results(lock, ["3.13"], ["win-amd64"], "purewheel") == [{"win-amd64": "wheel"}]
+
+
+def test_pixi_python_is_the_python_package_only(tmp_path):
+    dateutil = "conda: https://conda.anaconda.org/conda-forge/noarch/python-dateutil-2.9.0-pyhd8ed1ab_1.conda"
+    abi = "conda: https://conda.anaconda.org/conda-forge/noarch/python_abi-3.14-8_cp314.conda"
+    lock = write_pixi(
+        tmp_path,
+        {"linux-64": [python("linux-64"), dateutil, abi], "osx-arm64": [python("osx-arm64"), PURE[0]]},
+        [PURE[1]],
+    )
+    assert results(lock, ["3.13"], ["linux-x86_64"], "purewheel") == [{"linux-x86_64": "n/a"}]
+    assert results(lock, ["3.14"], ["linux-x86_64"], "purewheel") == [{"linux-x86_64": "wheel"}]
+
+
+def test_pixi_one_release_from_two_indexes_is_skipped(tmp_path):
+    private = "https://private.example.com/files/fastlib-2.0.0.tar.gz"
+    lock = write_pixi(
+        tmp_path,
+        {"linux-64": [python("linux-64"), FAST[0]], "osx-arm64": [python("osx-arm64"), f"pypi: {private}"]},
+        [FAST[1], pypi_entry(private, "fastlib", "2.0.0", "  index: https://private.example.com/simple")],
+    )
+    (pkg,) = [p for p in parse_pixi_lock(lock).packages if p.name == "fastlib"]
+    assert (pkg.skip, pkg.files) == ("private index", None)  # neither index may be asked for the other's package
+
+
+@pytest.mark.parametrize(
+    "host,indexes,skip",
+    [
+        ("https://files.pythonhosted.org/packages/aa", ["https://private.example.com/simple"], None),
+        # Only PyPI's own file host counts as PyPI
+        ("https://files.pythonhosted.org.example.com/aa", ["https://private.example.com/simple"], "private index"),
+        ("https://mirror-files.pythonhosted.org/aa", ["https://private.example.com/simple"], "private index"),
+        # With PyPI the only index, a file elsewhere is a direct URL; with another index too, it may be internal
+        ("https://example.com/aa", ["https://pypi.org/simple"], "url"),
+        ("https://example.com/aa", ["https://pypi.org/simple", "https://private.example.com/simple"], "private index"),
+        ("https://example.com/aa", ["https://private.example.com/simple", "https://pypi.org/simple/"], "private index"),
+    ],
+)
+def test_pixi_where_a_package_came_from(tmp_path, host, indexes, skip):
+    location = f"{host}/fastlib-2.0.0.tar.gz"
+    lock = write_pixi(
+        tmp_path,
+        {"linux-64": [python("linux-64"), f"pypi: {location}"]},
+        [pypi_entry(location, "fastlib", "2.0.0")],
+        indexes=indexes,
+    )
+    (pkg,) = [p for p in parse_pixi_lock(lock).packages if p.name == "fastlib"]
+    assert pkg.skip == skip
+
+
+def test_pixi_git_revisions_stay_apart(tmp_path):
+    a = "git+https://github.com/example/gitdep.git#aaaa"
+    b = "git+https://github.com/example/gitdep.git#bbbb"
+    lock = write_pixi(
+        tmp_path,
+        {"linux-64": [python("linux-64"), f"pypi: {a}"], "osx-arm64": [python("osx-arm64"), f"pypi: {b}"]},
+        [pypi_entry(a, "gitdep"), pypi_entry(b, "gitdep")],
+    )
+    assert [(p.name, p.skip) for p in parse_pixi_lock(lock).packages if p.name == "gitdep"] == [("gitdep", "git")] * 2
+
+
+def test_pixi_conda_packages_are_skipped_once_by_name(tmp_path):
+    cffi = "conda: https://conda.anaconda.org/conda-forge/{}/cffi-{}-py313h0_0.conda"
+    lock = write_pixi(
+        tmp_path,
+        {
+            "linux-64": [python("linux-64"), cffi.format("linux-64", "1.17.1")],
+            "osx-arm64": [python("osx-arm64"), cffi.format("osx-arm64", "2.0.0")],
+        },
+        [],
+    )
+    assert [(p.name, p.skip) for p in parse_pixi_lock(lock).packages] == [("cffi", "conda"), ("python", "conda")]
+
+
+def test_find_lockfile_order_with_pixi_lock(fixtures, tmp_path):
+    (tmp_path / "pixi.lock").write_text(
+        (fixtures / "pixiproj" / "pixi.lock").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (tmp_path / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    assert find_lockfile(tmp_path).name == "requirements.txt"  # pixi.lock comes last
+    assert find_lockfile(tmp_path, pixi=True).name == "pixi.lock"
+    (source,) = load_inputs([str(tmp_path)])
+    assert (source.kind, source.passed_over) == ("requirements", tmp_path / "pixi.lock")
+    (source,) = load_inputs([str(tmp_path)], "test")
+    assert (source.kind, source.passed_over) == ("pixi", None)

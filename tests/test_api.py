@@ -408,3 +408,32 @@ def test_via_is_empty_without_a_graph(fake_pypi, tmp_path):
     assert result.via == {} and result.to_dict(explain=True)["via"] == {}
     assert list(result.reasons.values()) == ["no wheels published for this version"]
     assert wheelgap.check_package("nowheels", "0.9", wheelgap.make_targets("3.13", "linux-x86_64")).via == {}
+
+
+def test_check_lockfile_pixi_environment(fake_pypi, fixtures, tmp_path):
+    targets = wheelgap.make_targets(python="3.13", platforms="linux-x86_64")
+    default = {r.name for r in wheelgap.check_lockfile(fixtures / "pixiproj", targets)}
+    assert default == {"fastlib", "purewheel"}  # winonly is n/a on linux-x86_64
+    results = wheelgap.check_lockfile(fixtures / "pixiproj", targets, environment="test")
+    assert [(r.name, r.statuses[targets[0]]) for r in results] == [("nowheels", Status.SOURCE)]
+    # In a folder with another lockfile too, naming an environment reads pixi.lock.
+    (tmp_path / "pixi.lock").write_bytes((fixtures / "pixiproj" / "pixi.lock").read_bytes())
+    (tmp_path / "uv.lock").write_bytes((fixtures / "uvproj" / "uv.lock").read_bytes())
+    assert [r.name for r in wheelgap.check_lockfile(tmp_path, targets, environment="test")] == ["nowheels"]
+    with pytest.raises(SourceError, match="environment applies to pixi.lock only"):
+        wheelgap.check_lockfile(fixtures / "uvproj", targets, environment="test")
+    with pytest.raises(SourceError, match="the environment name is empty"):
+        wheelgap.check_lockfile(fixtures / "pixiproj", targets, environment="")
+
+
+def test_check_lockfile_pixi_failed_lookup_has_no_files(fixtures, monkeypatch):
+    from wheelgap import pypi
+
+    def down(url, timeout=20.0):
+        raise OSError("no network")
+
+    monkeypatch.setattr(pypi, "fetch_json", down)
+    targets = wheelgap.make_targets(python="3.13", platforms="macos-arm64")
+    (fastlib,) = [r for r in wheelgap.check_lockfile(fixtures / "pixiproj", targets) if r.name == "fastlib"]
+    # Not the lock's two files, which are only what pixi picked for its platforms
+    assert (fastlib.statuses[targets[0]], fastlib.files) == (Status.UNKNOWN, ())

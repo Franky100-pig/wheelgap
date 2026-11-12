@@ -2997,3 +2997,92 @@ def test_pixi_lock_offline_needs_the_index(capsys, fixtures, fake_pypi):
         "or drop --offline\n"
     )
     assert fake_pypi == []
+
+
+MIRROR_PIXI = """\
+version: 7
+platforms:
+- name: linux-64
+environments:
+  default:
+    channels:
+    - url: https://conda.anaconda.org/conda-forge/
+    indexes:
+    - https://pypi.org/simple
+    - https://mirror.example.com/simple
+    packages:
+      linux-64:
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.13.9-hc97d973_101_cp313.conda
+      - pypi: https://mirror.example.com/files/fastlib-2.0.0.tar.gz
+packages:
+- conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.13.9-hc97d973_101_cp313.conda
+- pypi: https://mirror.example.com/files/fastlib-2.0.0.tar.gz
+  name: fastlib
+  version: 2.0.0
+  index: https://mirror.example.com/simple
+"""
+
+
+@pytest.mark.parametrize("online", [False, True])
+def test_pixi_lock_mirror_package_is_looked_up_never_kept(capsys, tmp_path, fake_pypi, monkeypatch, online):
+    # The lock's one file (an sdist) can't answer the target; the mirror the lock names has a wheel for it.
+    (tmp_path / "pixi.lock").write_text(MIRROR_PIXI, encoding="utf-8")
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://mirror.example.com/pypi")
+    args = ["-p", "3.13", "-t", "linux-x86_64", "--json"] + ["--online"] * online
+    code, out, _ = run(capsys, str(tmp_path), *args)
+    assert {p["name"]: p["results"] for p in json.loads(out)["packages"]} == {"fastlib": {"linux-x86_64": "wheel"}}
+    assert fake_pypi == ["https://mirror.example.com/pypi/fastlib/2.0.0/json"]
+    assert code == 0
+
+
+def test_pixi_lock_mirror_package_is_skipped_without_its_index(capsys, tmp_path, fake_pypi):
+    (tmp_path / "pixi.lock").write_text(MIRROR_PIXI, encoding="utf-8")
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--online", "--json")
+    assert json.loads(out)["skipped"] == [
+        {"name": "fastlib", "reason": "private index"},
+        {"name": "python", "reason": "conda"},
+    ]
+    assert fake_pypi == [] and code == 0
+
+
+def test_pixi_lock_next_to_another_lockfile(capsys, fixtures, tmp_path, fake_pypi):
+    (tmp_path / "pixi.lock").write_bytes((fixtures / "pixiproj" / "pixi.lock").read_bytes())
+    (tmp_path / "uv.lock").write_bytes((fixtures / "uvproj" / "uv.lock").read_bytes())
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert json.loads(out)["sources"] == ["uv.lock"]
+    assert err == (
+        f"wheelgap: note: {tmp_path / 'uv.lock'} was checked; {tmp_path / 'pixi.lock'} is in the same folder too "
+        "(pass it, or --environment, to check it instead)\n"
+    )
+    code, out, err = run(
+        capsys, str(tmp_path), "--environment", "default", "-p", "3.13", "-t", "linux-x86_64", "--json"
+    )
+    assert json.loads(out)["sources"] == ["pixi.lock"] and not err
+    code, out, err = run(capsys, str(tmp_path), "-q", "-p", "3.13", "-t", "linux-x86_64")
+    assert not err
+
+
+def test_pixi_lock_empty_environment_is_an_error(capsys, fixtures, fake_pypi):
+    code, out, err = run(capsys, str(fixtures / "pixiproj"), "--environment", "", "-p", "3.13")
+    assert (code, out, err) == (2, "", "wheelgap: error: --environment needs a name\n")
+
+
+def test_pixi_lock_counts_conda_packages_in_text(capsys, tmp_path, fake_pypi):
+    names = ["bzip2", "libffi", "ncurses", "openssl", "readline", "tk"]
+    selectors = [f"      - conda: https://conda.anaconda.org/conda-forge/linux-64/{n}-1.0-h0_0.conda" for n in names]
+    text = MIRROR_PIXI.replace(
+        "      - pypi: https://mirror.example.com/files/fastlib-2.0.0.tar.gz\n", "\n".join(selectors) + "\n"
+    )
+    (tmp_path / "pixi.lock").write_text(text, encoding="utf-8")
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert "skipped 7 non-index packages: 7 conda packages (not on PyPI)" in out
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--markdown")
+    assert "Skipped 7 non-index packages: 7 conda packages (not on PyPI)" in out
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert len(json.loads(out)["skipped"]) == 7  # --json lists each one
+    # Up to five are listed by name, after any others
+    (tmp_path / "pixi.lock").write_text(
+        text.replace(selectors[-1] + "\n", "").replace(selectors[-2] + "\n", ""), encoding="utf-8"
+    )
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert "skipped 5 non-index packages: bzip2 (conda), libffi (conda), ncurses (conda), openssl (conda)," in out

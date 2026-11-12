@@ -395,8 +395,9 @@ def may_look_up(registry: str | None, simple_index: str | None = None) -> bool:
 
 
 def keeps_locked_files(p: Package) -> bool:
-    """Under --online, a package from another index keeps the files in the lock: PyPI doesn't know it."""
-    return not p.skip and p.files is not None and not is_pypi(p.registry)
+    """Under --online, a package from another index keeps the files in the lock: PyPI doesn't know it. Never one with
+    partial_files (pixi.lock), whose locked files can't answer most targets: it's looked up or skipped instead."""
+    return not p.skip and p.files is not None and not p.partial_files and not is_pypi(p.registry)
 
 
 def recheck_lock(
@@ -481,4 +482,7 @@ def fill_all(
                 for done, future in enumerate(as_completed([pool.submit(fn, p) for p in todo]), 1):
                     future.result()
                     report(done, len(todo))
+    for p in todo:
+        if p.partial_files and p.error:
+            p.files = None  # never judged on the lock's partial files, not even by --explain
     return len(kept)
