@@ -1222,11 +1222,7 @@ def main(argv: list[str] | None = None) -> int:
         note_unpinned_requirements(sources)
         for source in sources:
             if source.poetry_extras_unsure is not None:
-                print(
-                    f"wheelgap: note: {source.label}: {source.poetry_extras_unsure}, so Poetry 2.0-2.2 and 2.3+ may "
-                    "install different packages without an extra; extras leave no package out of this lock",
-                    file=sys.stderr,
-                )
+                print(f"wheelgap: note: {source.label}: {source.poetry_extras_unsure}", file=sys.stderr)
     for source in sources:
         if source.pyproject_extras is not None:  # always: this answer differs from a lockfile's
             print(

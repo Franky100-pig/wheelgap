@@ -190,13 +190,16 @@ for groups a `pdm.lock`, or for `--extra`/`--all-extras` a `pyproject.toml` (see
 apply to them too. `main` and every group not marked `optional = true` in `pyproject.toml` count; `--group` adds a
 group (like `poetry install --with`), `--no-dev` leaves out `dev`, and `--only-group` checks only the named groups
 (`main` only if named). A package counts if any of its groups is selected, with the markers of those groups.
-`--extra NAME` and `--all-extras` work like `poetry install --extras NAME` and `--all-extras`: once any selector
-is used, packages that only an extra installs count only if that extra is selected, and an extra that isn't in the
-lock's `[extras]` table is an error. Unlike `uv.lock`, `--only-group` combines with `--extra` here, as in
-`poetry install --only main --extras api`. Poetry 2.x can lock a name that's in an extra and also declared elsewhere
-in `pyproject.toml` (in the dependencies, a group, or another extra with a marker) as if only the extra installed it;
-Poetry 2.3 and later then leave it out, while Poetry 2.0-2.2 install it. For such a project, and for a lock with no
-`pyproject.toml` beside it, extras leave no package out, and a note says so. A command-line selection on a Poetry
+`--extra NAME` and `--all-extras` work like `poetry install --extras NAME` and `--all-extras`, as Poetry 2.3 and
+later install with default settings: once any selector is used, a package whose lock markers are only extra
+comparisons (`extra == "s3"`) counts only if one of those extras is selected, and an extra that isn't in the lock's
+`[extras]` table is an error. Unlike `uv.lock`, `--only-group` combines with `--extra` here, as in
+`poetry install --only main --extras api`. Poetry 2.0-2.2 (and later versions with `installer.re-resolve`) can
+install more than the lock's markers say, so wheelgap checks a superset of what any Poetry 2.x installs where the lock
+alone can't tell: a package whose markers combine an extra with other conditions (`sys_platform == "win32" or
+extra == "a"`) is checked as if any extra might be selected, and when there's no `pyproject.toml` beside the lock, or
+it declares a name from an extra somewhere else too (in the dependencies, a group, or another extra with a marker) or
+has a requirement wheelgap can't read, extras leave no package out of the lock. A note says when either happens. A command-line selection on a Poetry
 1.x lock (no per-package groups) is an error; a configured selection leaves a 1.x lock unfiltered.
 
 `pdm.lock` inputs take the same selectors with PDM's meanings, and configured `groups` apply to them too. Every

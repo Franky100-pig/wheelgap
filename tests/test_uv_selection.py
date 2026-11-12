@@ -5,10 +5,9 @@ import tomllib
 import pytest
 
 from wheelgap import check as check_module
-from wheelgap.check import applies, check, marker_holds, poetry_marker_holds
+from wheelgap.check import check, marker_holds, poetry_extras_decide, poetry_marker_holds
 from wheelgap.cli import main
 from wheelgap.sources import (
-    Package,
     SourceError,
     UvSelection,
     _poetry_extras_declared_elsewhere,
@@ -712,42 +711,43 @@ def _names(capsys, argv, target="linux-x86_64", python="3.13"):
     return code, {p["name"] for p in report["packages"] if [*p["results"].values()] != ["n/a"]}, err
 
 
-# What `poetry install --dry-run` (Poetry 2.5.1) installs for the same options on a Poetry 2.5.1 lock of this shape.
+# What `poetry install --dry-run` (Poetry 2.5.1) installs for the same options on a Poetry 2.5.1 lock of this shape,
+# plus what Poetry 2.0-2.2 may install too: linuxyaml's and backport's markers combine an extra with other conditions
+# (`sys_platform == "linux" and extra == "yaml"`), so they're kept for every extra, with a note when the extras
+# selected would have left them out.
 @pytest.mark.parametrize(
-    "args, expected",
+    "args, expected, noted",
     [
-        ([], POETRY_EXTRAS_ALL),  # no selector: every extra still counts
-        (["--no-dev"], {"app-dep"}),  # poetry install --without dev: no extras
-        (["--no-dev", "--extra", "s3"], {"app-dep", "s3lib", "shared"}),
-        (["--no-dev", "--extra", "Fancy_Name"], {"app-dep", "pretty"}),  # extra names are normalized
-        (["--no-dev", "--extra", "yaml"], {"app-dep", "linuxyaml"}),
-        (["--no-dev", "--extra", "empty"], {"app-dep"}),
-        (["--no-dev", "--all-extras"], POETRY_EXTRAS_ALL - {"devrunner"}),
-        (["--extra", "both"], {"app-dep", "shared", "devtool", "devrunner"}),
-        (["--only-group", "main", "--extra", "both"], {"app-dep", "shared", "devtool"}),  # --only main --extras both
-        (["--only-group", "dev", "--extra", "s3"], {"devtool", "devrunner"}),  # Poetry ignores extras without main
+        ([], POETRY_EXTRAS_ALL, None),  # no selector: every extra still counts
+        (["--no-dev"], {"app-dep", "linuxyaml"}, "linuxyaml, backport"),  # poetry install --without dev
+        (["--no-dev", "--extra", "s3"], {"app-dep", "s3lib", "shared", "linuxyaml"}, "linuxyaml kept"),
+        (["--no-dev", "--extra", "Fancy_Name"], {"app-dep", "pretty", "linuxyaml"}, "linuxyaml, backport"),
+        (["--no-dev", "--extra", "yaml"], {"app-dep", "linuxyaml"}, "backport kept"),
+        (["--no-dev", "--extra", "empty"], {"app-dep", "linuxyaml"}, "linuxyaml, backport"),
+        (["--no-dev", "--all-extras"], POETRY_EXTRAS_ALL - {"devrunner"}, None),
+        (["--extra", "both"], {"app-dep", "shared", "devtool", "devrunner", "linuxyaml"}, "linuxyaml, backport"),
+        (["--only-group", "main", "--extra", "both"], {"app-dep", "shared", "devtool", "linuxyaml"}, "linuxyaml"),
+        (["--only-group", "dev", "--extra", "s3"], {"devtool", "devrunner"}, None),  # extras need main
     ],
 )
-def test_poetry_lock_extras_follow_poetry_install(poetry_extras, capsys, fake_pypi, args, expected):
+def test_poetry_lock_extras_follow_poetry_install(poetry_extras, capsys, fake_pypi, args, expected, noted):
     code, names, err = _names(capsys, [str(poetry_extras), *args])
     assert names == expected and code == (1 if expected - {"app-dep", "devrunner"} else 0)
-    assert "note" not in err
+    if noted is None:
+        assert "note" not in err
+    else:
+        assert f"note: poetry.lock: {noted}" in err and "kept for every extra" in err
     assert fake_pypi == []
 
 
-@pytest.mark.parametrize(
-    "args, backport",
-    [
-        (["--no-dev"], False),
-        (["--no-dev", "--extra", "s3"], True),  # main's marker: extra == "s3" and python_version < "3.11"
-        (["--extra", "both"], True),  # dev's marker holds, though main's (extra s3) doesn't: either group counts
-    ],
-)
-def test_poetry_lock_extras_keep_each_groups_markers(poetry_extras, capsys, fake_pypi, args, backport):
-    _, names, _ = _names(capsys, [str(poetry_extras), *args], python="3.10")
-    assert ("backport" in names) is backport
-    _, names, _ = _names(capsys, [str(poetry_extras), *args])
-    assert "backport" not in names  # python_version < "3.11" in both groups
+def test_poetry_lock_mixed_markers_are_kept_for_every_extra(poetry_extras, capsys, fake_pypi):
+    # backport: main `extra == "s3" and python_version < "3.11"`, dev `python_version < "3.11"`. Its python_version
+    # still applies, but s3 isn't needed for it.
+    for args in (["--no-dev"], ["--no-dev", "--extra", "s3"], ["--extra", "both"]):
+        _, names, _ = _names(capsys, [str(poetry_extras), *args], python="3.10")
+        assert "backport" in names
+        _, names, _ = _names(capsys, [str(poetry_extras), *args])
+        assert "backport" not in names
 
 
 def test_poetry_lock_extras_keep_their_other_markers(poetry_extras, capsys, fake_pypi):
@@ -773,12 +773,35 @@ def test_poetry_lock_extras_leave_out_packages_no_selected_extra_needs(poetry_ex
     sources = load_inputs([str(poetry_extras)])
     select_uv_dependencies(sources, UvSelection(extras=frozenset({"s3"}), no_dev=True))
     (source,) = sources
-    assert {p.name for p in source.packages} == {"app-dep", "s3lib", "shared", "backport"}
-    assert {"linuxyaml", "pretty", "devtool", "devrunner"} <= source.unselected_keys
-    assert all(p.poetry_extras == (frozenset(POETRY_EXTRAS_SECTIONS), frozenset({"s3"})) for p in source.packages)
+    packages = {p.name: p for p in source.packages}
+    assert set(packages) == {"app-dep", "s3lib", "shared", "backport", "linuxyaml"}
+    assert {"pretty", "devtool", "devrunner"} <= source.unselected_keys
+    # A selected extra decides s3lib and shared everywhere; linuxyaml keeps its marker, read with extras unknown.
+    assert packages["s3lib"].markers is None and packages["shared"].markers is None
+    assert packages["linuxyaml"].markers == ['sys_platform == "linux" and extra == "yaml"']
 
 
-POETRY_EXTRAS_SECTIONS = ["both", "empty", "fancy-name", "s3", "yaml"]
+def test_poetry_lock_package_counts_if_any_groups_extra_is_selected(tmp_path):
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "twice"\nversion = "1.0"\ngroups = ["main", "docs"]\n'
+        'markers = {main = "extra == \\"a\\"", docs = "extra == \\"b\\""}\nfiles = []\n\n'
+        '[extras]\na = ["twice"]\nb = []\n\n[metadata]\nlock-version = "2.1"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "0"\n', encoding="utf-8")
+    for extras, kept in (({"a"}, True), ({"b"}, True), (set(), False)):
+        sources = load_inputs([str(tmp_path)])
+        select_uv_dependencies(sources, UvSelection(extras=frozenset(extras), groups=frozenset({"docs"})))
+        assert bool(sources[0].packages) is kept
+        assert not kept or sources[0].packages[0].markers is None
+
+
+def test_poetry_lock_extra_names_in_the_lock_are_normalized(poetry_extras):
+    lock = poetry_extras / "poetry.lock"
+    lock.write_text(lock.read_text(encoding="utf-8").replace("fancy-name = [", "Fancy_Name = ["), encoding="utf-8")
+    sources = load_inputs([str(poetry_extras)])
+    select_uv_dependencies(sources, UvSelection(extras=frozenset({"fancy-name"}), no_dev=True))
+    assert "pretty" in {p.name for p in sources[0].packages}
 
 
 def test_poetry_lock_ignore_note_counts_packages_extras_leave_out(poetry_extras, capsys, fake_pypi):
@@ -792,9 +815,9 @@ def test_poetry_lock_configured_extras_apply(poetry_extras, capsys, fake_pypi):
     with (poetry_extras / "pyproject.toml").open("a", encoding="utf-8") as f:
         f.write('\n[tool.wheelgap]\nextras = ["s3"]\n')
     code, names, _ = _names(capsys, [str(poetry_extras), "--no-dev"])
-    assert code == 1 and names == {"app-dep", "s3lib", "shared"}
+    assert code == 1 and names == {"app-dep", "s3lib", "shared", "linuxyaml"}
     code, names, _ = _names(capsys, [str(poetry_extras), "--no-dev", "--extra", "fancy-name"])  # replaces them
-    assert code == 1 and names == {"app-dep", "pretty"}
+    assert code == 1 and names == {"app-dep", "pretty", "linuxyaml"}
 
 
 def test_poetry_lock_unknown_extra_names_the_lock(poetry_extras, capsys, fake_pypi):
@@ -1028,10 +1051,52 @@ def test_poetry_lock_extras_leave_nothing_out_when_poetry_versions_disagree(
         (LEGACY + 'six = "*"\n\n[tool.poetry.extras]\na = ["six"]\n', ["six"]),
         (LEGACY + 'six = { version = "*", platform = "darwin" }\n\n[tool.poetry.extras]\na = ["six"]\n', ["six"]),
         (LEGACY + 'six = "*"\n', []),  # in no extra
+        # A legacy optional dependency with a condition, in two extras.
+        (
+            LEGACY + 'six = { version = "*", optional = true, python = "<3.13" }\n\n'
+            '[tool.poetry.extras]\na = ["six"]\nb = ["six"]\n',
+            ["six"],
+        ),
+        (
+            LEGACY + 'six = { version = "*", optional = true, platform = "darwin" }\n\n'
+            '[tool.poetry.extras]\na = ["six"]\nb = ["six"]\n',
+            ["six"],
+        ),
+        # Names are normalized everywhere: Typing_Extensions and typing.extensions are one package.
+        (
+            '[project]\ndependencies = ["typing.extensions"]\n\n'
+            '[project.optional-dependencies]\na = ["Typing_Extensions"]\n',
+            ["typing-extensions"],
+        ),
+        ('[project.optional-dependencies]\na = ["Typing_Extensions"]\nb = ["typing.extensions"]\n', []),
+        (
+            '[project.optional-dependencies]\na = ["Typing_Extensions"]\n\n'
+            '[tool.poetry.group.dev.dependencies]\n"typing.extensions" = "*"\n',
+            ["typing-extensions"],
+        ),
+        (
+            '[project.optional-dependencies]\na = ["Typing_Extensions"]\n\n'
+            '[dependency-groups]\ndev = ["typing.extensions"]\n',
+            ["typing-extensions"],
+        ),
+        (
+            '[project.optional-dependencies]\na = ["Typing_Extensions"]\n\n'
+            '[tool.poetry.dependencies]\n"typing.extensions" = "*"\n',
+            ["typing-extensions"],
+        ),
+        (
+            LEGACY + 'Typing_Extensions = { version = "*", optional = true }\n\n'
+            '[tool.poetry.extras]\na = ["typing.extensions"]\nb = ["typing-extensions"]\n',
+            [],
+        ),
+        (
+            LEGACY + 'Typing_Extensions = "*"\n\n[tool.poetry.extras]\na = ["typing.extensions"]\n',
+            ["typing-extensions"],
+        ),
     ],
 )
 def test_poetry_extras_declared_elsewhere(pyproject, expected):
-    assert _poetry_extras_declared_elsewhere(tomllib.loads(pyproject)) == expected
+    assert _poetry_extras_declared_elsewhere(tomllib.loads(pyproject)) == (expected, [])
 
 
 def test_poetry_extra_markers_have_poetry_meanings(monkeypatch):
@@ -1059,13 +1124,158 @@ def test_poetry_extra_markers_have_poetry_meanings(monkeypatch):
     assert poetry_marker_holds('extra == "c"', target, extras)  # packaging changed: kept rather than hidden
 
 
-def test_poetry_extras_apply_per_target():
-    linux, mac = build_targets(["3.13"], ["linux-x86_64", "macos-arm64"])
-    marker = 'sys_platform == "linux" and extra == "mix" or sys_platform == "darwin" and extra == "alt"'
-    pkg = Package("p", "1", markers=[marker], poetry_extras=(frozenset({"mix", "alt"}), frozenset({"mix"})))
-    assert applies(pkg, linux) and not applies(pkg, mac)
-    pkg.poetry_extras = (frozenset({"mix", "alt"}), frozenset({"alt"}))
-    assert not applies(pkg, linux) and applies(pkg, mac)
+@pytest.mark.parametrize(
+    "marker, decided",
+    [
+        # Only extra comparisons on the project's extras: the selection decides them.
+        ('extra == "a" or extra == "b"', (True, False)),
+        ('extra == "c"', (False, False)),
+        ('"c" == extra', (False, False)),
+        ('extra == "Fancy_Name"', (False, False)),  # normalized: fancy-name, not selected
+        ('(extra == "c" or extra == "a") and extra != "b"', (False, False)),
+        ('(extra == "c" or extra == "a") and extra == "b"', (True, False)),
+        # Anything else is evaluated per target with extras unknown, noting whether the selection rules one out.
+        ('sys_platform == "win32" or extra == "c"', (None, True)),
+        ('sys_platform == "win32" or extra == "a"', (None, False)),
+        ('sys_platform == "win32" and extra == "b" or extra == "c"', (None, True)),
+        ('python_version < "3.11"', (None, False)),
+        ('extra == "other"', (None, False)),  # not one of the project's extras
+        ('"a" in extra', (None, False)),
+        ("extra == sys_platform", (None, False)),
+        ("not a marker ((", (None, False)),
+    ],
+)
+def test_poetry_extras_decide(marker, decided):
+    extras = (frozenset({"a", "b", "c", "fancy-name"}), frozenset({"a", "b"}))
+    assert poetry_extras_decide(marker, extras) == decided
+
+
+def test_poetry_extras_decide_keeps_a_marker_when_packaging_changes(monkeypatch):
+    monkeypatch.setattr(check_module, "_evaluate3", lambda *a, **k: 1 / 0)
+    assert poetry_extras_decide('extra == "c"', (frozenset({"c"}), frozenset())) == (None, False)
+
+
+# Poetry 2.5.1 locks whose markers mix an extra with other conditions, where Poetry 2.0-2.2 (default settings) install
+# a package the markers leave out without the extra: `uvx poetry@2.2.1 install --dry-run --no-root` on macOS, Python
+# 3.12. Poetry 2.5.1 installs none of these packages, so wheelgap reports a superset of both.
+def _lock(*packages: tuple[str, str | None], extras: str) -> str:
+    out = ""
+    for name, markers in packages:
+        out += f'[[package]]\nname = "{name}"\nversion = "1.0"\ngroups = ["main"]\n'
+        if markers is not None:
+            out += f"markers = {markers}\n"
+        out += f'files = [{{file = "{name}-1.0.tar.gz", hash = "sha256:00"}}]\n\n'
+    return out + f'[extras]\n{extras}\n\n[metadata]\nlock-version = "2.1"\n'
+
+
+EXTRA_A = '"extra == \\"a\\""'
+PEP621 = '[project]\nname = "x"\nversion = "0"\nrequires-python = ">=3.10"\n'
+
+
+@pytest.mark.parametrize(
+    "lock, pyproject, args, expected",
+    [
+        # B1: Poetry 2.2.1 `--only main` installs idna and urllib3.
+        (
+            _lock(
+                ("certifi", EXTRA_A),
+                ("idna", '"sys_platform == \\"win32\\" or extra == \\"a\\""'),
+                ("requests", EXTRA_A),
+                ("urllib3", '"python_version == \\"3.10\\" or extra == \\"a\\""'),
+                extras='a = ["requests"]',
+            ),
+            PEP621 + "dependencies = [\"urllib3; python_version < '3.11'\", \"idna; sys_platform == 'win32'\"]\n\n"
+            '[project.optional-dependencies]\na = ["requests"]\n',
+            ["--only-group", "main"],
+            {"idna", "urllib3"},
+        ),
+        # B2: legacy; Poetry 2.2.1 installs idna.
+        (
+            _lock(
+                ("certifi", EXTRA_A),
+                ("idna", '"extra == \\"a\\" or sys_platform == \\"win32\\""'),
+                ("requests", EXTRA_A),
+                extras='a = ["requests"]',
+            ),
+            LEGACY + 'requests = { version = "*", optional = true }\n'
+            'idna = { version = "*", markers = "sys_platform == \'win32\'" }\n\n'
+            '[tool.poetry.extras]\na = ["requests"]\n',
+            ["--no-dev"],
+            {"idna"},
+        ),
+        # B3: a group dependency with a marker that the extra reaches; Poetry 2.2.1 installs pysocks.
+        (
+            _lock(
+                ("requests", EXTRA_A),
+                ("pysocks", '{main = "extra == \\"a\\"", dev = "sys_platform == \\"win32\\""}'),
+                extras='a = ["requests"]',
+            ).replace(
+                'name = "pysocks"\nversion = "1.0"\ngroups = ["main"]',
+                'name = "pysocks"\nversion = "1.0"\ngroups = ["main", "dev"]',
+            ),
+            PEP621
+            + '\n[project.optional-dependencies]\na = ["requests[socks]"]\n\n[tool.poetry.group.dev.dependencies]\n'
+            'pysocks = { version = "*", markers = "sys_platform == \'win32\'" }\n',
+            ["--group", "dev"],
+            {"pysocks"},
+        ),
+        # B4: Poetry 2.2.1 `-E b` installs urllib3.
+        (
+            _lock(
+                ("requests", EXTRA_A),
+                ("urllib3", '"sys_platform == \\"win32\\" and extra == \\"b\\" or extra == \\"a\\""'),
+                extras='a = ["requests"]\nb = ["urllib3"]',
+            ),
+            PEP621
+            + '\n[project.optional-dependencies]\na = ["requests"]\nb = ["urllib3; sys_platform == \'win32\'"]\n',
+            ["--extra", "b"],
+            {"urllib3"},
+        ),
+        # S2: urllib3 in an extra, reached only through `requests; python_version < '3.11'`. Neither Poetry installs
+        # it on 3.12, but its marker has B1's shape, so it's kept too.
+        (
+            _lock(
+                ("requests", '"python_version == \\"3.10\\""'),
+                ("urllib3", '"python_version == \\"3.10\\" or extra == \\"net\\""'),
+                extras='net = ["urllib3"]',
+            ),
+            PEP621 + "dependencies = [\"requests; python_version < '3.11'\"]\n\n"
+            '[project.optional-dependencies]\nnet = ["urllib3"]\n',
+            ["--no-dev"],
+            {"urllib3"},
+        ),
+    ],
+)
+def test_poetry_lock_mixed_extra_markers_report_a_superset(
+    tmp_path, capsys, fake_pypi, lock, pyproject, args, expected
+):
+    (tmp_path / "poetry.lock").write_text(lock, encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+    code, names, err = _names(capsys, [str(tmp_path), *args], target="macos-arm64", python="3.12")
+    assert code == 1 and names == expected
+    assert f"note: poetry.lock: {', '.join(sorted(expected))} kept for every extra" in err
+
+
+def test_poetry_lock_unconditional_dependency_an_extra_reaches_needs_no_note(tmp_path, capsys, fake_pypi):
+    # S1: `dependencies = ["idna"]` and a = ["requests"], which depends on idna: both Poetry versions install idna only.
+    lock = _lock(("certifi", EXTRA_A), ("idna", None), ("requests", EXTRA_A), extras='a = ["requests"]')
+    (tmp_path / "poetry.lock").write_text(lock, encoding="utf-8")
+    pyproject = PEP621 + 'dependencies = ["idna"]\n\n[project.optional-dependencies]\na = ["requests"]\n'
+    (tmp_path / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+    code, names, err = _names(capsys, [str(tmp_path), "--no-dev"], target="macos-arm64", python="3.12")
+    assert names == {"idna"} and "note" not in err
+
+
+def test_poetry_lock_unreadable_requirement_leaves_nothing_out(poetry_extras, capsys, fake_pypi):
+    pyproject = poetry_extras / "pyproject.toml"
+    pyproject.write_text(POETRY_EXTRAS_PYPROJECT.replace('"app-dep"]', '"app-dep", "not a requirement (("]'), "utf-8")
+    assert _poetry_extras_declared_elsewhere(tomllib.loads(pyproject.read_text("utf-8"))) == (
+        [],
+        ["not a requirement (("],
+    )
+    code, names, err = _names(capsys, [str(poetry_extras), "--no-dev"])
+    assert names == POETRY_EXTRAS_ALL - {"devrunner"}
+    assert "pyproject.toml has requirements wheelgap can't read (not a requirement (()" in err
 
 
 def test_configured_extras_leave_a_pdm_lock_as_it_is(tmp_path, capsys, fake_pypi):

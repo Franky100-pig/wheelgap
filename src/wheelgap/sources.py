@@ -59,8 +59,6 @@ class Package:
     registry: str | None = None
     # The index picked `version` (an unpinned or ranged requirement): it isn't a pin from the input.
     version_from_index: bool = False
-    # poetry.lock after a selection: the project's extras, so `markers` read `extra` the way Poetry does.
-    poetry_extras: PoetryExtras | None = None
 
     @property
     def key(self) -> str:
@@ -117,8 +115,8 @@ class Source:
     poetry_pyproject: Path | None = None
     # poetry.lock only: the extras in its [extras] table, which `poetry install --extras` accepts.
     poetry_lock_extras: list[str] = field(default_factory=list)
-    # poetry.lock after a selection: why Poetry versions may disagree on what its extras install (see
-    # _poetry_extras_declared_elsewhere), so extras didn't leave anything out. Shown in a note.
+    # poetry.lock after a selection: the note that says where extras couldn't leave packages out, because Poetry
+    # 2.0-2.2 may install them without the extra (see poetry_extras_decide and _poetry_extras_declared_elsewhere).
     poetry_extras_unsure: str | None = None
     # pdm.lock only: each package's `groups` list (None for a package that records none, as before PDM 2.x),
     # kept so --group/--only-group/--no-dev can pick packages. None when the input isn't a pdm.lock.
@@ -347,7 +345,7 @@ def _select_poetry(source: Source, selection: UvSelection) -> None:
     every non-optional group by default, `--group` adds a group (like `poetry install --with`), `--no-dev` leaves
     out `dev`, and `--only-group` installs only the named groups (`main` too only if named). Extras are only those
     selected, as with `poetry install --extras` / `--all-extras`: a package's markers read `extra` as that set."""
-    from .check import poetry_marker_holds  # check imports this module
+    from .check import poetry_extras_decide  # check imports this module
 
     tables = source.poetry_tables or []
     if source.edges is not None or any(not isinstance(t.get("groups"), list) for t in tables):
@@ -362,16 +360,16 @@ def _select_poetry(source: Source, selection: UvSelection) -> None:
     known = {"main"} | {canonicalize_name(g) for t in tables for g in t["groups"]}
     optional: set[str] = set()
     pyproject = source.poetry_pyproject
+    unsure = None
     if known_extras and (pyproject is None or not pyproject.is_file()):
-        # Can't check what declares its extras' dependencies: never let extras leave a package out of it.
-        source.poetry_extras_unsure = "no pyproject.toml beside it to show how its extras are declared"
-        extras = None
+        unsure = "no pyproject.toml beside it to show how its extras are declared"
     if pyproject is not None and pyproject.is_file():
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-        if elsewhere := _poetry_extras_declared_elsewhere(data):
-            # The lock's markers for these can be wrong for Poetry 2.0-2.2: never let extras leave a package out.
-            source.poetry_extras_unsure = f"{', '.join(elsewhere)} in an extra and declared elsewhere in pyproject.toml"
-            extras = None
+        elsewhere, unreadable = _poetry_extras_declared_elsewhere(data)
+        if unreadable:
+            unsure = f"pyproject.toml has requirements wheelgap can't read ({', '.join(unreadable)})"
+        elif elsewhere:
+            unsure = f"{', '.join(elsewhere)} in an extra and declared elsewhere in pyproject.toml"
         # PEP 735 groups (Poetry 2.2+): an empty one is in no package's groups, but it's still a known group.
         pep735 = data.get("dependency-groups")
         known.update(canonicalize_name(name) for name in (pep735 if isinstance(pep735, dict) else {}))
@@ -380,6 +378,13 @@ def _select_poetry(source: Source, selection: UvSelection) -> None:
             known.add(canonicalize_name(name))
             if isinstance(group, dict) and group.get("optional") is True:
                 optional.add(canonicalize_name(name))
+    if unsure is not None:
+        # The lock's markers can be wrong for Poetry 2.0-2.2 here: never let extras leave a package out of it.
+        source.poetry_extras_unsure = (
+            f"{unsure}, so Poetry 2.0-2.2 and 2.3+ may install different packages without an extra; "
+            "extras leave no package out of this lock"
+        )
+        extras = None
     unknown = (selection.groups | selection.only_groups) - known
     if unknown:
         raise SourceError(f"{source.label}: unknown groups: {', '.join(sorted(unknown))}")
@@ -390,31 +395,42 @@ def _select_poetry(source: Source, selection: UvSelection) -> None:
     if selection.no_dev:
         chosen.discard("dev")
     kept = []
+    kept_anyway: list[str] = []
     for pkg, table in zip(source.packages, tables, strict=True):
         groups = [g for g in table["groups"] if canonicalize_name(g) in chosen]
-        markers = _poetry_markers(table, groups) if groups else None
-        # Left out on every target: in no selected group, or only for extras that aren't selected.
-        if not groups or (
-            extras is not None
-            and markers is not None
-            and not any(poetry_marker_holds(m, None, extras) for m in markers)
-        ):
+        if not groups:
             source.unselected_keys.add(pkg.key)
             continue
+        markers = _poetry_markers(table, groups)
+        if markers is not None and extras is not None:
+            decided = [poetry_extras_decide(m, extras) for m in markers]
+            if all(holds is not None for holds, _ in decided):
+                if not any(holds for holds, _ in decided):
+                    source.unselected_keys.add(pkg.key)  # only for extras that aren't selected
+                    continue
+                markers = None  # a selected extra installs it, on every target
+            elif any(holds is False or ruled_out for holds, ruled_out in decided):
+                kept_anyway.append(pkg.name)  # the extras selected would have left it out somewhere
         pkg.markers = markers
-        pkg.poetry_extras = extras
         kept.append(pkg)
+    if kept_anyway:
+        shown = ", ".join(kept_anyway[:5]) + (f" and {len(kept_anyway) - 5} more" if len(kept_anyway) > 5 else "")
+        source.poetry_extras_unsure = (
+            f"{shown} kept for every extra: their markers combine an extra with other conditions, and Poetry 2.0-2.2 "
+            "can install them without the extra"
+        )
     source.packages = kept
     source.poetry_tables = None
 
 
-def _poetry_extras_declared_elsewhere(data: dict) -> list[str]:
+def _poetry_extras_declared_elsewhere(data: dict) -> tuple[list[str], list[str]]:
     """Names in an extra that pyproject.toml also declares somewhere else: in the main dependencies (in any form), in
     a group, or in another extra entry that isn't the same plain requirement. Poetry 2.x can lock these, and what they
     depend on, with only the extra's marker (`requests; python_version < '3.11'` that an extra also lists becomes
     `extra == "s3"`), and then Poetry 2.3 and later (which install from the lock's markers) leave them out where
     Poetry 2.0 to 2.2 (which re-resolve, as installer.re-resolve does) install them. Found with Poetry 2.5.1 locks
-    installed by Poetry 2.0.1, 2.2.1 and 2.5.1. The same plain requirement in several extras locks correctly."""
+    installed by Poetry 2.0.1, 2.2.1 and 2.5.1. The same plain requirement in several extras locks correctly. Also
+    returns the requirement strings it can't read, which could be any of these."""
 
     def table(value: object) -> dict:
         return value if isinstance(value, dict) else {}
@@ -422,14 +438,19 @@ def _poetry_extras_declared_elsewhere(data: dict) -> list[str]:
     def strings(value: object) -> list[str]:
         return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
 
-    def names(specs: list[str]) -> list[str]:
-        out: list[str] = []
+    unreadable: list[str] = []
+
+    def requirements(specs: list[str]) -> list[Requirement]:
+        out: list[Requirement] = []
         for spec in specs:
             try:
-                out.append(canonicalize_name(Requirement(spec).name))
+                out.append(Requirement(spec))
             except InvalidRequirement:
-                continue
+                unreadable.append(spec)
         return out
+
+    def names(specs: list[str]) -> list[str]:
+        return [canonicalize_name(req.name) for req in requirements(specs)]
 
     project = table(data.get("project"))
     poetry = table(table(data.get("tool")).get("poetry"))
@@ -437,12 +458,9 @@ def _poetry_extras_declared_elsewhere(data: dict) -> list[str]:
     # Each extra entry, as (name, what it says): a repeated entry is safe only if it's the same plain requirement.
     entries: list[tuple[str, str | None]] = []
     for specs in table(project.get("optional-dependencies")).values():
-        for spec in strings(specs):
-            try:
-                req = Requirement(spec)
-            except InvalidRequirement:
-                continue
-            entries.append((canonicalize_name(req.name), None if req.marker else str(req)))
+        for req in requirements(strings(specs)):
+            says = f"{sorted(map(canonicalize_name, req.extras))} {req.specifier} {req.url}"
+            entries.append((canonicalize_name(req.name), None if req.marker else says))
     pep621 = {name for name, _ in entries}
     for specs in table(poetry.get("extras")).values():
         for legacy_name in map(canonicalize_name, strings(specs)):
@@ -467,7 +485,7 @@ def _poetry_extras_declared_elsewhere(data: dict) -> list[str]:
     tables += [table(table(g).get("dependencies")) for g in table(poetry.get("group")).values()]
     elsewhere |= {canonicalize_name(name) for t in tables for name in t}
     elsewhere |= {name for group in table(data.get("dependency-groups")).values() for name in names(strings(group))}
-    return sorted(elsewhere & in_extras)
+    return sorted(elsewhere & in_extras), unreadable
 
 
 def _select_pdm_groups(source: Source, selection: UvSelection) -> None:

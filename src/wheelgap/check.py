@@ -414,6 +414,37 @@ def poetry_marker_holds(marker: str, target: Target | None, extras: PoetryExtras
         return True
 
 
+def poetry_extras_decide(marker: str, extras: PoetryExtras) -> tuple[bool | None, bool]:
+    """How the selected extras decide a Poetry 2.x lock marker. If it's only `extra` comparisons on the project's
+    extras (`extra == "a" or extra == "b"`), the selection alone decides it: (True or False, False). Anything else
+    (`sys_platform == "win32" or extra == "a"`) also depends on how the package is reached, which Poetry 2.0-2.2 (and
+    installer.re-resolve) read differently from the lock, so it's (None, ruled_out): evaluated per target with every
+    extra unknown, a superset, where ruled_out says whether the selection rules out one of its extra comparisons."""
+    m = _parsed_marker(marker)
+    if m is None or _Variable is None:
+        return None, False
+    atoms: list[tuple] = []
+
+    def walk(items: list) -> None:
+        for item in items:
+            if isinstance(item, list):
+                walk(item)
+            elif isinstance(item, tuple):
+                atoms.append(item)
+
+    try:
+        walk(m._markers)
+        decided = [
+            _poetry_extra(atom, extras) if {n.value for n in atom if isinstance(n, _Variable)} == {"extra"} else None
+            for atom in atoms
+        ]
+        if atoms and all(d is not None for d in decided):
+            return _evaluate3(m._markers, None, poetry_extras=extras) is not False, False
+        return None, False in decided
+    except Exception:  # packaging changed its internals: count it as needed rather than hide a gap
+        return None, False
+
+
 def marker_holds(
     marker: str | None,
     target: Target,
@@ -606,8 +637,6 @@ def _in_range(version: str | None, spec: SpecifierSet) -> bool:
 
 
 def applies(pkg: Package, target: Target) -> bool:
-    if pkg.markers is not None and pkg.poetry_extras is not None:
-        return any(poetry_marker_holds(m, target, pkg.poetry_extras) for m in pkg.markers)
     return pkg.markers is None or any(marker_holds(m, target) for m in pkg.markers)
 
 
