@@ -8,6 +8,10 @@ license: MIT
 
 wheelgap reads a lockfile and reports, per package and target platform, whether pip/uv would install a prebuilt **wheel**, build from **source** (slow, needs a compiler), or find nothing (**missing**). Lockfiles that record their files (`uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`) are checked offline in about a second; `requirements*.txt`, `Pipfile.lock` and package names are looked up on PyPI.
 
+## If the wheelgap MCP server is available
+
+If the `wheelgap` MCP server is connected, prefer its tools to the command line: `check_lockfile`, `check_dockerfile`, `diff_lockfiles`, `check_package` (one package, latest or a given version) and `list_targets`. Their results are shaped differently from `--json`: `check_lockfile` and `check_dockerfile` return `ok` (true only when no package has a gap) and `gaps` (just the packages with one, each with its `results` and `error`); `diff_lockfiles` returns `worse`, `new` and `ok`. Statuses, `unknown`, `skipped` and the advice below apply as for the command line. Pass paths as absolute paths or `file://` URIs, since the server's working directory may not be the project. The tools take no `--no-dev`, `--group` or `--extra` arguments (`check_lockfile` still applies `groups` and `extras` from `[tool.wheelgap]`), so when you need a selection the project doesn't configure, run the command line instead. To set it up: `claude mcp add wheelgap -- uvx --from wheelgap wheelgap-mcp` (other clients: [MCP setup guide](https://github.com/wheelgap/wheelgap/blob/main/docs/mcp.md)).
+
 ## Run it
 
 ```bash
