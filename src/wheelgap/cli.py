@@ -1061,14 +1061,13 @@ def conda_forge_hints(
 ) -> dict[int, condaforge.Hint]:
     """--conda-forge: look the gap packages up on anaconda.org and return their hints, by id() of the package. Only
     names that are positively PyPI's are sent; notes on stderr say which packages weren't looked up, and why."""
-    if origin.other_index(index_url) is not None:
-        if not quiet:
-            print(
-                "wheelgap: note: --conda-forge looks nothing up when packages come from another index "
-                "(--index-url, index-url or WHEELGAP_INDEX_URL), so no package names leave it",
-                file=sys.stderr,
-            )
-        return {}
+    other = origin.other_index(index_url)
+    if other is not None and not quiet:
+        print(
+            "wheelgap: note: --conda-forge looks nothing up when packages come from another index "
+            f"({other}), so no package names leave it",
+            file=sys.stderr,
+        )
     source_of = {id(p): s for s in sources for p in s.packages}
     asked, private = [], []
     for r in gaps:
@@ -1077,7 +1076,7 @@ def conda_forge_hints(
                 asked.append(r)
             else:
                 private.append(r.package.name)
-    if private and not quiet:
+    if private and other is None and not quiet:
         private = list(dict.fromkeys(private))
         print(
             f"wheelgap: note: --conda-forge didn't look up {len(private)} package{'s' * (len(private) != 1)} "
@@ -1086,11 +1085,11 @@ def conda_forge_hints(
         )
     lookups = condaforge.look_up_all([(r.package.key, r.package.version or "") for r in asked], **cached)
     if lookups.unchecked and not quiet:
-        why = "anaconda.org stopped answering, or was too slow" if lookups.stopped else "no usable answer"
         n = len(lookups.unchecked)
+        which = _names([f"{name} ({why})" for name, why in lookups.unchecked.items()])
         print(
-            f"wheelgap: note: --conda-forge couldn't check {n} package{'s' * (n != 1)} ({_names(lookups.unchecked)}): "
-            f"{why}, so no hint doesn't mean conda-forge has no build",
+            f"wheelgap: note: --conda-forge couldn't check {n} package{'s' * (n != 1)}: {which}; "
+            "no hint doesn't mean conda-forge has no build",
             file=sys.stderr,
         )
     hints = {}

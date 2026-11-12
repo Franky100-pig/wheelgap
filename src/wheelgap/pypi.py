@@ -385,8 +385,9 @@ PYPI_SIMPLE = "https://pypi.org/simple"
 
 
 def is_pypi(registry: str | None) -> bool:
-    """Whether a package pinned to `registry` comes from PyPI: unset (the default index) or exactly PYPI_SIMPLE."""
-    return (registry or PYPI_SIMPLE).rstrip("/") == PYPI_SIMPLE
+    """Whether a package pinned to `registry` comes from PyPI: unset (None: the default index) or exactly PYPI_SIMPLE.
+    An empty registry ("") isn't PyPI: it says nothing about where the package came from."""
+    return registry is None or (isinstance(registry, str) and registry.rstrip("/") == PYPI_SIMPLE)
 
 
 def _index(url: str, suffix: str) -> tuple[str, str, int | None, str] | None:

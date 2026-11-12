@@ -12,17 +12,36 @@ from collections.abc import Mapping
 from . import pypi
 from .sources import Package, Source
 
-# Settings that point pip or uv at another index: with any of them set, a name found on pypi.org may still be a
-# private package's.
+# Settings that point pip or uv at another index, or at a config file that may: with any of them set, a name found
+# on pypi.org may still be a private package's. pip lower-cases what follows PIP_, so PIP_index_url counts too; every
+# UV_INDEX_* variable counts (UV_INDEX_<NAME>_USERNAME names an index configured somewhere).
 INDEX_ENV = (
     "PIP_INDEX_URL",
     "PIP_EXTRA_INDEX_URL",
     "PIP_FIND_LINKS",
+    "PIP_NO_INDEX",
+    "PIP_CONFIG_FILE",
     "UV_INDEX_URL",
     "UV_DEFAULT_INDEX",
     "UV_INDEX",
     "UV_EXTRA_INDEX_URL",
+    "UV_FIND_LINKS",
+    "UV_NO_INDEX",
+    "UV_CONFIG_FILE",
 )
+_PIP_INDEX_ENV = {name.removeprefix("PIP_") for name in INDEX_ENV if name.startswith("PIP_")}
+
+
+def index_env(env: Mapping[str, str] = os.environ) -> str | None:
+    """The first set (non-empty) environment variable that may point pip or uv at another index, or None."""
+    for name, value in env.items():
+        if not value:
+            continue
+        if name in INDEX_ENV or name.startswith("UV_INDEX_"):
+            return name
+        if name.startswith("PIP_") and name[4:].upper() in _PIP_INDEX_ENV:
+            return name
+    return None
 
 
 def other_index(simple_index: str | None = None, env: Mapping[str, str] = os.environ) -> str | None:
@@ -45,12 +64,12 @@ def known_pypi(
     - the package comes from an index (not git, a path, a URL, or a skipped private index);
     - either its lock says it came from PyPI (uv.lock's registry, pylock.toml's index is https://pypi.org/simple),
       or this run found it on pypi.org (Package.found_on_pypi) and neither its input (Source.pypi_only) nor the
-      environment (INDEX_ENV) names another index.
+      environment (index_env) names another index.
 
     So never a pdm.lock or poetry.lock entry, a pylock.toml entry with no index, a requirements file with an
     --index-url line, or anything else wheelgap can't place."""
     if other_index(simple_index, env) is not None or pkg.skip:
         return False
-    if pkg.registry is not None and pypi.is_pypi(pkg.registry):
+    if isinstance(pkg.registry, str) and pkg.registry.rstrip("/") == pypi.PYPI_SIMPLE:
         return True
-    return pkg.found_on_pypi and source.pypi_only and not any(env.get(k) for k in INDEX_ENV)
+    return pkg.found_on_pypi and source.pypi_only and index_env(env) is None

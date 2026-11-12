@@ -159,7 +159,7 @@ def T(python, platform="linux-x86_64"):
     return Target(int(python[0]), int(python.rstrip("t").split(".")[1]), python.endswith("t"), platform)
 
 
-def B(subdir="linux-64", abi=None, python=None, os=(), glibc=None, osx=None, other_virtual=False):
+def B(subdir="linux-64", abi=None, python=None, os=(), glibc=None, osx=None, unknown=False):
     return {
         "subdir": subdir,
         "abi": abi,
@@ -167,7 +167,7 @@ def B(subdir="linux-64", abi=None, python=None, os=(), glibc=None, osx=None, oth
         "os": list(os),
         "glibc": glibc,
         "osx": osx,
-        "other_virtual": other_virtual,
+        "unknown": unknown,
     }
 
 
@@ -201,7 +201,7 @@ def TG(python, platform="linux-x86_64", glibc=(2, 36), macos=(14, 0)):
         (B(python=["2.7*"]), T("3.13"), False),
         (B(python=["~=3"]), T("3.13"), False),  # can't be told: never counts
         (B(python=["~=3.13.0"]), T("3.13"), True),
-        (B(abi="cp313", python=[], other_virtual=True), T("3.13"), False),  # __cuda and the like
+        (B(abi="cp313", python=[], unknown=True), T("3.13"), False),  # __cuda and the like
         (B("noarch", python=[], os=["__linux"]), T("3.13", "macos-arm64"), False),
         (B("noarch", python=[], os=["__linux"]), T("3.13", "linux-aarch64"), True),
         (B("noarch", python=[], os=["__glibc"], glibc=">=2.17"), T("3.13", "macos-arm64"), False),
@@ -216,6 +216,8 @@ def TG(python, platform="linux-x86_64", glibc=(2, 36), macos=(14, 0)):
         (B(abi="abi3", python=[">=3.11"]), T("3.13t"), False),  # the stable ABI isn't free-threaded's
         (B(abi="abi3", python=[">=3.11"]), T("3.10"), False),
         (B(abi="abi3", python=[]), T("3.13"), False),  # no cpython constraint: can't be told
+        (B("linux-64", "cp313", [], ["__glibc"], ">=2.17,<2.30"), TG("3.13", glibc=(2, 36)), False),  # and-ed
+        (B("linux-64", "cp313", [], ["__glibc"], ">=2.17,<2.30"), TG("3.13", glibc=(2, 28)), True),
         (B("osx-64", abi="cp313", python=[]), T("3.13"), False),  # another subdir
         (B("win-32", abi="cp313", python=[]), T("3.13", "win32"), False),  # a dead subdir
     ],
@@ -253,6 +255,11 @@ def test_fits(build, target, fits):
         (">=3.8,!=3.9.*", (3, 10), True),
         (">=3.9.5,<3.9.6", (3, 9), True),  # only 3.9.5
         ("<3.9.0", (3, 9), False),
+        (">=3.12.5", (3, 12), True),  # a late patch
+        (">3.10.5,<3.10.7", (3, 10), True),  # only 3.10.6: a named patch's neighbour
+        (">=3.11", (3, 12), True),  # names no 3.12 patch: X.Y.0 and X.Y.99 decide
+        ("<=3.12.0", (3, 12), True),  # only 3.12.0
+        ("3.6|3.7", (3, 6), True),  # the first alternative matches
         ("*", (3, 9), True),
         ("~=3", (3, 9), None),
         (">=3.9.*", (3, 9), None),
@@ -281,6 +288,24 @@ def test_parse_builds_keeps_the_version_s_main_unbroken_builds():
     ]
 
 
+def test_parse_builds_ands_two_glibc_dependencies_and_marks_pypy_unknown():
+    files = [
+        conda_file("0.9", "linux-64", *cp(13), "__glibc >=2.17", "__glibc <2.30"),
+        conda_file("0.9", "linux-aarch64", "python 3.9.* *_73_pypy", "python_abi 3.9 *_pypy39_pp73"),
+        conda_file("0.9", "osx-64", "python", "python 3.13.* *_cp313t", "python_abi 3.13.* *_cp313t"),
+    ]
+    assert condaforge.parse_builds({"files": files}, "0.9") == [
+        B(abi="cp313", python=[], os=["__glibc"], glibc=">=2.17,<2.30"),
+        B("linux-aarch64", "pypy39_pp73", ["3.9.*"], unknown=True),
+        B("osx-64", "cp313t", ["3.13.*"]),
+    ]
+    # A PyPy python build string with no python_abi: unknown, so it never counts.
+    (pypy,) = condaforge.parse_builds(
+        {"files": [conda_file("0.9", "noarch", "python >=3.8", "python 3.9.* *_pypy")]}, "0.9"
+    )
+    assert pypy["unknown"] and not condaforge.fits(pypy, T("3.9"))
+
+
 def test_parse_builds_reads_real_shaped_depends():
     files = [
         # linux-aarch64 numpy builds name the interpreter as `python 3.12.* *_cpython`: the build string isn't a
@@ -300,7 +325,7 @@ def test_parse_builds_reads_real_shaped_depends():
     assert builds == [
         B("linux-aarch64", "cp312", ["3.12.*"], ["__glibc"], ">=2.17,<3.0.a0"),
         B("osx-64", "abi3", [">=3.11"], ["__osx"], osx=">=11.0"),
-        B("linux-64", "cp312", [], other_virtual=True),
+        B("linux-64", "cp312", [], unknown=True),
     ]
     assert condaforge.fits(builds[0], T("3.12", "linux-aarch64"))
     assert condaforge.fits(builds[1], T("3.13", "macos-x86_64"))
@@ -455,10 +480,15 @@ def test_index_env_is_the_agreed_list():
         "PIP_INDEX_URL",
         "PIP_EXTRA_INDEX_URL",
         "PIP_FIND_LINKS",
+        "PIP_NO_INDEX",
+        "PIP_CONFIG_FILE",
         "UV_INDEX_URL",
         "UV_DEFAULT_INDEX",
         "UV_INDEX",
         "UV_EXTRA_INDEX_URL",
+        "UV_FIND_LINKS",
+        "UV_NO_INDEX",
+        "UV_CONFIG_FILE",
     )
 
 
@@ -498,6 +528,15 @@ def test_same_name_from_pypi_and_a_private_index(capsys, fake_pypi, tmp_path):
     assert "didn't look up 1 package" in err
 
 
+def test_index_url_keeps_even_pypi_lock_names(capsys, fake_pypi, fake_simple, tmp_path):
+    # A uv.lock entry from pypi.org is known PyPI, but not in a run that uses another index.
+    (tmp_path / "uv.lock").write_text(uv_lock("https://pypi.org/simple"), encoding="utf-8")
+    _, _, err = run(
+        capsys, str(tmp_path / "uv.lock"), "-t", "linux-aarch64", *FLAGS, "--index-url", "https://x.example/simple"
+    )
+    assert not conda_calls(fake_pypi) and "(--index-url)" in err and "didn't look up" not in err
+
+
 def test_other_index_runs_look_nothing_up(capsys, fake_pypi, fake_simple, monkeypatch):
     args = ["nowheels==0.9", "-t", "linux-aarch64", *FLAGS]
     _, out, err = run(capsys, *args, "--index-url", "https://pkgs.example.com/simple")
@@ -535,7 +574,7 @@ def test_a_failed_lookup_is_a_note_and_not_cached(capsys, fake_pypi, monkeypatch
     code_plain, out_plain, err_plain = run(capsys, *args)
     code, out, err = run(capsys, *args, "--conda-forge")
     assert (code, out) == (code_plain, out_plain)
-    assert err == err_plain + err[len(err_plain) :] and "couldn't check 1 package (nowheels)" in err
+    assert err == err_plain + err[len(err_plain) :] and "couldn't check 1 package: nowheels (no usable answer)" in err
     run(capsys, *args, "--conda-forge")
     assert conda_calls(fake_pypi) == [API + "nowheels"] * 2  # asked again: a failure isn't an answer
     assert cache.load_builds("nowheels", "0.9") is None
@@ -577,7 +616,7 @@ def test_too_large_is_cached(capsys, fake_pypi, monkeypatch):
     monkeypatch.setitem(FAKE_CONDA_FORGE, "nowheels", pypi.ResponseTooLarge("over the cap"))
     args = ["nowheels==0.9", "-t", "linux-aarch64", *FLAGS]
     _, out, err = run(capsys, *args)
-    assert "couldn't check 1 package (nowheels)" in err and "named nowheels" not in out
+    assert "couldn't check 1 package: nowheels (answer too large (over 16 MB))" in err and "named nowheels" not in out
     assert cache.load_builds("nowheels", "0.9") == cache.TOO_LARGE
     _, _, err = run(capsys, *args)
     assert conda_calls(fake_pypi) == [API + "nowheels"] and "couldn't check 1 package" in err  # not fetched again
@@ -598,8 +637,8 @@ def test_too_large_is_cached(capsys, fake_pypi, monkeypatch):
         [{"subdir": "linux-64", "abi": None, "python": None, "os": [1]}],
         [B() | {"glibc": 2.17}],
         [B() | {"osx": [">=11.0"]}],
-        [B() | {"other_virtual": "no"}],
-        [B() | {"other_virtual": None}],
+        [B() | {"unknown": "no"}],
+        [B() | {"unknown": None}],
         ["linux-64"],
     ],
 )
@@ -611,12 +650,12 @@ def test_load_builds_refuses_odd_entries(value):
 def test_conda_forge_entries_are_keyed_apart_from_pypi_ones():
     good = [
         B(abi="cp313", python=["3.13.*"], os=["__glibc"], glibc=">=2.17"),
-        B("noarch", python=[], other_virtual=True),
+        B("noarch", python=[], unknown=True),
     ]
     cache.save_builds("nowheels", "0.9", good)
     assert cache.load_builds("nowheels", "0.9") == good
     assert cache.load_files(cache.CONDA_FORGE_KEY, "nowheels", "0.9") is None
-    assert cache.CONDA_FORGE_KEY.startswith("condaforge-v2 ")  # v2: builds keep __glibc, __osx and other virtuals
+    assert cache.CONDA_FORGE_KEY.startswith("condaforge-v3 ")  # v3: builds keep __glibc, __osx and `unknown`
 
 
 def test_names_are_quoted(monkeypatch):
@@ -641,7 +680,7 @@ def test_a_slow_answer_doesn_t_stop_the_rest(monkeypatch):
 
     monkeypatch.setattr(pypi, "fetch_json", fetch_json)
     lookups = condaforge.look_up_all([("a", "1"), ("b", "1")])
-    assert len(calls) == 2 and lookups.unchecked == ["a"] and not lookups.stopped
+    assert len(calls) == 2 and lookups.unchecked == {"a": condaforge.FAILED} and not lookups.stopped
 
 
 def test_memory_bounds_are_pinned():
@@ -678,7 +717,7 @@ def test_first_connection_failure_stops_the_rest(monkeypatch):
 
     monkeypatch.setattr(pypi, "fetch_json", fetch_json)
     lookups = condaforge.look_up_all([("a", "1"), ("b", "1"), ("c", "1")])
-    assert calls == [API + "a"] and lookups.stopped and lookups.unchecked == ["a", "b", "c"]
+    assert calls == [API + "a"] and lookups.stopped and lookups.unchecked == dict.fromkeys("abc", condaforge.DROPPED)
 
 
 def test_the_deadline_drops_stalled_lookups(monkeypatch):
@@ -693,7 +732,7 @@ def test_the_deadline_drops_stalled_lookups(monkeypatch):
     try:
         lookups = condaforge.look_up_all([("a", "1"), ("b", "1")], deadline=0.2)
         assert time.monotonic() - start < 2
-        assert lookups.stopped and lookups.unchecked == ["a", "b"] and not lookups.found
+        assert lookups.stopped and lookups.unchecked == dict.fromkeys("ab", condaforge.DROPPED) and not lookups.found
     finally:
         release.set()
 
@@ -701,7 +740,7 @@ def test_the_deadline_drops_stalled_lookups(monkeypatch):
 def test_unreachable_is_a_note(capsys, fake_pypi, monkeypatch):
     monkeypatch.setitem(FAKE_CONDA_FORGE, "nowheels", urllib.error.URLError(OSError("no route to host")))
     _, _, err = run(capsys, "nowheels==0.9", "forked==1.0", "-t", "linux-aarch64", *FLAGS)
-    assert "anaconda.org stopped answering, or was too slow" in err
+    assert "nowheels (not asked: anaconda.org couldn't be reached, or was too slow)" in err
 
 
 class CountingResponse(io.BytesIO):

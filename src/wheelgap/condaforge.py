@@ -47,6 +47,10 @@ TIMEOUT = 15.0
 DEADLINE = 30.0  # seconds for all the lookups of a run; past it, the rest are dropped
 NOARCH = "noarch"
 TOO_LARGE = cache.TOO_LARGE
+# Why a lookup gave no usable answer, as the stderr note says it.
+TOO_LARGE_ANSWER = f"answer too large (over {MAX_BYTES // (1024 * 1024)} MB)"
+FAILED = "no usable answer"
+DROPPED = "not asked: anaconda.org couldn't be reached, or was too slow"
 
 # wheelgap platform -> conda subdir. Only the subdirs where conda-forge builds current CPython: it has no Python for
 # linux-32, linux-armv7l or linux-s390x, and win-32 stopped at 3.6. musl, Pyodide, iOS and Android never match.
@@ -75,9 +79,12 @@ VIRTUAL_OS = {
 # - python: the version constraints of its python (and, for abi3, cpython) dependencies, or None when it has none;
 # - os: the VIRTUAL_OS names it depends on;
 # - glibc, osx: the version constraint of its __glibc / __osx dependency ("" for none), or None without one;
-# - other_virtual: it depends on a virtual package wheelgap can't check (__cuda, __archspec...).
+# - unknown: it depends on something wheelgap can't check: a virtual package such as __cuda or __archspec, or a
+#   python that isn't CPython (a PyPy build string such as *_73_pypy).
 Build = dict
-BUILD_KEYS = {"subdir", "abi", "python", "os", "glibc", "osx", "other_virtual"}
+BUILD_KEYS = {"subdir", "abi", "python", "os", "glibc", "osx", "unknown"}
+# The build strings of CPython itself in a `python` dependency: *_cpython, *_cp313, *_cp313t.
+_CPYTHON_BUILD = re.compile(r"\*?_?cp(ython|\d+t?)")
 
 
 class Unreachable(Exception):
@@ -115,7 +122,7 @@ def _build(f: object, version: str) -> Build | None:
         "os": [],
         "glibc": None,
         "osx": None,
-        "other_virtual": False,
+        "unknown": False,
     }
     abi3, cpython = False, []
     for dep in depends if isinstance(depends, list) else []:
@@ -127,6 +134,8 @@ def _build(f: object, version: str) -> Build | None:
             build["abi"] = parts[2].removeprefix("*_")
         elif name == "python":
             build["python"] = (build["python"] or []) + spec  # a bare `python` adds no constraint
+            if len(parts) >= 3 and not _CPYTHON_BUILD.fullmatch(parts[2]):
+                build["unknown"] = True  # PyPy, or another interpreter
         elif name == "cpython":
             cpython += spec
         elif name == "_python_abi3_support":
@@ -136,7 +145,7 @@ def _build(f: object, version: str) -> Build | None:
             if name in ("__glibc", "__osx"):
                 build[name[2:]] = ",".join(filter(None, [build[name[2:]], *spec]))
         elif name.startswith("__"):
-            build["other_virtual"] = True
+            build["unknown"] = True
     if abi3 and build["abi"] is None:
         build["abi"] = "abi3"
         build["python"] = (build["python"] or []) + cpython
@@ -221,7 +230,7 @@ def _admits(spec: str, version: tuple[int, int]) -> bool:
 def fits(build: Build, target: Target) -> bool:
     """Whether a build installs on the target's conda subdir and Python (see the module docstring)."""
     own = SUBDIRS.get(target.platform)
-    if own is None or build["subdir"] not in (own, NOARCH) or build["other_virtual"]:
+    if own is None or build["subdir"] not in (own, NOARCH) or build["unknown"]:
         return False
     family = PLATFORMS[target.platform][0]
     if not all(family in VIRTUAL_OS[name] for name in build["os"]):
@@ -278,8 +287,8 @@ def look_up(key: str, version: str, read_cache: bool = False, write_cache: bool 
 @dataclass
 class Lookups:
     found: dict[tuple[str, str], list[Build]]  # (name, version) -> builds, for the lookups that gave an answer
-    unchecked: list[str]  # names with no usable answer: failed, too large, or dropped
-    stopped: bool  # anaconda.org stopped answering, or the deadline passed, so some lookups were dropped
+    unchecked: dict[str, str]  # name -> why it has no usable answer: TOO_LARGE, FAILED or DROPPED
+    stopped: bool  # anaconda.org couldn't be reached, or the deadline passed, so some lookups were dropped
 
 
 def look_up_all(
@@ -319,7 +328,13 @@ def look_up_all(
         stop.set()
     with lock:
         found = {item: r for item, r in results.items() if isinstance(r, list)}
-        unchecked = list(dict.fromkeys(name for name, v in asked if (name, v) not in found))
+        unchecked: dict[str, str] = {}
+        for item in asked:
+            if item not in found:
+                result = results.get(item)
+                unchecked.setdefault(
+                    item[0], TOO_LARGE_ANSWER if result == TOO_LARGE else FAILED if item in results else DROPPED
+                )
         return Lookups(found, unchecked, len(results) < len(asked))
 
 

@@ -298,6 +298,10 @@ def test_fill_all_still_looks_up_a_pypi_package_with_no_files(fake_pypi):
         ("https://pypi.org/simple/", True),
         ("https://pkgs.example.com/simple", False),
         ("https://pypi.python.org/simple", False),  # the same exact rule recheck_lock() used before
+        ("", False),  # an empty registry says nothing
+        ("/", False),
+        ("https://pypi.org/simple-corp", False),
+        ("https://pypi.org/simple/corp", False),
     ],
 )
 def test_is_pypi(registry, expected):

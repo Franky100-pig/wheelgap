@@ -730,7 +730,8 @@ def parse_pipfile_lock(path: Path) -> Source:
     # A package with no "index" comes from the Pipfile's default source, which may be private: only a lock whose
     # sources are all PyPI says where every package came from.
     urls = [s.get("url") if isinstance(s, dict) else None for s in (sources if isinstance(sources, list) else [])]
-    return Source(path.name, pkgs, pypi_only=bool(urls) and all(_is_public_pypi(u) for u in urls))
+    only_pypi = bool(urls) and all(_is_public_pypi(u) for u in urls) and not _nearby_config_names_an_index(path)
+    return Source(path.name, pkgs, pypi_only=only_pypi)
 
 
 def _is_public_pypi(url: str | None) -> bool:
@@ -760,24 +761,48 @@ def _uv_names_an_index(uv: dict) -> bool:
     return any(k in uv for k in _UV_INDEX_KEYS) or any(k in _table(uv, "pip") for k in _UV_INDEX_KEYS)
 
 
-def _sibling_uv_toml_names_an_index(path: Path) -> bool:
-    """A uv.toml next to the input that configures an index. One that can't be read counts as naming one."""
-    uv_toml = path.parent / "uv.toml"
-    if not uv_toml.exists():
-        return False
-    try:
-        return _uv_names_an_index(tomllib.loads(uv_toml.read_text(encoding="utf-8")))
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
-        return True
-
-
 def _names_an_index(pyproject: dict) -> bool:
-    """Whether a pyproject.toml configures an index or source for an installer (uv, Poetry, PDM), so its
-    dependencies may come from somewhere other than PyPI."""
+    """Whether a pyproject.toml configures an index or source for an installer (uv, Poetry, PDM, pixi's PyPI options),
+    so its dependencies may come from somewhere other than PyPI."""
     tool = _table(pyproject, "tool")
+    pixi = _table(_table(tool, "pixi"), "pypi-options")
     return (
-        _uv_names_an_index(_table(tool, "uv")) or "source" in _table(tool, "poetry") or "source" in _table(tool, "pdm")
+        _uv_names_an_index(_table(tool, "uv"))
+        or "source" in _table(tool, "poetry")
+        or "source" in _table(tool, "pdm")
+        or any(k in pixi for k in ("index-url", "extra-index-urls", "find-links"))
     )
+
+
+def _pdm_names_an_index(pdm: dict) -> bool:
+    """pdm.toml: [pypi] (url, or a named [pypi.<name>] index) or a source."""
+    return "pypi" in pdm or "source" in pdm
+
+
+# Project config files an installer reads from the input's folder or a folder above it, and how to tell whether one
+# points it at an index.
+_CONFIG_FILES = {"uv.toml": _uv_names_an_index, "pyproject.toml": _names_an_index, "pdm.toml": _pdm_names_an_index}
+
+
+def _nearby_config_names_an_index(path: Path) -> bool:
+    """Whether a uv.toml, pyproject.toml or pdm.toml in the input's folder, or a folder above it up to the
+    repository root (the first with a .git), configures an index: uv applies [tool.uv] to `uv pip install -r` and
+    looks in parent folders, and `uv pip compile` writes no index lines. One that can't be read counts as naming
+    one. User and system settings (pip.conf, ~/.config/uv/uv.toml, /etc/uv/uv.toml, .netrc) aren't read."""
+    folder = path.resolve().parent
+    for directory in (folder, *folder.parents):
+        for name, names_an_index in _CONFIG_FILES.items():
+            config = directory / name
+            if not config.is_file():
+                continue
+            try:
+                if names_an_index(tomllib.loads(config.read_text(encoding="utf-8-sig"))):
+                    return True
+            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+                return True
+        if (directory / ".git").exists():
+            break
+    return False
 
 
 def parse_pyproject(path: Path) -> Source:
@@ -830,7 +855,7 @@ def parse_pyproject(path: Path) -> Source:
         path.name,
         pyproject_extras=extras,
         pyproject_dynamic_extras="optional-dependencies" in dynamic,
-        pypi_only=not (_names_an_index(data) or _sibling_uv_toml_names_an_index(path)),
+        pypi_only=not (_names_an_index(data) or _nearby_config_names_an_index(path)),
     )
     if isinstance(requires_python := project.get("requires-python"), str):
         source.requires_python = requires_python
@@ -945,6 +970,17 @@ def _names_index_option(line: str) -> bool:
     return False
 
 
+def _abbreviated_include(line: str) -> bool:
+    """An abbreviation of --requirement or --constraint (`--requirem f`, `--cons f`), which pip reads but wheelgap
+    doesn't follow: the file it names may set an index."""
+    option = line.split(None, 1)[0].split("=", 1)[0]
+    return (
+        len(option) > 2
+        and option not in ("--requirement", "--constraint")
+        and any(name.startswith(option) for name in ("--requirement", "--constraint"))
+    )
+
+
 def parse_requirements(path: Path) -> Source:
     constraints: list[Package] = []
     seen: dict[bool, set[Path]] = {False: set(), True: set()}  # requirement files, constraint files
@@ -971,7 +1007,7 @@ def parse_requirements(path: Path) -> Source:
                 spec &= SpecifierSet(entry.spec or "")
             pkg.spec = str(spec) or None
     return Source(
-        path.name, pkgs, requirements=True, pypi_only=not index_options and not _sibling_uv_toml_names_an_index(path)
+        path.name, pkgs, requirements=True, pypi_only=not index_options and not _nearby_config_names_an_index(path)
     )
 
 
@@ -982,25 +1018,30 @@ def _read_requirements(
     constraint: bool = False,
     index_options: list[str] | None = None,
 ) -> list[Package]:
-    """`index_options` collects the index lines (--index-url, --extra-index-url, --find-links, --no-index)."""
+    """`index_options` collects the lines that may point pip at another index: index options (--index-url,
+    --extra-index-url, --find-links, --no-index), includes that aren't read, and abbreviated include options."""
     path = path.resolve()
     if path in seen[constraint]:
         return []
     seen[constraint].add(path)
     pkgs: list[Package] = []
     append = constraints.append if constraint else pkgs.append
-    lines = path.read_text(encoding="utf-8").replace("\\\n", " ").splitlines()
+    # utf-8-sig: a byte order mark (Windows editors) mustn't hide an option on the first line.
+    lines = path.read_text(encoding="utf-8-sig").replace("\\\n", " ").splitlines()
     for raw in lines:
         line = _COMMENT_RE.split(raw, 1)[0].strip()  # " # note" or "<TAB># note"
         if not line or line.startswith("#"):
             continue
-        if index_options is not None and _names_index_option(line):
+        if index_options is not None and (_names_index_option(line) or _abbreviated_include(line)):
             index_options.append(line)
         if m := _CONSTRAINT_RE.match(line):
             target = m.group(1).strip()
-            # A URL (-c https://releases.openstack.org/...) or ${VAR} is left to pip: it's skipped, as before.
+            # A URL (-c https://releases.openstack.org/...) or ${VAR} is left to pip: it's skipped, as before. Unread,
+            # it may name an index, so the input isn't PyPI-only.
             if "://" not in target and "${" not in target:
                 _read_requirements(path.parent / target, seen, constraints, True, index_options)
+            elif index_options is not None:
+                index_options.append(line)
             continue
         if m := _INCLUDE_RE.match(line):  # -r file, -rfile, --requirement file, --requirement=file
             pkgs.extend(
