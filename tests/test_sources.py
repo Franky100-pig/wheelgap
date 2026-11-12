@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +11,7 @@ from wheelgap.sources import (
     UvSelection,
     find_lockfile,
     load_inputs,
+    parse_pixi_lock,
     parse_poetry_lock,
     parse_requirements,
     pythons_outside_lock,
@@ -888,3 +890,205 @@ def test_poetry_group_selection_keeps_markers_per_group(tmp_path):
     select_uv_dependencies(sources, UvSelection(no_dev=True))
     # Without dev, only main's marker applies.
     assert sources[0].packages[0].markers == ['sys_platform == "win32"']
+
+
+def test_pixi_lock(fixtures):
+    source = load_inputs([str(fixtures / "pixiproj")])[0]
+    assert source.label == "pixi.lock" and source.kind == "pixi"
+    pkgs = by_name(source)
+    # Each platform records the one file pixi picked there; together they're the package's files, which are only
+    # some of the release's, so the package is still looked up on its index.
+    assert pkgs["fastlib"].files == ["fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl", "fastlib-2.0.0.tar.gz"]
+    assert pkgs["fastlib"].partial_files and pkgs["fastlib"].registry is None
+    assert pkgs["fastlib"].markers is None  # on every platform
+    assert pkgs["internal"].registry == "https://example.com/simple"
+    assert {name: p.skip for name, p in pkgs.items() if p.skip} == {
+        "gitdep": "git",
+        "localpkg": "conda",
+        "openssl": "conda",
+        "python": "conda",
+    }
+    assert pkgs["python"].version == "3.13.9"
+    # winonly is locked on win-64 only: hidden on the lock's other platforms for its Python (3.13), nowhere else.
+    linux, mac, win = build_targets(["3.13"], ["linux-x86_64", "macos-arm64", "win-amd64"])
+    (linux14,) = build_targets(["3.14"], ["linux-x86_64"])
+    rows = {r.package.name: r for r in check([source], [linux, mac, win, linux14])}
+    assert rows["winonly"].results == {
+        linux: Status.NOT_NEEDED,
+        mac: Status.NOT_NEEDED,
+        win: Status.WHEEL,
+        linux14: Status.MISSING,
+    }
+    # A platform the lock doesn't cover still counts it: what pixi would install there isn't known. musl-x86_64
+    # evaluates markers as linux-64 does (linux, x86_64), so it's hidden there too.
+    musl, arm = build_targets(["3.13"], ["musl-x86_64", "linux-aarch64"])
+    rows = {r.package.name: r for r in check([source], [musl, arm])}
+    assert rows["winonly"].results == {musl: Status.NOT_NEEDED, arm: Status.MISSING}
+
+
+def test_pixi_lock_environment(fixtures):
+    source = load_inputs([str(fixtures / "pixiproj")], "test")[0]
+    assert [(p.name, p.skip) for p in source.packages] == [("nowheels", None), ("python", "conda")]
+    with pytest.raises(SourceError, match=r"pixi.lock: no environment 'docs' \(it has: default, test\)"):
+        load_inputs([str(fixtures / "pixiproj")], "docs")
+    with pytest.raises(SourceError, match="--environment applies to pixi.lock inputs only"):
+        load_inputs([str(fixtures / "uvproj")], "test")
+
+
+def test_find_lockfile_finds_pixi_lock(fixtures):
+    assert find_lockfile(fixtures / "pixiproj").name == "pixi.lock"
+
+
+PIXI_V6 = """\
+version: 6
+environments:
+  default:
+    channels:
+    - url: https://conda.anaconda.org/conda-forge/
+    indexes:
+    - INDEX
+    packages:
+      linux-64:
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.12.8-h9e4cc4f_1_cpython.conda
+      - pypi: https://files.pythonhosted.org/packages/aa/purewheel-3.1-py3-none-any.whl
+      - pypi: https://mirror.example.com/files/fastlib-2.0.0.tar.gz
+      - pypi: ./
+packages:
+- conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.12.8-h9e4cc4f_1_cpython.conda
+  sha256: 0123
+  md5: 4567
+  depends:
+  - libgcc >=13
+  license: Python-2.0
+- pypi: https://files.pythonhosted.org/packages/aa/purewheel-3.1-py3-none-any.whl
+  name: purewheel
+  version: '3.1'
+  sha256: 89ab
+- pypi: https://mirror.example.com/files/fastlib-2.0.0.tar.gz
+  name: fastlib
+  version: 2.0.0
+  sha256: cdef
+- pypi: ./
+  name: myproject
+  version: 0.1.0
+  sha256: 0011
+  requires_dist:
+  - "fastlib ; python_version >= \\"3.10\\""
+  requires_python: '>=3.10'
+  editable: true
+"""
+
+
+@pytest.mark.parametrize(
+    "index,fastlib",
+    [
+        # PyPI serves files only from files.pythonhosted.org, so a file elsewhere is a direct URL.
+        ("https://pypi.org/simple", "url"),
+        # A version 6 lock doesn't say which index a package came from: a name off PyPI's file host may be internal.
+        ("https://mirror.example.com/simple", "private index"),
+    ],
+)
+def test_pixi_lock_version_6(tmp_path, index, fastlib):
+    lock = tmp_path / "pixi.lock"
+    lock.write_text(PIXI_V6.replace("INDEX", index), encoding="utf-8")
+    pkgs = by_name(load_inputs([str(lock)])[0])
+    assert {name: p.skip for name, p in pkgs.items()} == {
+        "purewheel": None,  # on PyPI's file host: a PyPI package whatever the indexes
+        "fastlib": fastlib,
+        "myproject": "editable",
+        "python": "conda",
+    }
+    assert pkgs["purewheel"].files == ["purewheel-3.1-py3-none-any.whl"]
+
+
+PIXI_V7 = (Path(__file__).parent / "fixtures" / "pixiproj" / "pixi.lock").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "old,new,message",
+    [
+        # Lock versions it doesn't know, older or newer: refused, never read as if they were 6 or 7.
+        ("version: 7", "version: 5", "pixi.lock version '5' isn't supported"),
+        ("version: 7", "version: 8", "pixi.lock version '8' isn't supported"),
+        ("version: 7\n", "", "no top-level `version`"),
+        # YAML outside the subset pixi writes
+        ("- name: osx-arm64", "- name: &p osx-arm64", "unsupported YAML"),
+        ("  license: Apache-2.0\n", "  license: |\n    Apache-2.0\n", "unsupported YAML"),
+        ("  purls: []\n  run_exports:", "  purls: [pkg:pypi/x]\n  run_exports:", "unsupported YAML"),
+        ("  name: winonly\n", "  name: winonly # a comment\n", "unsupported YAML"),
+        ("  name: winonly\n", "  name: winonly\n    more\n", "unexpected indentation"),
+        ("  name: winonly\n", "  name: 'winonly\n", "must end on its own line"),
+        ("  name: winonly\n", '  name: "win\\qonly"\n', "unsupported escape"),
+        ("  name: winonly\n", "  name: winonly\n  name: other\n", "duplicate key 'name'"),
+        ("  name: winonly\n", "\tname: winonly\n", "tabs, comments"),
+        ("  name: winonly\n", "  name: winonly\n  []: x\n", "unsupported key '[]'"),
+        ("version: 7\n", "version: 7\n# generated\n", "tabs, comments"),
+        ("version: 7\n", "version: 7\n---\n", "tabs, comments"),
+        # Structure it can't be sure of
+        ("platforms:", "platform:", "unknown top-level key 'platform'"),
+        (
+            "  requires_python: '>=3.9'\n- pypi: https://files",
+            "  editable: 'true'\n- pypi: https://files",
+            "key 'editable'",
+        ),
+        (
+            "    indexes:\n    - https://pypi.org/simple\n    packages:\n      linux-64:\n      - conda: https://conda.anaconda.org/conda-forge/linux-64/openssl",
+            "    packages:\n      linux-64:\n      - conda: https://conda.anaconda.org/conda-forge/linux-64/openssl",
+            "has PyPI packages but no `indexes`",
+        ),
+        ("    channels:\n", "    solver: uv\n    channels:\n", "unknown key 'solver'"),
+        ("- name: win-64\n", "", "platform 'win-64', which `platforms` doesn't list"),
+        (
+            "      - pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n",
+            "      - pypi: https://files.pythonhosted.org/packages/33/44/nowheels-1.0.tar.gz\n",
+            "isn't in `packages`",
+        ),
+        (
+            "- pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n  name: nowheels\n",
+            "- pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n",
+            "has no name",
+        ),
+        (
+            "  name: nowheels\n  version: '0.9'\n",
+            "  name: nowheels\n",
+            "nowheels comes from an index but has no version",
+        ),
+        (
+            "- pypi: git+https://github.com/example/gitdep.git?rev=v1#0123456789abcdef0123456789abcdef01234567\n  name",
+            "- pypi: git+https://github.com/example/gitdep.git?rev=v1#0123456789abcdef0123456789abcdef01234567\n"
+            "  conda: x\n  name",
+            "isn't exactly one of",
+        ),
+        (
+            "git+https://github.com/example/gitdep.git",
+            "ftp://github.com/example/gitdep.git",
+            "location wheelgap can't read",
+        ),
+        (
+            "      - pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n",
+            "      - pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n        extras: [x]\n",
+            "unsupported YAML",
+        ),
+        (
+            "      - pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n",
+            "      - pypi: https://files.pythonhosted.org/packages/33/44/nowheels-0.9.tar.gz\n        extras: x\n",
+            "has other keys",
+        ),
+    ],
+)
+def test_pixi_lock_refuses_what_it_cannot_read_for_sure(tmp_path, old, new, message):
+    assert old in PIXI_V7
+    lock = tmp_path / "pixi.lock"
+    lock.write_text(PIXI_V7.replace(old, new), encoding="utf-8")
+    with pytest.raises(SourceError, match="^pixi.lock: ") as e:
+        parse_pixi_lock(lock, "test" if "nowheels" in old else None)
+    assert message in str(e.value)
+
+
+def test_pixi_lock_reads_quoted_scalars(tmp_path):
+    lock = tmp_path / "pixi.lock"
+    text = PIXI_V7.replace("  name: winonly\n", '  name: "win\\x6fnly"\n').replace(
+        "  name: purewheel\n", "  'name': 'pure''wheel'\n"
+    )
+    lock.write_text(text, encoding="utf-8")
+    assert {"winonly", "pure'wheel"} <= set(by_name(parse_pixi_lock(lock)))

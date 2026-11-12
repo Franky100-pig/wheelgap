@@ -124,7 +124,7 @@ def make_parser() -> argparse.ArgumentParser:
         nargs="*",
         metavar="INPUT",
         help=(
-            "uv.lock, pylock.toml, poetry.lock, Pipfile.lock, requirements.txt, "
+            "uv.lock, pylock.toml, poetry.lock, Pipfile.lock, pixi.lock, requirements.txt, "
             "pyproject.toml (direct dependencies), a directory, or package specs (default: .)"
         ),
     )
@@ -191,6 +191,11 @@ def make_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--only-group", action="append", metavar="NAME", help="check only the named dependency groups (repeatable)"
+    )
+    p.add_argument(
+        "--environment",
+        metavar="NAME",
+        help="the pixi.lock environment to check (default: default)",
     )
     p.add_argument(
         "--online", action="store_true", help="re-check lockfile packages against PyPI instead of trusting the lockfile"
@@ -1149,7 +1154,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
         else:
             check_index_url()  # WHEELGAP_INDEX_URL only matters for the JSON API
-        sources = load_inputs(args.inputs or ["."])
+        sources = load_inputs(args.inputs or ["."], args.environment)
         extra_names = args.extra if args.extra is not None else config.get("extras")
         group_names = args.group if args.group is not None else config.get("groups")
         if args.only_group:

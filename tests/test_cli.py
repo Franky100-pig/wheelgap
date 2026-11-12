@@ -2919,3 +2919,81 @@ def test_github_annotations_partial_ignore(capsys, fake_pypi, fixtures, monkeypa
         "::error file=uvproj/uv.lock,line=23,title=fastlib 2.0.0%3A builds from source::"
         "fastlib 2.0.0 builds from source on linux-aarch64."
     )
+
+
+def test_pixi_lock_json(capsys, fixtures, fake_pypi):
+    code, out, err = run(
+        capsys, str(fixtures / "pixiproj"), "-p", "3.13", "-t", "linux-x86_64,macos-arm64,win-amd64", "--json"
+    )
+    assert code == 1 and not err
+    data = json.loads(out)
+    assert data["sources"] == ["pixi.lock"]
+    packages = {p["name"]: p for p in data["packages"]}
+    assert packages["fastlib"]["results"] == {"linux-x86_64": "wheel", "macos-arm64": "source", "win-amd64": "source"}
+    # Locked for win-64 only, so not installed on the lock's other platforms (with the same Python)
+    assert packages["winonly"]["results"] == {"linux-x86_64": "n/a", "macos-arm64": "n/a", "win-amd64": "wheel"}
+    assert data["skipped"] == [
+        {"name": "internal", "reason": "private index"},
+        {"name": "gitdep", "reason": "git"},
+        {"name": "localpkg", "reason": "conda"},
+        {"name": "openssl", "reason": "conda"},
+        {"name": "python", "reason": "conda"},
+    ]
+    # Every PyPI package is looked up, since the lock records only pixi's pick per platform; the one from another
+    # index never is.
+    assert sorted(fake_pypi) == [
+        "https://pypi.org/pypi/fastlib/2.0.0/json",
+        "https://pypi.org/pypi/purewheel/3.1/json",
+        "https://pypi.org/pypi/winonly/311/json",
+    ]
+
+
+def test_pixi_lock_files_are_looked_up_for_other_targets(capsys, fixtures, tmp_path, fake_pypi):
+    # pixi locked fastlib's sdist (say, for an older glibc), but PyPI also has a wheel the target takes.
+    lock = (fixtures / "pixiproj" / "pixi.lock").read_text(encoding="utf-8")
+    lock = lock.replace(
+        "packages/aa/bb/fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl", "packages/ee/ff/fastlib-2.0.0.tar.gz", 1
+    )
+    (tmp_path / "pixi.lock").write_text(lock, encoding="utf-8")
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    packages = {p["name"]: p for p in json.loads(out)["packages"]}
+    assert packages["fastlib"]["results"] == {"linux-x86_64": "wheel"}
+    assert "https://pypi.org/pypi/fastlib/2.0.0/json" in fake_pypi
+
+
+def test_pixi_lock_failed_lookup_is_unknown(capsys, fixtures, monkeypatch):
+    from wheelgap import pypi
+
+    def down(url, timeout=20.0):
+        raise OSError("no network")
+
+    monkeypatch.setattr(pypi, "fetch_json", down)
+    code, out, _ = run(capsys, str(fixtures / "pixiproj"), "-p", "3.13", "-t", "macos-arm64", "--json")
+    packages = {p["name"]: p for p in json.loads(out)["packages"]}
+    # Not the sdist the lock records for macOS: the release may have a wheel pixi didn't pick.
+    assert packages["fastlib"]["results"] == {"macos-arm64": "unknown"}
+
+
+def test_pixi_lock_environment_option(capsys, fixtures, fake_pypi):
+    code, out, _ = run(
+        capsys, str(fixtures / "pixiproj"), "--environment", "test", "-p", "3.13", "-t", "linux", "--json"
+    )
+    assert [p["name"] for p in json.loads(out)["packages"]] == ["nowheels"]
+    code, out, err = run(capsys, str(fixtures / "pixiproj"), "--environment", "docs", "-p", "3.13")
+    assert code == 2 and not out
+    assert err == (
+        "wheelgap: error: pixi.lock: no environment 'docs' (it has: default, test); pick one with --environment\n"
+    )
+    code, out, err = run(capsys, str(fixtures / "uvproj"), "--environment", "test", "-p", "3.13")
+    assert code == 2 and err == "wheelgap: error: --environment applies to pixi.lock inputs only\n"
+
+
+def test_pixi_lock_offline_needs_the_index(capsys, fixtures, fake_pypi):
+    code, out, err = run(capsys, str(fixtures / "pixiproj"), "--offline", "-p", "3.13")
+    assert code == 2 and not out
+    assert err == (
+        "wheelgap: error: --offline: pixi.lock (it records only the file pixi picked for each platform) needs the "
+        "index for 3 packages (fastlib, purewheel, winonly); use a lockfile that lists each package's files, "
+        "or drop --offline\n"
+    )
+    assert fake_pypi == []
