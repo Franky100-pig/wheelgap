@@ -172,9 +172,11 @@ def make_parser() -> argparse.ArgumentParser:
         "--extra",
         action="append",
         metavar="NAME",
-        help="include a uv project extra, or a pyproject.toml optional-dependencies group (repeatable)",
+        help="include a uv or Poetry project extra, or a pyproject.toml optional-dependencies group (repeatable)",
     )
-    p.add_argument("--all-extras", action="store_true", help="include every uv project extra (or pyproject.toml extra)")
+    p.add_argument(
+        "--all-extras", action="store_true", help="include every uv or Poetry project extra (or pyproject.toml extra)"
+    )
     p.add_argument(
         "--group",
         action="append",
@@ -993,11 +995,12 @@ def main(argv: list[str] | None = None) -> int:
                     no_dev=args.no_dev,
                     only_groups=frozenset(canonicalize_name(name) for name in args.only_group or []),
                 ),
-                # Configured extras apply to uv.lock inputs only, configured groups to uv.lock, Poetry 2.x
-                # poetry.lock and pdm.lock inputs; on the command line they need one of those.
+                # Configured extras apply to uv.lock and Poetry 2.x poetry.lock inputs, configured groups to those
+                # and pdm.lock inputs; on the command line they need one of those.
                 strict=bool(from_cli or args.only_group),
                 configured_extras=args.extra is None and extra_names is not None,
-                poetry=bool(from_cli or args.only_group) or group_names is not None,
+                poetry=bool(from_cli or args.only_group) or group_names is not None or extra_names is not None,
+                pdm=bool(from_cli or args.only_group) or group_names is not None,
             )
         if offline:
             require_offline(sources, offline_how, simple_index=index_url)
@@ -1026,6 +1029,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if not quiet:
         note_unpinned_requirements(sources)
+        for source in sources:
+            if source.poetry_extras_unsure:
+                print(
+                    f"wheelgap: note: {source.label}: in an extra and, with a marker, in the project's dependencies: "
+                    f"{', '.join(source.poetry_extras_unsure)}. Poetry 2.0-2.2 and 2.3+ install these (and what they "
+                    "depend on) differently without the extra, so extras leave no package out of this lock",
+                    file=sys.stderr,
+                )
     for source in sources:
         if source.pyproject_extras is not None:  # always: this answer differs from a lockfile's
             print(

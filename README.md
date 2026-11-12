@@ -178,16 +178,23 @@ unless `--only-group` is given;
 project extras are included only when requested. `--no-dev` removes `dev`, while `--only-group`
 excludes project dependencies and default groups. Combine `--only-group` with `--group` to add more
 groups, but not with `--extra`/`--all-extras`. An explicit `dev` group conflicts with `--no-dev`.
-Unknown extra/group names are errors. Command-line selectors need a `uv.lock` input, or for groups a Poetry 2.x
-`poetry.lock` or a `pdm.lock`, or for `--extra`/`--all-extras` a `pyproject.toml` (see below); configured `groups`
-apply to `uv.lock`, Poetry 2.x `poetry.lock` and `pdm.lock` inputs, and configured `extras` only to `uv.lock` inputs.
+Unknown extra/group names are errors. Command-line selectors need a `uv.lock` or Poetry 2.x `poetry.lock` input, or
+for groups a `pdm.lock`, or for `--extra`/`--all-extras` a `pyproject.toml` (see below); configured `groups` apply to
+`uv.lock`, Poetry 2.x `poetry.lock` and `pdm.lock` inputs, and configured `extras` to `uv.lock` and Poetry 2.x
+`poetry.lock` inputs.
 
-`poetry.lock` (Poetry 2.x) inputs accept `--group`, `--only-group` and `--no-dev` with Poetry's meanings, and
-configured `groups` apply to them too. `main` and every group not marked `optional = true` in
-`pyproject.toml` count; `--group` adds a group (like `poetry install --with`), `--no-dev` leaves out `dev`,
-and `--only-group` checks only the named groups (`main` only if named). A package counts if any of its groups is
-selected, with the markers of those groups. `--extra` isn't supported for `poetry.lock` yet, and a command-line
-selection on a Poetry 1.x lock (no per-package groups) is an error; configured `groups` leave a 1.x lock unfiltered.
+`poetry.lock` (Poetry 2.x) inputs accept every selector with Poetry's meanings, and configured `extras` and `groups`
+apply to them too. `main` and every group not marked `optional = true` in `pyproject.toml` count; `--group` adds a
+group (like `poetry install --with`), `--no-dev` leaves out `dev`, and `--only-group` checks only the named groups
+(`main` only if named). A package counts if any of its groups is selected, with the markers of those groups.
+`--extra NAME` and `--all-extras` work like `poetry install --extras NAME` and `--all-extras`: once any selector is
+used, packages that only an extra installs count only if that extra is selected, and an extra that isn't in the lock's
+`[extras]` table is an error. Unlike `uv.lock`, `--only-group` combines with `--extra` here, as in
+`poetry install --only main --extras api`. Poetry 2.5 locks a dependency that is both in an extra and, with a marker,
+in the project's dependencies (`requests; python_version < '3.11'`) as if only the extra installed it, and Poetry
+2.0-2.2 install it anyway while 2.3 and later don't; for such a project extras leave no package out, and a note says
+so. A command-line selection on a Poetry 1.x lock (no per-package groups) is an error; a configured selection leaves a
+1.x lock unfiltered.
 
 `pdm.lock` inputs take the same selectors with PDM's meanings, and configured `groups` apply to them too. Every
 group the lock was made for (its `[metadata] groups`: `default`, the dev groups and any optional-dependencies groups
@@ -195,7 +202,8 @@ locked with `pdm lock -G`) counts, as with a plain `pdm install`; `--no-dev` lea
 `pdm install --without dev`), and `--only-group` checks only the named groups (`default` only if named), so PDM's
 `--prod` is `--only-group default` here. `--group` only checks that the group is locked, since it already counts. A
 group that's in `pyproject.toml` but not in the lock is an error (lock it with `pdm lock -G <name>`), as in PDM. A
-package counts if any of its groups is selected. `--extra` isn't supported for `pdm.lock`, and a command-line
+package counts if any of its groups is selected. `--extra` isn't supported for `pdm.lock` (PDM installs
+optional-dependencies as groups, with `pdm install -G NAME`, and they count once locked), and a command-line
 selection on a lock without package groups (one locked without the `inherit_metadata` strategy) is an error;
 configured `groups` leave such a lock unfiltered.
 
@@ -217,8 +225,8 @@ including local workspace dependencies, rather than enabling every extra of ever
 Unresolved marker conditions (including uv's synthetic conflict markers and unknown OS releases)
 remain conservative: wheelgap can still report a possible gap rather than silently hide one.
 Selection itself needs no network. Index refreshes (`--online`, or a target outside the lockfile's
-`requires-python`) only look up packages in the selected graph. Configured `extras` only apply to `uv.lock` inputs, and configured `groups` to `uv.lock`, Poetry 2.x
-`poetry.lock` and `pdm.lock` inputs; other inputs are checked as usual.
+`requires-python`) only look up packages in the selected graph. Configured `extras` only apply to `uv.lock` and Poetry 2.x `poetry.lock` inputs, and configured
+`groups` to those and `pdm.lock` inputs; other inputs are checked as usual.
 
 ### Check a library's direct dependencies
 

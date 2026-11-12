@@ -3,7 +3,7 @@ import shutil
 
 import pytest
 
-from wheelgap.check import check, marker_holds
+from wheelgap.check import check, marker_holds, poetry_marker_holds
 from wheelgap.cli import main
 from wheelgap.sources import SourceError, UvSelection, load_inputs, select_uv_dependencies
 from wheelgap.targets import build_targets
@@ -534,9 +534,10 @@ def test_poetry_lock_unknown_group_is_an_error(poetry_groups, capsys, fake_pypi)
     assert "unknown groups: nosuch" in capsys.readouterr().err
 
 
-def test_poetry_lock_rejects_extras(poetry_groups, capsys, fake_pypi):
+def test_poetry_lock_unknown_extra_is_an_error(poetry_groups, capsys, fake_pypi):
+    # Like `poetry install --extras api`: "Extra [api] is not specified." This lock has no [extras] table.
     assert main([str(poetry_groups), "--extra", "api"]) == 2
-    assert "poetry.lock and pdm.lock support groups only" in capsys.readouterr().err
+    assert "unknown extras: api" in capsys.readouterr().err
 
 
 def test_poetry_lock_configured_groups_apply(poetry_groups, capsys, fake_pypi):
@@ -556,14 +557,12 @@ def test_poetry_1x_lock_rejects_group_selection(tmp_path, capsys, fake_pypi):
     assert "needs a poetry.lock from Poetry 2.x" in capsys.readouterr().err
 
 
-def test_poetry_lock_configured_extras_alone_select_nothing(poetry_groups, capsys, fake_pypi):
-    # Configured extras apply to uv.lock inputs only: they neither drop the optional docs group nor reject --no-dev.
+def test_poetry_lock_configured_extras_alone_select(poetry_groups, capsys, fake_pypi):
+    # An empty configured list selects no extras: Poetry's default groups, so the optional docs group is left out.
     with (poetry_groups / "pyproject.toml").open("a", encoding="utf-8") as f:
-        f.write('\n[tool.wheelgap]\nextras = ["api"]\n')
+        f.write("\n[tool.wheelgap]\nextras = []\n")
     code, names = _poetry_names(capsys, [str(poetry_groups)])
-    assert code == 1 and {"app-dep", "devonly", "docstool"} <= names
-    code, names = _poetry_names(capsys, [str(poetry_groups), "--no-dev"])
-    assert code == 0 and names == {"app-dep"}
+    assert code == 1 and names == {"app-dep", "devonly", "winonly"}
 
 
 def test_poetry_lock_knows_empty_pep735_groups(poetry_groups, capsys, fake_pypi):
@@ -586,6 +585,216 @@ def test_poetry_1x_lock_ignores_configured_groups(tmp_path, capsys, fake_pypi):
     # No per-package groups to select by, so every package stays in.
     code, names = _poetry_names(capsys, [str(tmp_path)])
     assert code == 1 and names == {"app-dep", "devonly"}
+
+
+# Shaped like `poetry lock` output (Poetry 2.5.1) for a [project] with optional-dependencies s3, yaml (linux only),
+# Fancy_Name, both (shared with the dev group) and an empty one: each package's markers say which extras need it.
+POETRY_EXTRAS_LOCK = """\
+[[package]]
+name = "app-dep"
+version = "1.0"
+optional = false
+groups = ["main"]
+files = [{file = "app_dep-1.0-py3-none-any.whl", hash = "sha256:00"}]
+
+[[package]]
+name = "s3lib"
+version = "1.0"
+optional = true
+groups = ["main"]
+markers = "extra == \\"s3\\""
+files = [{file = "s3lib-1.0.tar.gz", hash = "sha256:00"}]
+
+[[package]]
+name = "linuxyaml"
+version = "1.0"
+optional = true
+groups = ["main"]
+markers = "sys_platform == \\"linux\\" and extra == \\"yaml\\""
+files = [{file = "linuxyaml-1.0.tar.gz", hash = "sha256:00"}]
+
+[[package]]
+name = "pretty"
+version = "1.0"
+optional = true
+groups = ["main"]
+markers = "extra == \\"fancy-name\\""
+files = [{file = "pretty-1.0.tar.gz", hash = "sha256:00"}]
+
+[[package]]
+name = "shared"
+version = "1.0"
+optional = true
+groups = ["main"]
+markers = "extra == \\"s3\\" or extra == \\"both\\""
+files = [{file = "shared-1.0.tar.gz", hash = "sha256:00"}]
+
+[[package]]
+name = "devtool"
+version = "1.0"
+optional = false
+groups = ["main", "dev"]
+markers = {main = "extra == \\"both\\""}
+files = [{file = "devtool-1.0.tar.gz", hash = "sha256:00"}]
+
+[[package]]
+name = "backport"
+version = "1.0"
+optional = false
+groups = ["main", "dev"]
+markers = {main = "extra == \\"s3\\" and python_version < \\"3.11\\"", dev = "python_version < \\"3.11\\""}
+files = [{file = "backport-1.0.tar.gz", hash = "sha256:00"}]
+
+[extras]
+both = ["devtool", "shared"]
+empty = []
+fancy-name = ["pretty"]
+s3 = ["s3lib", "shared"]
+yaml = ["linuxyaml"]
+
+[metadata]
+lock-version = "2.1"
+python-versions = ">=3.10"
+"""
+
+POETRY_EXTRAS_PYPROJECT = """\
+[project]
+name = "app"
+version = "0"
+requires-python = ">=3.10"
+dependencies = ["app-dep"]
+
+[project.optional-dependencies]
+s3 = ["s3lib", "shared", "backport; python_version < '3.11'"]
+yaml = ["linuxyaml; sys_platform == 'linux'"]
+Fancy_Name = ["pretty"]
+both = ["shared", "devtool"]
+empty = []
+
+[tool.poetry]
+package-mode = false
+
+[tool.poetry.group.dev.dependencies]
+devtool = "*"
+backport = { version = "*", python = "<3.11" }
+"""
+
+POETRY_EXTRAS_ALL = {"app-dep", "s3lib", "linuxyaml", "pretty", "shared", "devtool"}
+
+
+@pytest.fixture
+def poetry_extras(tmp_path):
+    (tmp_path / "poetry.lock").write_text(POETRY_EXTRAS_LOCK, encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(POETRY_EXTRAS_PYPROJECT, encoding="utf-8")
+    return tmp_path
+
+
+# What `poetry install --dry-run` (Poetry 2.5.1) installs for the same options on a Poetry 2.5.1 lock of this shape.
+@pytest.mark.parametrize(
+    "args, expected",
+    [
+        ([], POETRY_EXTRAS_ALL),  # no selector: every extra still counts
+        (["--no-dev"], {"app-dep"}),  # poetry install --without dev: no extras
+        (["--no-dev", "--extra", "s3"], {"app-dep", "s3lib", "shared"}),
+        (["--no-dev", "--extra", "Fancy_Name"], {"app-dep", "pretty"}),  # extra names are normalized
+        (["--no-dev", "--extra", "yaml"], {"app-dep", "linuxyaml"}),
+        (["--no-dev", "--extra", "empty"], {"app-dep"}),
+        (["--no-dev", "--all-extras"], POETRY_EXTRAS_ALL),  # devtool through main, for both
+        (["--extra", "both"], {"app-dep", "shared", "devtool"}),
+        (["--only-group", "main", "--extra", "both"], {"app-dep", "shared", "devtool"}),  # --only main --extras both
+        (["--only-group", "dev", "--extra", "s3"], {"devtool"}),  # Poetry ignores extras without main
+    ],
+)
+def test_poetry_lock_extras_follow_poetry_install(poetry_extras, capsys, fake_pypi, args, expected):
+    code, names = _poetry_names(capsys, [str(poetry_extras), *args])
+    assert names == expected and code == (0 if expected == {"app-dep"} else 1)
+    assert fake_pypi == []
+
+
+def test_poetry_lock_extras_keep_their_other_markers(poetry_extras, capsys, fake_pypi):
+    args = [str(poetry_extras), "--no-dev", "--json", "--extra", "yaml", "--extra", "s3"]
+    main([*args, "-t", "linux-x86_64,macos-arm64", "-p", "3.10", "-p", "3.13"])
+    results = {p["name"]: p["results"] for p in json.loads(capsys.readouterr().out)["packages"]}
+    # sys_platform == "linux" and python_version < "3.11" still apply.
+    assert results["linuxyaml"] == {
+        "3.10 linux-x86_64": "source",
+        "3.10 macos-arm64": "n/a",
+        "3.13 linux-x86_64": "source",
+        "3.13 macos-arm64": "n/a",
+    }
+    assert results["backport"] == {
+        "3.10 linux-x86_64": "source",
+        "3.10 macos-arm64": "source",
+        "3.13 linux-x86_64": "n/a",
+        "3.13 macos-arm64": "n/a",
+    }
+
+
+def test_poetry_lock_ignore_note_counts_packages_extras_leave_out(poetry_extras, capsys, fake_pypi):
+    main([str(poetry_extras), "--no-dev", "--ignore", "s3lib,nosuchpkg", "-t", "linux", "-p", "3.13"])
+    err = capsys.readouterr().err
+    assert "--ignore matches no package: nosuchpkg" in err
+    assert "s3lib" not in err
+
+
+def test_poetry_lock_configured_extras_apply(poetry_extras, capsys, fake_pypi):
+    with (poetry_extras / "pyproject.toml").open("a", encoding="utf-8") as f:
+        f.write('\n[tool.wheelgap]\nextras = ["s3"]\n')
+    code, names = _poetry_names(capsys, [str(poetry_extras), "--no-dev"])
+    assert code == 1 and names == {"app-dep", "s3lib", "shared"}
+    code, names = _poetry_names(capsys, [str(poetry_extras), "--no-dev", "--extra", "fancy-name"])  # replaces them
+    assert code == 1 and names == {"app-dep", "pretty"}
+
+
+def test_poetry_lock_unknown_extra_names_the_lock(poetry_extras, capsys, fake_pypi):
+    assert main([str(poetry_extras), "--extra", "s3", "--extra", "nope"]) == 2
+    assert "poetry.lock: unknown extras: nope" in capsys.readouterr().err
+
+
+def test_poetry_1x_lock_rejects_extras(tmp_path, capsys, fake_pypi):
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "app-dep"\nversion = "1.0"\ncategory = "main"\nfiles = []\n\n'
+        '[extras]\ns3 = ["app-dep"]\n\n[metadata]\nlock-version = "2.0"\n',
+        encoding="utf-8",
+    )
+    assert main([str(tmp_path), "--extra", "s3"]) == 2
+    assert "needs a poetry.lock from Poetry 2.x" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "dependencies",
+    [
+        # Poetry 2.5.1 locks shared (and what it depends on) as `extra == "s3" or extra == "both"` here, losing the
+        # python_version marker: Poetry 2.3+ leaves it out on 3.10 without the extra, Poetry 2.0-2.2 installs it.
+        '[project]\nname = "app"\nversion = "0"\ndependencies = ["app-dep", "shared; python_version < \'3.11\'"]\n',
+        '[tool.poetry.dependencies]\npython = ">=3.10"\nshared = { version = "*", python = "<3.11" }\n',
+    ],
+)
+def test_poetry_lock_extras_leave_nothing_out_when_poetry_versions_disagree(
+    poetry_extras, capsys, fake_pypi, dependencies
+):
+    pyproject = poetry_extras / "pyproject.toml"
+    text = POETRY_EXTRAS_PYPROJECT.replace('[project]\nname = "app"\nversion = "0"\nrequires-python = ">=3.10"\n', "")
+    text = text.replace('dependencies = ["app-dep"]\n', "")
+    pyproject.write_text(dependencies + text, encoding="utf-8")
+    main([str(poetry_extras), "--no-dev", "--json", "-t", "linux-x86_64", "-p", "3.13"])
+    out, err = capsys.readouterr()
+    # As with no selector: extras leave nothing out.
+    assert {p["name"] for p in json.loads(out)["packages"]} == POETRY_EXTRAS_ALL
+    assert "in an extra and, with a marker, in the project's dependencies: shared." in err
+
+
+def test_poetry_extra_markers_have_poetry_meanings():
+    (target,) = build_targets(["3.13"], ["linux-x86_64"])
+    extras = (frozenset({"a", "b", "fancy-name"}), frozenset({"a", "b"}))
+    assert poetry_marker_holds('extra == "a" and extra == "b"', target, extras)  # `extra` is a set of extras
+    assert poetry_marker_holds('"b" == extra', target, extras)
+    assert not poetry_marker_holds('extra != "a"', target, extras)
+    assert not poetry_marker_holds('extra == "Fancy_Name"', target, extras)  # normalized, and not selected
+    assert not poetry_marker_holds('extra == "a" and sys_platform == "win32"', target, extras)
+    assert poetry_marker_holds('extra == "other"', target, extras)  # not one of the project's extras: unknown
+    assert poetry_marker_holds('extra == "fancy-name"', None, (extras[0], frozenset())) is False
+    assert poetry_marker_holds('extra == "a" and sys_platform == "win32"', None, extras)  # on some target
 
 
 # Shaped like `pdm lock -G docs` output (PDM 2.29): [metadata] groups lists every locked group, including the
@@ -695,7 +904,7 @@ def test_pdm_lock_unknown_group_is_an_error(pdm_groups, capsys, fake_pypi):
 
 def test_pdm_lock_rejects_extras(pdm_groups, capsys, fake_pypi):
     assert main([str(pdm_groups), "--extra", "docs"]) == 2
-    assert "poetry.lock and pdm.lock support groups only" in capsys.readouterr().err
+    assert "pdm.lock supports groups only" in capsys.readouterr().err
 
 
 def test_pdm_lock_configured_groups_keep_locked_optional_groups(pdm_groups, capsys, fake_pypi):
