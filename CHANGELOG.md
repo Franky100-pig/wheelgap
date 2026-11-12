@@ -3,6 +3,8 @@
 ## Unreleased
 
 - The Python API's `Result` has `reasons`, the text `--explain` prints for each `source` or `missing` target (which wheels were rejected and why), and `via`, the dependency path that pulls the package in (`app → pandas → numpy`), filled by `check_lockfile()` for lockfiles with a dependency graph. `to_dict()` adds them as `"reasons"` and `"via"`; the existing keys are unchanged, and `wheelgap-mcp`'s `check_package` tool returns them too. (#241)
+- `-p next` and `-p next-t` (also in `[tool.wheelgap] python`, `wheelgap diff -p`, `make_targets()` and the MCP tools) check the newest CPython wheelgap knows, 3.15 in this release, and its free-threaded build, with a note on stderr saying which version that is. When exactly two Pythons are checked and one is newer, the summary names the packages that block the upgrade, those with a gap on the newer Python where the older one has a wheel (`blocking 3.15: numpy, pydantic-core`), and `--json` and the MCP `check_lockfile` tool list them as `blocking_newer_python`. Packages that couldn't be checked aren't listed, only counted. (#242)
+- `wheelgap mcp` starts the MCP server, as `wheelgap-mcp` does (`--version` and `--help` too), so `uvx wheelgap mcp` works and MCP registries can start it from the `wheelgap` package. `mcp` as the first argument always starts the server, even when a file or folder named `mcp` is in the current directory (MCP clients choose that directory). To check such a folder, run `wheelgap ./mcp` or `wheelgap mcp/`; to check the PyPI package `mcp`, pin it: `wheelgap mcp==2.3.0`. Run in a terminal, `wheelgap mcp` says on stderr that it's waiting for an MCP client. (#240)
 
 ## 0.9.0 (2026-11-12)
 

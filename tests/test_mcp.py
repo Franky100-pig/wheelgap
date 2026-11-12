@@ -113,6 +113,31 @@ def test_check_package(fake_pypi):
     assert fake_pypi == ["https://pypi.org/pypi/winonly/json"]
 
 
+def test_python_next(fake_pypi, fixtures):
+    (_, reply) = run(init(), call("check_package", name="purewheel", python="3.14,next-t", targets=["linux-x86_64"]))
+    assert reply["result"]["structuredContent"]["results"] == {
+        "3.14 linux-x86_64": "wheel",
+        "3.15t linux-x86_64": "wheel",
+    }
+    (_, reply) = run(
+        init(), call("check_lockfile", path=str(fixtures / "uvproj"), python="next", targets=["linux-x86_64"])
+    )
+    data = reply["result"]["structuredContent"]
+    assert data["targets"] == ["3.15 linux-x86_64"]
+    assert "next is Python 3.15, the newest CPython this wheelgap version knows" in data["notes"]
+    assert "blocking_newer_python" not in data  # one Python
+
+
+@pytest.mark.parametrize("python", ["3.14,Next", "3.14, NEXT-T"])
+def test_python_next_any_case_and_blocking(fake_pypi, tmp_path, python):
+    (tmp_path / "requirements.txt").write_text("newpylag==1.0\nnowheels==0.9\n", encoding="utf-8")
+    (_, reply) = run(init(), call("check_lockfile", path=str(tmp_path), python=python, targets=["linux-x86_64"]))
+    data = reply["result"]["structuredContent"]
+    assert data["blocking_newer_python"] == ["newpylag"]
+    (_, reply) = run(init(), call("check_package", name="purewheel", python=python, targets=["linux-x86_64"]))
+    assert reply["result"]["isError"] is False
+
+
 def test_check_package_pinned_version_and_glibc(fake_pypi):
     (_, reply) = run(
         init(),
@@ -521,6 +546,99 @@ def test_real_stdio(fixtures):
 @pytest.mark.parametrize(("argv", "code"), [(["--version"], 0), (["--help"], 0), (["--bogus"], 2)])
 def test_main_flags(argv, code, capsys):
     assert mcp.main(argv) == code
+
+
+def test_wheelgap_mcp_subcommand_over_real_stdio(tmp_path):
+    messages = [
+        init(),
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        call("list_targets", msg_id=2),
+    ]
+    replies = run_wheelgap_mcp(tmp_path, messages)
+    assert [r["id"] for r in replies] == [0, 1, 2]
+    assert replies[0]["result"]["serverInfo"] == {"name": "wheelgap", "version": __version__}
+    assert [t["name"] for t in replies[1]["result"]["tools"]] == [t["name"] for t in mcp.TOOLS]
+    assert "linux-aarch64" in replies[2]["result"]["structuredContent"]["platforms"]
+
+
+def run_wheelgap_mcp(cwd: Path, messages: list[dict]) -> list[dict]:
+    """Run `python -m wheelgap mcp` in cwd over real stdio; return the parsed replies."""
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "wheelgap", "mcp"],
+        input=b"".join(json.dumps(m).encode() + b"\n" for m in messages),
+        capture_output=True,
+        timeout=60,
+        check=True,
+        cwd=cwd,
+    )
+    return [json.loads(line) for line in proc.stdout.splitlines()]
+
+
+@pytest.mark.parametrize("folder", ["mcp", "MCP"])
+def test_wheelgap_mcp_starts_the_server_next_to_a_folder_named_mcp(tmp_path, folder):
+    # MCP clients start the server in a directory they choose, often a project with an mcp/ folder.
+    (tmp_path / folder).mkdir()
+    (tmp_path / folder / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    (reply,) = run_wheelgap_mcp(tmp_path, [init()])
+    assert reply["jsonrpc"] == "2.0"
+    assert reply["id"] == 0
+    assert reply["result"]["serverInfo"] == {"name": "wheelgap", "version": __version__}
+
+
+@pytest.mark.parametrize(("argv", "code"), [(["--version"], 0), (["-V"], 0), (["--help"], 0), (["--bogus"], 2)])
+def test_wheelgap_mcp_subcommand_flags(argv, code, capsys, tmp_path, monkeypatch):
+    from wheelgap.cli import main as cli_main
+
+    monkeypatch.chdir(tmp_path)
+    assert cli_main(["mcp", *argv]) == code
+    out, err = capsys.readouterr()
+    if argv[0] in ("--version", "-V"):
+        assert out == f"wheelgap-mcp {__version__}\n"
+    else:
+        assert err.startswith("usage: wheelgap mcp\n")
+        assert "`wheelgap ./mcp`" in err
+        assert "`wheelgap mcp==VERSION`" in err
+
+
+def test_wheelgap_mcp_is_the_server_even_with_a_folder_named_mcp(fake_pypi, tmp_path, capsys, monkeypatch):
+    from wheelgap.cli import main as cli_main
+
+    (tmp_path / "mcp").mkdir()
+    (tmp_path / "mcp" / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    assert cli_main(["mcp", "-p", "3.13", "-t", "linux-x86_64"]) == 2  # the server takes no arguments
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "pin it: `wheelgap mcp==VERSION`" in err
+    assert cli_main(["./mcp", "-p", "3.13", "-t", "linux-x86_64"]) == 0
+    assert cli_main(["mcp/", "-p", "3.13", "-t", "linux-x86_64"]) == 0
+    assert not [url for url in fake_pypi if "/mcp" in url]  # none of these looked up the PyPI package mcp
+
+
+def test_wheelgap_mcp_notes_on_a_terminal(monkeypatch, capsys):
+    class Terminal(io.TextIOWrapper):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr("sys.stdin", Terminal(io.BytesIO()))
+    assert mcp.main([], prog="wheelgap mcp") == 0
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.startswith("wheelgap mcp: waiting for an MCP client on stdin")
+    assert "`wheelgap mcp==VERSION`" in err
+    assert mcp.main([]) == 0  # wheelgap-mcp says nothing, as before
+    assert capsys.readouterr().err == ""
+
+
+def test_server_json_matches_the_package_version():
+    # The release PR bumps these with pyproject.toml; the MCP Registry checks the PyPI release they name.
+    server = json.loads((Path(__file__).parent.parent / "server.json").read_text(encoding="utf-8"))
+    assert server["version"] == __version__
+    assert [p["version"] for p in server["packages"]] == [__version__]
 
 
 def with_token(message: dict, token: object) -> dict:

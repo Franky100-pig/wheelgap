@@ -22,6 +22,11 @@ def test_make_targets_takes_cli_style_names():
         wheelgap.make_targets(python="3.13", platforms="solaris")
 
 
+def test_make_targets_next_is_the_newest_python():
+    targets = wheelgap.make_targets(python=["3.14", "next-t"], platforms="linux")
+    assert [t.python for t in targets] == ["3.14", "3.15t"]
+
+
 @pytest.mark.parametrize("python", ["", " , "])
 def test_make_targets_uses_running_python_for_empty_input(python):
     assert wheelgap.make_targets(python=python) == wheelgap.make_targets()
