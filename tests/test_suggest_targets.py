@@ -225,6 +225,34 @@ jobs:
     ]
 
 
+def test_matrix_with_flow_mappings(tmp_path):
+    workflow(
+        tmp_path,
+        """\
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.12", "3.13"]
+        include:
+          - { os: macos-latest, python: "3.13" }
+          - {os: windows-latest, python: '3.13'}
+          - { os: macos-26-intel, python: 3.10 }
+""",
+    )
+    found = suggest(tmp_path)
+    path = ".github/workflows/ci.yml"
+    assert where(found.targets) == [
+        ("linux-x86_64", path, 6),
+        ("macos-arm64", path, 9),
+        ("win-amd64", path, 10),
+        ("macos-x86_64", path, 11),
+    ]
+    assert found.unreadable == []
+
+
 def test_include_overwrites_what_an_earlier_include_added(tmp_path):
     # os isn't an original matrix key, so the second include overwrites the first on every combination:
     # GitHub never runs on windows-latest here.
@@ -288,10 +316,13 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version-file: pyproject.toml
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
 """,
     )
     found = suggest(tmp_path)
-    assert found.pythons == []
+    assert where(found.pythons) == [("3.13", ".github/workflows/ci.yml", 14)]  # the next step is still read
     assert unreadable(found) == [
         (
             ".github/workflows/ci.yml",
@@ -314,17 +345,28 @@ def test_multi_stage_dockerfile(tmp_path):
     (tmp_path / "deploy").mkdir()
     (tmp_path / "deploy" / "Dockerfile.web").write_text("FROM python:3.13-bookworm\n")
     (tmp_path / "deploy" / "Dockerfile.dockerignore").write_text("*.pyc\n")
+    (tmp_path / "deploy" / "worker.Dockerfile").write_text("FROM python:3.14-trixie\n")
+    (tmp_path / "dockerfile.py").write_text("from __future__ import annotations\n")  # not a Dockerfile
     (tmp_path / "node_modules").mkdir()
     (tmp_path / "node_modules" / "Dockerfile").write_text("FROM python:3.9\n")
     found = suggest(tmp_path)
     # The final stage builds on `base`, so the line is base's FROM, where the image is named.
-    assert where(found.targets) == [("musl-aarch64", "Dockerfile", 3), ("linux-x86_64", "deploy/Dockerfile.web", 1)]
+    assert where(found.targets) == [
+        ("musl-aarch64", "Dockerfile", 3),
+        ("linux-x86_64", "deploy/Dockerfile.web", 1),
+        ("linux-x86_64", "deploy/worker.Dockerfile", 1),
+    ]
     assert found.targets[0].source == "FROM --platform=linux/arm64 python:3.12-alpine (musl 1.2)"
-    assert where(found.pythons) == [("3.12", "Dockerfile", 3), ("3.13", "deploy/Dockerfile.web", 1)]
+    assert where(found.pythons) == [
+        ("3.12", "Dockerfile", 3),
+        ("3.13", "deploy/Dockerfile.web", 1),
+        ("3.14", "deploy/worker.Dockerfile", 1),
+    ]
+    assert found.unreadable == []
+    # The two Debian images name different glibc versions, so neither is suggested.
     assert found.config() == {
-        "python": ["3.12", "3.13"],
+        "python": ["3.12", "3.13", "3.14"],
         "targets": ["linux-x86_64", "musl-aarch64"],
-        "glibc": "2.36",
         "musl": "1.2",
     }
 

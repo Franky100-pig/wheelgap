@@ -92,6 +92,7 @@ _PYTHON_ACTIONS = ("actions/setup-python", "astral-sh/setup-uv")
 _MATRIX_REF_RE = re.compile(r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}")
 _BLOCK_SCALAR_RE = re.compile(r"[|>][-+0-9]*")
 _NUMBER_RE = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?", re.ASCII)
+_DOCKERFILE_PREFIXES = ("Dockerfile.", "Dockerfile-", "Dockerfile_")
 _SKIP_DIRS = {"node_modules", "__pycache__", "site-packages"}
 
 
@@ -261,10 +262,10 @@ def _unquote(text: str, line: int) -> _Scalar:
     return _Scalar(text, False, line)
 
 
-def _flow_list(text: str, line: int) -> list[_Scalar]:
-    """`[a, "b", 'c']` on one line, of scalars only."""
-    if not text.endswith("]"):
-        raise _Unsure(f"can't read {text} (a list over several lines?)", line)
+def _flow_items(text: str, line: int, close: str) -> list[str]:
+    """The comma-separated items of `[...]` or `{...}` on one line, holding scalars only."""
+    if not text.endswith(close):
+        raise _Unsure(f"can't read {text} (over several lines?)", line)
     inner = text[1:-1].strip()
     if any(c in inner for c in "[]{}"):
         raise _Unsure(f"can't read {text}", line)
@@ -290,7 +291,23 @@ def _flow_list(text: str, line: int) -> list[_Scalar]:
         items.append(current.strip())
     if any(not item for item in items):
         raise _Unsure(f"can't read {text}", line)
-    return [_unquote(item, line) for item in items]
+    return items
+
+
+def _flow_list(text: str, line: int) -> list[_Scalar]:
+    """`[a, "b", 'c']` on one line."""
+    return [_unquote(item, line) for item in _flow_items(text, line, "]")]
+
+
+def _flow_mapping(text: str, line: int) -> dict[str, _Scalar]:
+    """`{ os: macos-latest, python: "3.14" }` on one line."""
+    out: dict[str, _Scalar] = {}
+    for item in _flow_items(text, line, "}"):
+        pair = _split_key(item)
+        if pair is None or pair[0] in out:
+            raise _Unsure(f"can't read {text}", line)
+        out[pair[0]] = _unquote(pair[1], line)
+    return out
 
 
 def _scalar(node: _Node) -> _Scalar:
@@ -310,6 +327,8 @@ def _data(node: _Node) -> object:
             raise _Unsure(f"can't read the value of {node.key or 'a list item'}", node.line)
         if node.value.startswith("["):
             return _flow_list(node.value, node.line)
+        if node.value.startswith("{"):
+            return _flow_mapping(node.value, node.line)
         return _scalar(node)
     if not node.children:
         raise _Unsure(f"{node.key or 'a list item'} has no value", node.line)
@@ -452,41 +471,48 @@ def _read_job(job: _Node, path: str, out: Suggestions) -> None:
 
     try:
         steps = job.get("steps")
-        if steps is None:
-            return
-        for step in steps.children:
-            if step.key is not None or step.is_text:
-                raise _Unsure("can't read the steps", step.line)
-            uses = step.get("uses")
-            if uses is None:
-                continue
-            action = _scalar(uses).text.split("@", 1)[0].lower()
-            if action not in _PYTHON_ACTIONS:
-                continue
-            with_ = step.get("with")
-            version = with_.get("python-version") if with_ is not None else None
-            if version is None:
-                if action == "actions/setup-python":
-                    file = with_.get("python-version-file") if with_ is not None else None
-                    reason = (
-                        f"setup-python reads {_scalar(file).text}, which isn't read here"
-                        if file is not None
-                        else "setup-python with no python-version (it reads .python-version, or uses the runner's)"
-                    )
-                    raise _Unsure(reason, (file or step).line)
-                continue
-            for value, source in _values(job, version):
-                try:
-                    text = value.plain_text()
-                except _Unsure as e:
-                    unsure(e)
-                    continue
-                if m := _PYTHON_RE.fullmatch(text):
-                    out.pythons.append(Found(f"3.{m.group(1)}{m.group(2)}", path, value.line, source))
-                else:
-                    unsure(_Unsure(f"python-version {text} isn't a CPython version wheelgap can read", value.line))
+        if steps is not None and any(step.key is not None or step.is_text for step in steps.children):
+            raise _Unsure("can't read the steps", steps.line)
     except _Unsure as e:
         unsure(e)
+        return
+    for step in steps.children if steps is not None else []:
+        try:
+            _read_step(job, step, path, out)
+        except _Unsure as e:
+            unsure(e)
+
+
+def _read_step(job: _Node, step: _Node, path: str, out: Suggestions) -> None:
+    """The Python an actions/setup-python or astral-sh/setup-uv step installs."""
+    uses = step.get("uses")
+    if uses is None:
+        return
+    action = _scalar(uses).text.split("@", 1)[0].lower()
+    if action not in _PYTHON_ACTIONS:
+        return
+    with_ = step.get("with")
+    version = with_.get("python-version") if with_ is not None else None
+    if version is None:
+        if action == "actions/setup-python":
+            file = with_.get("python-version-file") if with_ is not None else None
+            if file is not None:
+                raise _Unsure(f"setup-python reads {_scalar(file).text}, which isn't read here", file.line)
+            raise _Unsure(
+                "setup-python with no python-version (it reads .python-version, or uses the runner's)", step.line
+            )
+        return
+    for value, source in _values(job, version):
+        try:
+            text = value.plain_text()
+        except _Unsure as e:
+            out.unreadable.append(Unreadable(path, e.line, f"job {job.key}: {e.reason}"))
+            continue
+        if m := _PYTHON_RE.fullmatch(text):
+            out.pythons.append(Found(f"3.{m.group(1)}{m.group(2)}", path, value.line, source))
+        else:
+            reason = f"job {job.key}: python-version {text} isn't a CPython version wheelgap can read"
+            out.unreadable.append(Unreadable(path, value.line, reason))
 
 
 def read_workflow(path: Path, name: str, out: Suggestions) -> None:
@@ -510,8 +536,14 @@ def read_workflow(path: Path, name: str, out: Suggestions) -> None:
 
 
 def _is_dockerfile(name: str) -> bool:
-    lower = name.lower()
-    return (lower.startswith("dockerfile") or lower.endswith(".dockerfile")) and not lower.endswith(".dockerignore")
+    """Dockerfile, dockerfile, Dockerfile.prod, Dockerfile-dev, prod.Dockerfile (not Dockerfile.dockerignore)."""
+    if name.lower().endswith(".dockerignore"):
+        return False
+    return (
+        name in ("Dockerfile", "dockerfile")
+        or name.startswith(_DOCKERFILE_PREFIXES)
+        or name.lower().endswith(".dockerfile")
+    )
 
 
 def dockerfiles(folder: Path) -> list[Path]:
