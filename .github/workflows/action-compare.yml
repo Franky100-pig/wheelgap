@@ -4,7 +4,8 @@ name: Action compare-to
 # and checks the report it writes to the job summary. The fixtures are uv.lock files that list every wheel, for a
 # Python inside their requires-python, so wheelgap diff looks nothing up (tests/test_action_compare.py checks that);
 # diff has no --offline flag to enforce it. The Action itself still installs wheelgap with pipx.
-# The token stays read-only, so this never posts a comment: tests/test_action_compare.py covers the comment body.
+# The token stays read-only, so this never posts a comment: tests/test_action_step.py runs the step's comment logic
+# against a stub gh.
 
 on:
   push:
@@ -18,6 +19,7 @@ permissions:
 jobs:
   compare:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
