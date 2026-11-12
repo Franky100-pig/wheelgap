@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import lru_cache
@@ -249,10 +250,54 @@ def _closeness(filename: str, target: Target) -> tuple[int, int, str]:
     return (group, distance, filename)
 
 
-def explain(files: list[str], target: Target) -> list[tuple[str, str]]:
-    """(filename, reason) for every wheel `target` rejects, the closest misses first."""
-    out = [(f, r) for f in files if f.endswith(".whl") and (r := rejection(f, target))]
+def explain(files: list[str], target: Target, yanked: frozenset[str] = frozenset()) -> list[tuple[str, str]]:
+    """(filename, reason) for every wheel `target` rejects, the closest misses first.
+
+    A wheel the target accepts but status_for() leaves out because it's yanked (the release has other files the
+    target can use) is listed with the reason "yanked".
+    """
+    skips_yanked = bool(yanked) and _installable([f for f in files if f not in yanked], target)
+    out = []
+    for f in files:
+        if not f.endswith(".whl"):
+            continue
+        reason = rejection(f, target)
+        if reason is None and skips_yanked and f in yanked:
+            reason = "yanked"
+        if reason:
+            out.append((f, reason))
     return sorted(out, key=lambda fr: _closeness(fr[0], target))
+
+
+# How many rejected wheels --explain's text (and wheelgap-mcp's check_package) lists per cell.
+EXPLAIN_LIMIT = 8
+
+
+def explain_lines(
+    files: list[str],
+    target: Target,
+    *,
+    yanked: frozenset[str] = frozenset(),
+    limit: int | None = None,
+    dim: Callable[[str], str] = lambda text: text,
+    align: bool = False,
+) -> list[str]:
+    """What --explain says under a gap on `target`: each rejected wheel and why (the closest misses first, at most
+    `limit` of them), or that none were published, and a note when the target can't build the sdist there is.
+
+    The command line aligns the reasons in a column, dims them and indents each line; Result.reasons joins them
+    unaligned (one space-separated "file  reason" per line) and with no limit.
+    """
+    rejected = explain(files, target, yanked)
+    out = [] if rejected else [dim("no wheels published for this version")]
+    shown = rejected[:limit]
+    width = max((len(f) for f, _ in shown), default=0) if align else 0
+    out += [f"{f.ljust(width)}  {dim(reason)}" for f, reason in shown]
+    if len(rejected) > len(shown):
+        out.append(dim(f"… and {len(rejected) - len(shown)} more (--json lists them all)"))
+    if not target.builds_sdists and has_sdist(files):
+        out.append(dim(f"there is an sdist, but {target.platform} can't build packages from source"))
+    return out
 
 
 _marker_cache: dict[str, Marker | None] = {}

@@ -21,7 +21,7 @@ from packaging.utils import canonicalize_name
 
 from . import __version__, cache
 from .api import running_python
-from .check import CELL, Row, Status, check, explain, has_sdist, marker_holds, reachable
+from .check import CELL, EXPLAIN_LIMIT, Row, Status, check, explain, explain_lines, marker_holds, reachable
 from .dockerfile import DockerfileError, read_dockerfile
 from .github import github_annotations
 from .junit import write_junit
@@ -534,9 +534,6 @@ def render_table(
     return out
 
 
-EXPLAIN_LIMIT = 8
-
-
 def gap_targets(row: Row, targets: list[Target]) -> list[Target]:
     return [t for t in targets if row.results[t] in (Status.SOURCE, Status.MISSING) and t not in row.ignored]
 
@@ -553,16 +550,8 @@ def render_explain(rows: list[Row], targets: list[Target], style: Style) -> list
             path = r.via.get(t, [])
             if len(path) >= 2:  # a lone name says nothing about why the package is there
                 out.append(f"  via: {' → '.join(path)}")
-            rejected = explain(files, t)
-            if not rejected:
-                out.append(style.dim("  no wheels published for this version"))
-            width = max((len(f) for f, _ in rejected[:EXPLAIN_LIMIT]), default=0)
-            for f, reason in rejected[:EXPLAIN_LIMIT]:
-                out.append(f"  {f.ljust(width)}  {style.dim(reason)}")
-            if len(rejected) > EXPLAIN_LIMIT:
-                out.append(style.dim(f"  … and {len(rejected) - EXPLAIN_LIMIT} more (--json lists them all)"))
-            if not t.builds_sdists and has_sdist(files):
-                out.append(style.dim(f"  there is an sdist, but {t.platform} can't build packages from source"))
+            lines = explain_lines(files, t, yanked=r.package.yanked, limit=EXPLAIN_LIMIT, dim=style.dim, align=True)
+            out += [f"  {line}" for line in lines]
             out.append("")
     return out
 
@@ -666,7 +655,9 @@ def report_json(
             out["bundled_version_differs"] = bundled_version_differs(r.package, pyodide_lock)
         if explained:
             out["rejected"] = {
-                t.label(multi_py): [{"file": f, "reason": why} for f, why in explain(r.package.files or [], t)]
+                t.label(multi_py): [
+                    {"file": f, "reason": why} for f, why in explain(r.package.files or [], t, r.package.yanked)
+                ]
                 for t in gap_targets(r, targets)
             }
             # Same targets as `rejected`, minus any without a path (inputs with no dependency graph).

@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
+from conftest import FAKE_INDEX
 
 from wheelgap import __version__, mcp
 
@@ -149,6 +150,37 @@ def test_check_package_pinned_version_and_glibc(fake_pypi):
     assert data["assumes"]["glibc"] == "2.17"
 
 
+@pytest.mark.parametrize("extra", [{}, {"explain": None}, {"explain": False}])
+def test_check_package_without_explain_has_no_explain_keys(fake_pypi, extra):
+    # explain: null means absent, like the other optional arguments
+    (_, reply) = run(init(), call("check_package", name="nowheels", python="3.13", targets=["linux-x86_64"], **extra))
+    data = reply["result"]["structuredContent"]
+    assert data["results"] == {"3.13 linux-x86_64": "source"}
+    assert set(data) == {"name", "version", "error", "results", "ok", "gaps", "targets", "assumes"}
+
+
+def test_check_package_explain_caps_rejected_wheels(fake_pypi, monkeypatch):
+    wheels = [f"many-1.0-cp3{m}-cp3{m}-win_amd64.whl" for m in range(5, 16)]  # 11, none for Linux
+    monkeypatch.setitem(FAKE_INDEX, "many", {"1.0": [*wheels, "many-1.0.tar.gz"]})
+    (_, reply) = run(
+        init(),
+        call("check_package", name="many", python="3.13", targets=["linux-x86_64", "win-amd64"], explain=True),
+    )
+    data = reply["result"]["structuredContent"]
+    assert data["results"] == {"3.13 linux-x86_64": "source", "3.13 win-amd64": "wheel"}
+    (cell,) = data["rejected"]["3.13 linux-x86_64"][:1]
+    assert cell == {"file": "many-1.0-cp313-cp313-win_amd64.whl", "reason": "win_amd64 doesn't match linux-x86_64"}
+    assert list(data["rejected"]) == ["3.13 linux-x86_64"]  # gap targets only
+    assert len(data["rejected"]["3.13 linux-x86_64"]) == 8
+    assert data["rejected_omitted"] == {"3.13 linux-x86_64": 3}
+    assert data["via"] == {}
+    (_, reply) = run(
+        init(), call("check_package", name="nowheels", python="3.13", targets=["linux-x86_64"], explain=True)
+    )
+    data = reply["result"]["structuredContent"]
+    assert (data["rejected"], data["rejected_omitted"]) == ({"3.13 linux-x86_64": []}, {})  # an sdist only
+
+
 def test_structured_content_only_from_2025_06_18(fake_pypi):
     (_, reply) = run(init("2025-03-26"), call("check_package", name="purewheel", python="3.13"))
     assert "structuredContent" not in reply["result"]
@@ -175,6 +207,7 @@ def test_check_package_lookup_failure_is_unknown_not_ok(fake_pypi):
         ({"name": "numpy==2.0"}, "isn't a package name"),
         ({"name": "numpy", "version": ">=2"}, "exact version"),
         ({"name": "numpy", "glibc": "new"}, "glibc"),
+        ({"name": "numpy", "explain": "yes"}, "'explain' must be true or false"),
     ],
 )
 def test_bad_arguments_are_tool_errors_without_lookups(fake_pypi, arguments, message):
