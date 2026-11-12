@@ -1119,6 +1119,9 @@ def test_pixi_lock_reads_quoted_scalars(tmp_path):
         ("a: 1\x1db: 2\n", "unsupported character '\\x1d'"),
         ("a: 1\x1eb: 2\n", "unsupported character '\\x1e'"),
         ("a: 1\u2028b: 2\n", "unsupported character '\\u2028'"),
+        ("a: 1\u2029b: 2\n", "unsupported character '\\u2029'"),
+        ("k: a\ufffe\n", "unsupported character '\\ufffe'"),
+        ("k: 'a\uffff'\n", "unsupported character '\\uffff'"),
         ("k: a\x01b\n", "unsupported character '\\x01'"),
         ("k: a\x7f\n", "unsupported character '\\x7f'"),
         ("k: a\x85\n", "unsupported character '\\x85'"),
@@ -1171,6 +1174,7 @@ def test_block_yaml_refuses(text, message):
         ("url: https://x.org/a#b\n", {"url": "https://x.org/a#b"}),
         ('k: "a\\tb\\u00e9\\x41\\U0001F600"\n', {"k": "a\tb\u00e9A\U0001f600"}),
         ("'a: b': 'it''s'\n", {"a: b": "it's"}),
+        ('k: "\\U0010FFFF"\n', {"k": "\U0010ffff"}),  # the last code point is still a character
     ],
 )
 def test_block_yaml_reads(text, expected):
@@ -1379,3 +1383,44 @@ def test_find_lockfile_order_with_pixi_lock(fixtures, tmp_path):
     assert (source.kind, source.passed_over) == ("requirements", tmp_path / "pixi.lock")
     (source,) = load_inputs([str(tmp_path)], "test")
     assert (source.kind, source.passed_over) == ("pixi", None)
+
+
+def test_pixi_platform_with_unknown_python_vouches_for_its_packages(tmp_path):
+    # linux-64-cuda builds its Python from source, so its version isn't known: it may be 3.12 like linux-64, and it
+    # installs psycopg2, so psycopg2 isn't hidden on linux x86_64 for 3.12.
+    psycopg2 = f"{FILES}/psycopg2-2.9.10.tar.gz"
+    lock = write_pixi(
+        tmp_path,
+        {
+            "linux-64": [python("linux-64", "3.12.3")],
+            "linux-64-cuda": ["conda_source: python[abcd1234] @ ./python", f"pypi: {psycopg2}"],
+            "win-64": [python("win-64", "3.12.3")],
+        },
+        ["- conda_source: python[abcd1234] @ ./python", pypi_entry(psycopg2, "psycopg2", "2.9.10")],
+        subdirs={"linux-64-cuda": "linux-64"},
+    )
+    assert results(lock, ["3.12"], ["linux-x86_64", "win-amd64"], "psycopg2") == [
+        {"linux-x86_64": "source", "win-amd64": "n/a"}
+    ]
+
+
+def test_pixi_platforms_sharing_a_subdir_with_different_pythons(tmp_path):
+    lock = write_pixi(
+        tmp_path,
+        {"linux-64": [python("linux-64", "3.12.3"), PURE[0]], "linux-64-py313": [python("linux-64")]},
+        [PURE[1]],
+        subdirs={"linux-64-py313": "linux-64"},
+    )
+    # Two groups: purewheel is installed for 3.12 and not for 3.13 on linux x86_64.
+    rows = check([parse_pixi_lock(lock)], build_targets(["3.12", "3.13"], ["linux-x86_64"]))
+    assert [(t.python, s.value) for r in rows for t, s in r.results.items() if r.package.name == "purewheel"] == [
+        ("3.12", "wheel"),
+        ("3.13", "n/a"),
+    ]
+
+
+def test_pixi_lock_that_isnt_utf8(tmp_path):
+    lock = tmp_path / "pixi.lock"
+    lock.write_bytes(b"version: 7\nplatforms:\n- name: linux-\xff64\n")
+    with pytest.raises(SourceError, match=r"^pixi.lock: not valid UTF-8 \(byte 36\)"):
+        parse_pixi_lock(lock)

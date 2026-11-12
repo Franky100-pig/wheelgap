@@ -3086,3 +3086,9 @@ def test_pixi_lock_counts_conda_packages_in_text(capsys, tmp_path, fake_pypi):
     )
     code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
     assert "skipped 5 non-index packages: bzip2 (conda), libffi (conda), ncurses (conda), openssl (conda)," in out
+    # Exactly six are counted; any other skipped package is still named before the count.
+    gitdep = "git+https://github.com/example/gitdep.git#aaaa"
+    six = text.replace(selectors[-1] + "\n", f"      - pypi: {gitdep}\n") + f"- pypi: {gitdep}\n  name: gitdep\n"
+    (tmp_path / "pixi.lock").write_text(six, encoding="utf-8")
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert "skipped 7 non-index packages: gitdep (git), 6 conda packages (not on PyPI)\n" in out

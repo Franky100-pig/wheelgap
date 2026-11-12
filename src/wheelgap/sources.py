@@ -956,8 +956,9 @@ class _BlockYaml:
 
     _ESCAPES = {'"': '"', "\\": "\\", "/": "/", "n": "\n", "t": "\t", "r": "\r", "0": "\0"}
     # Tabs, control characters (libyaml refuses most of them), line breaks other than \n and \r (which
-    # str.splitlines would also split on), a byte order mark after the start, and lone surrogates.
-    _BAD_CHAR = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029\ufeff\ud800-\udfff]")
+    # str.splitlines would also split on), a byte order mark after the start, lone surrogates, and the
+    # noncharacters U+FFFE and U+FFFF, which libyaml refuses too.
+    _BAD_CHAR = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029\ufeff\ud800-\udfff\ufffe\uffff]")
 
     def __init__(self, text: str):
         self.lines: list[tuple[int, int, str]] = []  # (line number, indent, content)
@@ -1197,7 +1198,10 @@ def parse_pixi_lock(path: Path, environment: str | None = None) -> Source:
     """One environment of a pixi.lock (`default` unless named): its PyPI packages with the files pixi picked for
     each platform, and its conda packages, skipped. A package missing from some of the lock's platforms gets a
     marker that hides it on those platforms (for the environment's Python there) and nowhere else."""
-    text = path.read_text(encoding="utf-8-sig")  # serde_yaml takes a leading byte order mark too
+    try:
+        text = path.read_text(encoding="utf-8-sig")  # serde_yaml takes a leading byte order mark too
+    except UnicodeDecodeError as e:
+        raise SourceError(f"{path.name}: not valid UTF-8 (byte {e.start}), so it can't be read for sure") from None
     top = re.search(r"^version:[ ]*(.*?)[ ]*$", text, re.MULTILINE)
     if top is None:
         raise SourceError(f"{path.name}: no top-level `version`, so this isn't a pixi.lock wheelgap can read")
@@ -1314,17 +1318,22 @@ def parse_pixi_lock(path: Path, environment: str | None = None) -> Source:
     # Locked platforms by the markers pip would see there: sys_platform, platform_machine and the environment's
     # Python. Platforms that share them (linux-64 and a linux-64-cuda with subdir linux-64, say) are one group.
     groups: dict[tuple[str, str, str], set[str]] = {}
+    # Platforms whose Python isn't known (no conda `python` package, or one built from source), by their markers:
+    # one of them may be the same Python as a group, so a package it installs is never hidden on that machine.
+    unknown_python: dict[tuple[str, str], set[str]] = {}
     for platform in per_platform:
         machine = _CONDA_MARKERS.get(subdirs[platform] if platform in subdirs else platform)
         if machine and platform in pythons:
             groups.setdefault((*machine, pythons[platform]), set()).add(platform)
+        elif machine:
+            unknown_python.setdefault(machine, set()).add(platform)
     # A package missing from every platform of a group isn't installed for those markers. Hide it on exactly them;
     # every other target, such as another Python or a platform the lock doesn't cover, still counts it.
     for pkg, platforms in found.values():
         clauses = [
             f"(sys_platform != '{sys_platform}' or platform_machine != '{machine}' or python_version != '{python}')"
             for (sys_platform, machine, python), members in groups.items()
-            if not members & platforms
+            if not members & platforms and not unknown_python.get((sys_platform, machine), set()) & platforms
         ]
         pkg.markers = [" and ".join(clauses)] if clauses else None
     pkgs = [pkg for pkg, _ in found.values()]
