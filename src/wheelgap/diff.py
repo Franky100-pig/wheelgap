@@ -45,7 +45,7 @@ from . import __version__
 from .api import Result, _check_lockfile, make_targets
 from .check import CELL, Status, applies, reachable
 from .sources import Source
-from .targets import Target
+from .targets import Target, next_python_note
 
 # Higher is worse. UNKNOWN only orders entries of the same package on one target (see the module docstring).
 RANK = {
@@ -305,7 +305,8 @@ def main(argv: list[str] | None = None, prog: str = "python -m wheelgap.diff") -
         action="append",
         default=[],
         metavar="VER",
-        help="target Python, e.g. 3.13 or 3.14t (repeatable; default: the running Python)",
+        help="target Python, e.g. 3.13, 3.14t, or next / next-t for the newest CPython wheelgap knows "
+        "(repeatable; default: the running Python)",
     )
     p.add_argument(
         "-t", "--target", action="append", default=[], metavar="PLATFORM", help="target platform (repeatable)"
@@ -314,6 +315,8 @@ def main(argv: list[str] | None = None, prog: str = "python -m wheelgap.diff") -
     args = p.parse_args(argv)
     try:
         targets = make_targets(args.python or None, args.target or None)
+        if note := next_python_note(args.python):
+            print(f"wheelgap: note: {note}", file=sys.stderr)
         sides = []
         with tempfile.TemporaryDirectory(prefix="wheelgap-diff-") as tmp:
             for path in (args.old, args.new):

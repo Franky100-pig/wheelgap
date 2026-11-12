@@ -11,6 +11,7 @@ import sys
 import sysconfig
 import tomllib
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import packaging
@@ -63,6 +64,7 @@ from .targets import (
     Target,
     TargetError,
     build_targets,
+    next_python_note,
     parse_api_level,
     parse_ios_version,
     parse_version_pair,
@@ -77,6 +79,7 @@ examples:
   wheelgap                                 check the lockfile in the current directory
   wheelgap uv.lock -t musl-aarch64         will my Alpine ARM image build from source?
   wheelgap -p 3.14t -t all                 is my stack ready for free-threaded 3.14?
+  wheelgap -p 3.14 -p next                 what blocks the move to the newest Python?
   wheelgap psycopg2 uvloop -t win-amd64    check packages without a lockfile
   wheelgap requirements.txt --json         machine-readable output for CI
   wheelgap -t alpine-arm64 --explain       show which wheels were rejected, and why
@@ -130,7 +133,8 @@ def make_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="VER",
-        help=f"target Python, e.g. 3.13 or 3.14t (repeatable; default: .python-version, else {running_python()})",
+        help="target Python, e.g. 3.13, 3.14t, or next / next-t for the newest CPython wheelgap knows "
+        f"(repeatable; default: .python-version, else {running_python()})",
     )
     p.add_argument(
         "-t",
@@ -355,7 +359,8 @@ def load_uv_targets(path: Path, pythons: list[str]) -> list[str]:
         # e.g. a mobile-only project, or `wheelgap requests` run in a project folder: don't fail the run
         print(
             f"wheelgap: note: {path} [tool.uv] required-environments matches none of the native targets "
-            f"for Python {', '.join(pythons)}, so the default targets are checked; select targets with -t",
+            f"for Python {', '.join(dict.fromkeys(t.python for t in targets))}, so the default targets are checked; "
+            "select targets with -t",
             file=sys.stderr,
         )
     return platforms
@@ -498,6 +503,66 @@ def bundled_line(rows: list[Row], lock: PyodideLock) -> str:
     return f"{len(rows)} {noun} from Pyodide {lock.pyodide_version}'s own builds: " + ", ".join(map(one, rows))
 
 
+_OK = (Status.WHEEL, Status.NOT_NEEDED, Status.BUNDLED)
+
+
+@dataclass(frozen=True)
+class Blocking:
+    """What blocks the move to the newer of two checked Pythons (see blocking_newer_python)."""
+
+    older: str
+    newer: str
+    names: list[str]  # packages with a gap on the newer Python only
+    unchecked: int  # other packages that couldn't be checked on the newer Python, so may block it too
+
+
+def blocking_newer_python(rows: list[Row], targets: list[Target]) -> Blocking | None:
+    """With exactly two Pythons checked, one newer: the packages that block the upgrade.
+
+    It's decided per package name, over every row (input or forked version) of it: a package blocks the upgrade
+    when, on some platform, the newer Python has a gap (source or missing) and every result for the older Python is
+    a wheel, n/a or bundled. Gaps the older Python has too and ignored targets don't count. A package that is unknown
+    on the newer Python isn't listed, but is counted in `unchecked`, since it may block the upgrade too.
+    """
+    by_python: dict[str, dict[str, Target]] = {}
+    for t in targets:
+        by_python.setdefault(t.python, {})[t.platform] = t
+    if len(by_python) != 2:
+        return None
+    older, newer = sorted(by_python.values(), key=lambda ts: next((t.major, t.minor) for t in ts.values()))
+    old, new = next(iter(older.values())), next(iter(newer.values()))
+    if (old.major, old.minor) == (new.major, new.minor):  # 3.14 and 3.14t: neither is newer
+        return None
+    by_name: dict[str, list[Row]] = {}
+    for r in rows:
+        by_name.setdefault(r.package.key, []).append(r)
+    names, unchecked = [], 0
+    for group in by_name.values():
+
+        def results(t: Target, group: list[Row] = group) -> list[Status]:
+            return [r.results[t] for r in group if t not in r.ignored]
+
+        if any(
+            any(s in (Status.SOURCE, Status.MISSING) for s in results(t)) and all(s in _OK for s in results(older[p]))
+            for p, t in newer.items()
+        ):
+            names.append(group[0].package.name)
+        elif any(Status.UNKNOWN in results(t) for t in newer.values()):
+            unchecked += 1
+    return Blocking(old.python, new.python, names, unchecked)
+
+
+def blocking_line(blocking: Blocking) -> str:
+    """'blocking 3.15: numpy, pydantic-core' (see blocking_newer_python)."""
+    n = blocking.unchecked
+    unchecked = f"{n} package{'s' * (n != 1)} couldn't be checked" if n else ""
+    if blocking.names:
+        return f"blocking {blocking.newer}: {', '.join(blocking.names)}" + (f" ({unchecked})" if n else "")
+    if n:
+        return f"blocking {blocking.newer}: none known ({unchecked})"
+    return f"blocking {blocking.newer}: none (every gap on {blocking.newer} is on {blocking.older} too)"
+
+
 def report_json(
     rows: list[Row],
     targets: list[Target],
@@ -509,6 +574,7 @@ def report_json(
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     gaps = [r for r in rows if not r.ok]
+    blocking = blocking_newer_python(rows, targets)
 
     def package(r: Row) -> dict:
         out: dict[str, object] = {
@@ -529,21 +595,21 @@ def report_json(
             out["via"] = {t.label(multi_py): r.via[t] for t in gap_targets(r, targets) if t in r.via}
         return out
 
-    return json.dumps(
-        {
-            "version": __version__,
-            "sources": sources,
-            "targets": [{"label": t.label(multi_py), "python": t.python, "platform": t.platform} for t in targets],
-            "packages": [package(r) for r in rows],
-            "skipped": [{"name": p.name, "reason": p.skip} for p in skipped],
-            "ignored": [name for name, platforms in ignored if platforms is None],
-            "ignored_targets": [
-                {"name": name, "platforms": platforms} for name, platforms in ignored if platforms is not None
-            ],
-            "summary": {"packages": len(rows), "with_gaps": len(gaps), "per_target": target_counts(gaps, targets)},
-        },
-        indent=2,
-    )
+    report: dict[str, object] = {
+        "version": __version__,
+        "sources": sources,
+        "targets": [{"label": t.label(multi_py), "python": t.python, "platform": t.platform} for t in targets],
+        "packages": [package(r) for r in rows],
+        "skipped": [{"name": p.name, "reason": p.skip} for p in skipped],
+        "ignored": [name for name, platforms in ignored if platforms is None],
+        "ignored_targets": [
+            {"name": name, "platforms": platforms} for name, platforms in ignored if platforms is not None
+        ],
+        "summary": {"packages": len(rows), "with_gaps": len(gaps), "per_target": target_counts(gaps, targets)},
+    }
+    if blocking is not None:
+        report["blocking_newer_python"] = blocking.names
+    return json.dumps(report, indent=2)
 
 
 def libc_versions(args: argparse.Namespace, config: dict) -> tuple[str, str]:
@@ -744,6 +810,8 @@ def render_markdown(
             out += [f"- {_md(label)}: {target_counts_text(counts, plain)}" for label, counts in per_target.items()]
             out.append("")
         out += [gap_summary(gaps, len(rows), plain), ""]
+        if blocking := blocking_newer_python(rows, targets):
+            out += [_md(blocking_line(blocking)), ""]
         if source_allowed:
             out += ["Source builds are allowed (fail-on missing), so this run passes.", ""]
     bundled = [r for r in rows if Status.BUNDLED in r.results.values()]
@@ -885,6 +953,14 @@ def main(argv: list[str] | None = None) -> int:
             "wheelgap: note: reading ./diff as an input; for the comparison, run python -m wheelgap.diff",
             file=sys.stderr,
         )
+    # `wheelgap mcp`: the MCP server (as `wheelgap-mcp`), so MCP registries can start it from the `wheelgap` package
+    # (`uvx wheelgap@VERSION mcp`). Unlike diff, a file or folder named mcp here doesn't make it an input: the MCP
+    # client picks the working directory, often a project with an mcp/ folder. `wheelgap ./mcp` checks such a folder,
+    # and `wheelgap mcp==1.0` the PyPI package.
+    if argv[:1] == ["mcp"]:
+        from .mcp import main as mcp_main
+
+        return mcp_main(argv[1:], prog="wheelgap mcp")
     parser = make_parser()
     args = parser.parse_args(argv)
     if args.json and args.markdown:
@@ -944,6 +1020,8 @@ def main(argv: list[str] | None = None) -> int:
             args.ios or config.get("ios", DEFAULT_IOS),
             args.android_api or config.get("android-api", DEFAULT_ANDROID_API),
         )
+        if not quiet and (resolved := next_python_note(pythons)):
+            print(f"wheelgap: note: {resolved}", file=sys.stderr)
         ignore_how = "--ignore" if args.ignore else "ignore in [tool.wheelgap]"
         ignores = [
             entry
@@ -1187,6 +1265,8 @@ def main(argv: list[str] | None = None) -> int:
         if gaps:
             print(gap_summary(gaps, len(rows), style))
             print("gaps: " + ", ".join(r.package.name for r in gaps))
+            if blocking := blocking_newer_python(rows, targets):
+                print(blocking_line(blocking))
         if ignored:
             print(style.dim("ignored: " + ignored_list(ignored)))
         if pyodide_lock:  # a bundled build of another version passes, but quiet mode mustn't hide that (#75)
@@ -1246,6 +1326,8 @@ def main(argv: list[str] | None = None) -> int:
     for line in target_lines(gaps, targets, style):
         print(line)
     print(gap_summary(gaps, len(rows), style))
+    if blocking := blocking_newer_python(rows, targets):
+        print(blocking_line(blocking))
     if not args.explain:
         print(style.dim("Run with --explain to see which wheels were rejected and why."))
     if gaps and not failing and not args.exit_zero:
