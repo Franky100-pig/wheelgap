@@ -260,10 +260,15 @@ def test_inspect_flags_a_drop_in_wheels_against_the_pinned_copy(tmp_path):
     assert report.of(MISREAD) == ["0.0 wheels per package, down from 11.6 in the pinned copy"]
 
 
-def test_inspect_escapes_lockfile_text(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("field", ["name", "version"])  # wheelgap refuses the name; the version gets printed
+def test_inspect_escapes_lockfile_text(tmp_path, monkeypatch, capsys, field):
     hostile = "a\\n::error::pwned ```\\n"
+    fields = {"name": "a", "version": "1.0", field: hostile}
     path = tmp_path / "pylock.toml"
-    path.write_text(f'lock-version = "1.0"\n[[packages]]\nname = "{hostile}"\nversion = "x"\n', encoding="utf-8")
+    path.write_text(
+        f'lock-version = "1.0"\n[[packages]]\nname = "{fields["name"]}"\nversion = "{fields["version"]}"\n',
+        encoding="utf-8",
+    )
     monkeypatch.setattr(script, "download", lambda repo, p, folder: path)
     script.main(["pdfly"])
     out = capsys.readouterr().out
@@ -340,7 +345,7 @@ def test_main_names_each_failing_project_and_carries_on(tmp_path, monkeypatch, c
         broken = {
             "python-poetry/tomlkit": '[[package]]\nname = "a"\nversion = "x.y"\n[metadata]\nlock-version = "2.1"\n',
             "ubernostrum/webcolors": '[metadata]\nlock_version = "4.5.0"\n[[package]]\nname = "a"\nversion = "1"\n'
-            'marker = 5\nfiles = [{ file = "a-1-py3-none-any.whl" }]\n',  # breaks the checks themselves
+            'marker = 5\nfiles = [{ file = "a-1-py3-none-any.whl" }]\n',  # wheelgap refuses a marker that isn't text
         }
         if repo == "pytest-dev/pluggy":
             raise urllib.error.URLError("no route")
@@ -351,7 +356,15 @@ def test_main_names_each_failing_project_and_carries_on(tmp_path, monkeypatch, c
             return folder / Path(path).name
         return REAL / next(e["file"] for e in script.manifest() if e["repo"] == repo)
 
+    inspect = script.inspect
+
+    def crashing_inspect(path, pinned=None):  # a lockfile odd enough to break the checks themselves
+        if pinned is not None and pinned.parent.name == "iniconfig":
+            raise RuntimeError("boom")
+        return inspect(path, pinned)
+
     monkeypatch.setattr(script, "download", download)
+    monkeypatch.setattr(script, "inspect", crashing_inspect)
     assert script.main([]) == 1
     out = capsys.readouterr().out
     assert (
@@ -362,15 +375,20 @@ def test_main_names_each_failing_project_and_carries_on(tmp_path, monkeypatch, c
         "FAIL python-poetry/tomlkit poetry.lock (default branch): lock-version '2.1'; 1 packages\n"
         "    misread: 'a': version 'x.y' doesn't parse\n"
     ) in out
+    assert (
+        "FAIL pytest-dev/iniconfig uv.lock (default branch): format unknown\n"
+        "    misread: checking it failed: RuntimeError: 'boom'\n"
+    ) in out
     assert "FAIL python-poetry/cleo poetry.lock (default branch): format unknown\n    upstream changed: " in out
     assert (
         "FAIL ubernostrum/webcolors pdm.lock (default branch): format unknown\n"
-        "    misread: checking it failed: TypeError: "
+        "    misread: can't read it: SourceError: \"pdm.lock: package a has a marker that isn't a string\"\n"
     ) in out
     assert "ok   pypa/pipenv Pipfile.lock (default branch): pipfile-spec '6'; 85 packages\n" in out
     assert out.endswith(
-        "4 lockfiles failed:\n"
+        "5 lockfiles failed:\n"
         "    pytest-dev/pluggy uv.lock (default branch): couldn't check\n"
+        "    pytest-dev/iniconfig uv.lock (default branch): misread\n"
         "    python-poetry/tomlkit poetry.lock (default branch): misread\n"
         "    python-poetry/cleo poetry.lock (default branch): upstream changed\n"
         "    ubernostrum/webcolors pdm.lock (default branch): misread\n"
