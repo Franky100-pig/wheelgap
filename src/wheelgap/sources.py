@@ -61,6 +61,19 @@ class Package:
         return canonicalize_name(self.name)
 
 
+# PEP 508's package name. pip and uv can't install anything else, and the CLI prints names at the start of lines,
+# where a lockfile's `::error::...` would otherwise read as a workflow command in a GitHub Actions log.
+_NAME_RE = re.compile(r"[A-Z0-9]|[A-Z0-9][A-Z0-9._-]*[A-Z0-9]", re.IGNORECASE | re.ASCII)
+
+
+def package_name(path: Path, name: object) -> str:
+    """A lockfile's package name, or SourceError naming the file if it isn't a valid one."""
+    if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
+        what = "has no name" if name is None else f"has the name {name!r}, which isn't a valid package name (PEP 508)"
+        raise SourceError(f"{path.name}: a package {what}")
+    return name
+
+
 # A dependency edge in a lockfile graph: (name, version or None, marker or None)
 Edge = tuple[str, str | None, str | None]
 
@@ -181,7 +194,7 @@ def parse_uv_lock(path: Path) -> Source:
     source.uv_pyproject = path.with_name("pyproject.toml")
     for p in data.get("package", []):
         src = p.get("source", {})
-        pkg = Package(p["name"], p.get("version"), origin=path.name)
+        pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name)
         kind = next((k for k in ("editable", "virtual", "git", "path", "directory", "url") if k in src), None)
         if kind and "registry" not in src:
             pkg.skip = kind
@@ -410,7 +423,7 @@ def parse_pylock(path: Path) -> Source:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     pkgs = []
     for p in data.get("packages", []):
-        pkg = Package(p["name"], p.get("version"), origin=path.name, registry=p.get("index"))
+        pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name, registry=p.get("index"))
         if p.get("marker"):
             pkg.markers = [p["marker"]]
         if any(k in p for k in ("vcs", "directory", "archive")) and "wheels" not in p and "sdist" not in p:
@@ -444,7 +457,7 @@ def parse_poetry_lock(path: Path) -> Source:
     pkgs: list[Package] = []
     edges: dict[int, list[Edge]] = {}
     for p in data.get("package", []):
-        pkg = Package(p["name"], p.get("version"), origin=path.name)
+        pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name)
         markers = p.get("markers")
         if isinstance(markers, str):
             pkg.markers = [markers]
@@ -614,7 +627,7 @@ def parse_pdm_lock(path: Path) -> Source:
     # Each package's groups, merged over its entries (PDM writes one per extras variant).
     groups: dict[tuple[str, str | None], list[str] | None] = {}
     for p in data.get("package", []):
-        pkg = Package(p["name"], p.get("version"), origin=path.name)
+        pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name)
         recorded = p.get("groups")
         recorded = [g for g in recorded if isinstance(g, str)] if isinstance(recorded, list) else None
         key = (pkg.key, pkg.version)
@@ -679,6 +692,7 @@ def parse_pipfile_lock(path: Path) -> Source:
     }
     for section in sections:
         for name, p in data[section].items():
+            package_name(path, name)
             if not isinstance(p, dict):
                 raise SourceError(f"{path.name}: {section}.{name} isn't a package entry")
             version = p.get("version")
