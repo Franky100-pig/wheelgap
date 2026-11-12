@@ -13,6 +13,10 @@ from wheelgap.check import Status
 from wheelgap.cli import main
 from wheelgap.targets import ALIASES, DEFAULT_PLATFORMS, PLATFORMS
 
+NOTES_HINT = (
+    "wheelgap: add --notes to show the tracker's notes for these packages (sends their names to wheelgap.github.io)\n"
+)
+
 
 def run(capsys, *argv):
     code = main(list(argv))
@@ -1559,7 +1563,7 @@ def test_ignore_on_one_target_text(capsys, fixtures, target):
 def test_ignore_on_one_target_keeps_other_targets(capsys, fixtures):
     args = (str(fixtures / "armgap"), *ARMGAP_TWO, "--color", "never", "--explain")
     code, out, err = run(capsys, *args, "--ignore", "newglibc:musl-aarch64")
-    assert code == 1 and not err
+    assert code == 1 and err == NOTES_HINT  # the only stderr line: --notes would look armlib up
     assert "ignored: newglibc (musl-aarch64)" in out
     # Per-target counts leave the ignored cell out; newglibc still counts on linux-aarch64.
     assert "linux-aarch64  1 missing\n" in out
@@ -1582,7 +1586,7 @@ def test_ignore_on_one_target_keeps_other_targets(capsys, fixtures):
 def test_ignore_on_one_target_json(capsys, fixtures):
     args = (str(fixtures / "armgap"), *ARMGAP_TWO, "--json", "--explain")
     code, out, err = run(capsys, *args, "--ignore", "armlib:musl-aarch64,newglibc:linux-aarch64")
-    assert code == 1 and not err
+    assert code == 1 and err == NOTES_HINT
     data = json.loads(out)
     _assert_matches_output_schema(data)
     assert data["ignored"] == []  # still whole-package names only
@@ -2096,6 +2100,7 @@ def _assert_matches_output_schema(data):
             "results",
             "rejected",
             "via",
+            "notes",
             "bundled",
             "bundled_version_differs",
             "conda_forge",
@@ -2121,6 +2126,8 @@ def _assert_matches_output_schema(data):
         if "conda_forge" in pkg:  # a hint for some of the targets in rejected, never an empty one
             assert pkg["conda_forge"]["builds"] and set(pkg["conda_forge"]["builds"]) <= set(pkg["rejected"])
             assert all(pkg["conda_forge"]["builds"].values())
+        for note in pkg.get("notes", []):
+            assert set(note["targets"]) <= set(pkg.get("rejected", {})), "notes cover gap targets only"
     for item in data["skipped"]:
         assert set(item) == {"name", "reason"}
         assert isinstance(item["name"], str) and isinstance(item["reason"], str)
@@ -2172,7 +2179,9 @@ def test_json_output_matches_schema(capsys, fixtures):
         assert "error" not in data, data
         _assert_matches_output_schema(data)
         if "--explain" in args:
-            assert all("rejected" in pkg and "via" in pkg for pkg in data["packages"])
+            assert all("rejected" in pkg and "via" in pkg and "notes" in pkg for pkg in data["packages"])
+        else:
+            assert all("notes" not in pkg for pkg in data["packages"])
         if "winonly" in args:
             assert "winonly" in data["ignored"]
             assert all(pkg["name"] != "winonly" for pkg in data["packages"])

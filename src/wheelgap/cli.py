@@ -20,6 +20,7 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
 
 from . import __version__, cache, condaforge, origin
+from . import notes as tracker
 from .api import running_python
 from .check import CELL, EXPLAIN_LIMIT, Row, Status, check, explain, explain_lines, marker_holds, reachable
 from .dockerfile import DockerfileError, read_dockerfile
@@ -223,6 +224,14 @@ def make_parser() -> argparse.ArgumentParser:
         "platform (sends the names of PyPI packages with gaps to anaconda.org)",
     )
     p.add_argument(
+        "--notes",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="with --explain, also show the coverage tracker's notes for packages with gaps, which sends the names of "
+        "those from PyPI to wheelgap.github.io (never with --offline, --index-url or a WHEELGAP_INDEX_URL mirror; "
+        "--no-notes overrides notes = true)",
+    )
+    p.add_argument(
         "-q",
         "--quiet",
         action=argparse.BooleanOptionalAction,
@@ -351,7 +360,7 @@ def load_config(path: Path) -> dict:
                 raise SourceError(f"{path}: [tool.wheelgap] {key} must be {example}")
             if key == "fail-on" and value not in FAIL_ON:
                 raise SourceError(f"{path}: [tool.wheelgap] fail-on must be one of: {', '.join(FAIL_ON)}")
-        elif key in ("quiet", "offline"):
+        elif key in ("quiet", "offline", "notes"):
             if not isinstance(value, bool):
                 raise SourceError(f"{path}: [tool.wheelgap] {key} must be a boolean")
         else:
@@ -552,10 +561,48 @@ def gap_targets(row: Row, targets: list[Target]) -> list[Target]:
     return [t for t in targets if row.results[t] in (Status.SOURCE, Status.MISSING) and t not in row.ignored]
 
 
+RowNotes = dict[int, list[tuple[tracker.Note, list[Target]]]]
+"""The tracker's notes that apply to a row's gaps, keyed by id(row), each with the gap targets it covers."""
+
+
+def notes_eligible(row: Row, targets: list[Target], source_of: dict[int, Source]) -> bool:
+    """Whether --notes would look this row's package up: it has a gap, and it's positively a PyPI package
+    (tracker.may_send). `source_of` maps id() of each package to the input it was read from."""
+    source = source_of.get(id(row.package))
+    return source is not None and bool(gap_targets(row, targets)) and tracker.may_send(row.package, source)
+
+
+def tracker_notes(
+    rows: list[Row], targets: list[Target], source_of: dict[int, Source], read_cache: bool, write_cache: bool
+) -> tuple[RowNotes, str | None]:
+    """--explain --notes: the coverage tracker's notes for each row with a gap, and why the lookups were cut short,
+    if they were (see tracker.lookup).
+
+    Only names positively from PyPI are looked up (notes_eligible). A note is kept for the gap targets on its
+    platforms, and only when it's about the checked release (Note.applies_to): the tracker checked its latest
+    release, which may not be yours.
+    """
+    eligible = [r for r in rows if notes_eligible(r, targets, source_of)]
+    found, cut = tracker.lookup([r.package.key for r in eligible], read_cache, write_cache)
+    out: RowNotes = {}
+    for r in eligible:
+        if r.package.key not in found:
+            continue
+        gaps = gap_targets(r, targets)
+        matched = [(note, [t for t in gaps if note.covers(t.platform)]) for note in found[r.package.key]]
+        if kept := [(note, ts) for note, ts in matched if ts and note.applies_to(r.package.version)]:
+            out[id(r)] = kept
+    return out, cut
+
+
 def render_explain(
-    rows: list[Row], targets: list[Target], style: Style, conda_forge: dict[int, condaforge.Hint] | None = None
+    rows: list[Row],
+    targets: list[Target],
+    style: Style,
+    conda_forge: dict[int, condaforge.Hint] | None = None,
+    notes: RowNotes | None = None,
 ) -> list[str]:
-    """`conda_forge`: --conda-forge hints, by id() of the row's package."""
+    """`conda_forge`: --conda-forge hints, by id() of the row's package. `notes`: --notes, by id() of the row."""
     multi_py = len({t.python for t in targets}) > 1
     out = []
     for r in rows:
@@ -572,6 +619,16 @@ def render_explain(
             out.append("")
         if conda_forge and (h := conda_forge.get(id(r.package))):
             out += [condaforge.hint_text(r.package, h, multi_py), ""]
+        for note, ts in (notes or {}).get(id(r), []):
+            # Printed as is: a note is one line of plain text (tracker.parse). It can't hold a GitHub Actions workflow
+            # command either: tracker.parse drops a note with "##[" or a word starting with "::", and the text never
+            # starts a line, since it follows "  - " (the runner only reads "::" at the start of a line).
+            platforms = ", ".join(dict.fromkeys(t.platform for t in ts))
+            head = f"{r.package.name} {r.package.version or '?'}: note from the wheelgap tracker for {platforms}"
+            out.append(f"{style.bold(head)} {style.dim(f'({note.kind}, checked {note.updated})')}")
+            out.append(f"  - {note.text}")
+            out += [f"    {link}" for link in note.links]
+            out.append("")
     return out
 
 
@@ -658,6 +715,7 @@ def report_json(
     pyodide_lock: PyodideLock | None = None,
     advisory: frozenset[Target] = frozenset(),
     conda_forge: dict[int, condaforge.Hint] | None = None,
+    notes: RowNotes | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     gaps = [r for r in rows if not r.ok]
@@ -688,6 +746,11 @@ def report_json(
                     "version": h.version,
                     "builds": {t.label(multi_py): subdirs for t, subdirs in h.builds.items()},
                 }
+            # The tracker's notes for this package's gaps, each with the gap targets it covers.
+            out["notes"] = [
+                {**note.as_json(), "targets": [t.label(multi_py) for t in ts]}
+                for note, ts in (notes or {}).get(id(r), [])
+            ]
         return out
 
     report: dict[str, object] = {
@@ -882,6 +945,7 @@ def render_markdown(
     source_allowed: bool = False,
     advisory: frozenset[Target] = frozenset(),
     conda_forge: dict[int, condaforge.Hint] | None = None,
+    notes: RowNotes | None = None,
 ) -> list[str]:
     """The same report as the text output, as GitHub-flavoured Markdown (for a job summary or a PR comment)."""
     plain = Style(False)
@@ -938,9 +1002,11 @@ def render_markdown(
         if r.package.error:
             out += [f"Could not check {_md(r.package.name)}: {_code(r.package.error)}", ""]
     if args.explain and gaps:
-        # Fenced, so wheel filenames and reasons need no escaping.
-        lines = render_explain(gaps, targets, plain, conda_forge)
-        out += ["<details><summary>Why (rejected wheels)</summary>", "", "```", *lines, "```", "", "</details>", ""]
+        # Fenced, so wheel filenames, reasons and the tracker's notes need no escaping: inside a code block, Markdown
+        # and HTML are shown as text. The fence is longer than any run of backticks in it, so nothing can close it.
+        lines = render_explain(gaps, targets, plain, conda_forge, notes)
+        fence = "`" * max([3, *(len(run) + 1 for line in lines for run in re.findall(r"`+", line))])
+        out += ["<details><summary>Why (rejected wheels)</summary>", "", fence, *lines, fence, "", "</details>", ""]
     return out
 
 
@@ -1149,6 +1215,8 @@ def _main(argv: list[str]) -> int:
         parser.error("--offline and --online can't be used together")
     if args.conda_forge and not args.explain:
         parser.error("--conda-forge only adds to --explain; pass --explain too")
+    if args.notes and not args.explain:
+        parser.error("--notes only adds to --explain; pass --explain too")
     try:
         if args.clear_cache:
             folder, count = cache.clear()
@@ -1448,8 +1516,45 @@ def _main(argv: list[str]) -> int:
         if r.package.key in ignore_on:
             r.ignored = frozenset(t for t in targets if t.platform in ignore_on[r.package.key])
     gaps = [r for r in rows if not r.ok]
-    conda_forge = conda_forge_hints(gaps, targets, sources, index_url, quiet, cached) if args.conda_forge else {}
     source_labels = [s.label for s in sources]
+    row_notes: RowNotes = {}
+    # Opt-in, since it sends package names to wheelgap.github.io: --explain on a lockfile makes no requests by default.
+    # Never offline, nor when packages come from another index (--index-url, a WHEELGAP_INDEX_URL mirror).
+    notes_asked = args.notes if args.notes is not None else config.get("notes")
+    elsewhere = origin.other_index(index_url)
+    index_how = "--index-url" if args.index_url is not None else "index-url in [tool.wheelgap]"
+    notes_off = offline_how if offline else (index_how if elsewhere == "--index-url" else elsewhere)
+    source_of = {id(p): s for s in sources for p in s.packages}
+    if args.explain and notes_asked and notes_off and not quiet:
+        print(
+            f"wheelgap: note: the tracker's notes are off with {notes_off}, so no package names leave for "
+            "wheelgap.github.io",
+            file=sys.stderr,
+        )
+    elif args.explain and gaps and not notes_off:
+        if notes_asked:
+            row_notes, cut = tracker_notes(gaps, targets, source_of, **cached)
+            if cut and not quiet:
+                why = (
+                    "wheelgap.github.io didn't answer in time"
+                    if cut == tracker.TIMED_OUT
+                    else "couldn't reach wheelgap.github.io"
+                )
+                print(
+                    Style(use_color(args.color)).dim(
+                        f"wheelgap: note: {why}, so some of the tracker's notes may be missing"
+                    ),
+                    file=sys.stderr,
+                )
+        elif notes_asked is None and not quiet and any(notes_eligible(r, targets, source_of) for r in gaps):
+            print(
+                Style(use_color(args.color)).dim(
+                    "wheelgap: add --notes to show the tracker's notes for these packages "
+                    "(sends their names to wheelgap.github.io)"
+                ),
+                file=sys.stderr,
+            )
+    conda_forge = conda_forge_hints(gaps, targets, sources, index_url, quiet, cached) if args.conda_forge else {}
     # With --fail-on missing, source builds are accepted; missing and unknown packages still fail. Gaps on
     # --advisory targets never fail the run.
     fail_statuses = GAP_STATUSES if fail_on == "source" else (Status.MISSING, Status.UNKNOWN)
@@ -1474,7 +1579,16 @@ def _main(argv: list[str]) -> int:
     if args.json:
         print(
             report_json(
-                rows, targets, source_labels, skipped, ignored, args.explain, pyodide_lock, advisory, conda_forge
+                rows,
+                targets,
+                source_labels,
+                skipped,
+                ignored,
+                args.explain,
+                pyodide_lock,
+                advisory,
+                conda_forge,
+                row_notes,
             )
         )
         return code
@@ -1493,6 +1607,7 @@ def _main(argv: list[str]) -> int:
                     source_allowed,
                     advisory,
                     conda_forge,
+                    row_notes,
                 )
             )
         )
@@ -1538,7 +1653,7 @@ def _main(argv: list[str]) -> int:
         if args.explain and gaps:
             if hidden:
                 print()
-            for ln in render_explain(gaps, targets, style, conda_forge):
+            for ln in render_explain(gaps, targets, style, conda_forge, row_notes):
                 print(ln)
 
     bundled = [r for r in rows if Status.BUNDLED in r.results.values()]

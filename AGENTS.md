@@ -32,12 +32,13 @@ uv run --group dev pytest
 | `targets.py` | Targets (Python × platform) and the wheel tags each accepts |
 | `check.py` | The status per package and target (`wheel`, `source`, `missing`, `unknown`, `n/a`, `bundled`) and `--explain` reasons |
 | `pypi.py` | The only HTTP client (`fetch_json`: retries, https-only redirects) and the PyPI lookups (`fill`, `fill_all`, `recheck_lock`) |
-| `cache.py` | The 24-hour on-disk cache of pinned PyPI lookups and `--conda-forge` lookups (`--no-cache` and `--online` skip it) |
+| `cache.py` | The 24-hour on-disk cache of pinned PyPI lookups, `--conda-forge` lookups and the tracker's notes (`--no-cache` and `--online` skip it) |
 | `dockerfile.py` | `--dockerfile`: reads the final stage's image and platform the way Docker/BuildKit does |
 | `offline.py` | `--offline`, `offline = true` and `check_lockfile(..., offline=True)`: refuse inputs that would need an index lookup |
 | `pyodide.py` | `--pyodide-lock`: packages Pyodide ships itself |
 | `condaforge.py` | `--conda-forge`: under `--explain`, whether conda-forge has a build of the same package and version that fits a gap's target (anaconda.org, through `pypi.fetch_json`) |
-| `origin.py` | `known_pypi`: whether a package is positively PyPI's, so its name may go to another service (`--conda-forge`); never for private-index names |
+| `origin.py` | `known_pypi`: whether a package is positively PyPI's, so its name may go to another service (`--conda-forge`, `--notes`); never for private-index names |
+| `notes.py` | `--explain`: the [coverage tracker](https://wheelgap.github.io/tracker/)'s notes for packages with gaps, opt-in with `--notes`, looked up only for names `origin.known_pypi` accepts (from `uv.lock` and `pylock.toml` for a registry), never with `--offline`, `--index-url` or a `WHEELGAP_INDEX_URL` mirror |
 | `github.py` | `--github-annotations`: GitHub Actions `::error`/`::warning` lines, and each package's line in its input file |
 | `logsafe.py` | Keeps input text from running as a GitHub Actions workflow command: the CLI's and `diff`'s stdout and stderr go through `CommandGuard` |
 | `scan.py` | `python -m wheelgap.scan`: the data behind the [coverage tracker](https://wheelgap.github.io/tracker/) |
@@ -47,10 +48,21 @@ uv run --group dev pytest
 ## Tests
 
 - **No network, ever.** Use the `fake_pypi` fixture in `tests/conftest.py`. To add a package, add it to `FAKE_INDEX`. The fixture returns the list of URLs fetched, so tests can assert what was (or wasn't) looked up. Lockfile fixtures live in `tests/fixtures/`; small one-off lockfiles go in `tmp_path`.
+- `--explain --notes` asks the coverage tracker for notes; the autouse `tracker` fixture answers instead (a 404 for every name, unless a test adds a file with `tracker.add(name, note)`), and `tracker.calls` lists what was asked.
 - `fake_pypi` patches `wheelgap.pypi.fetch_json`. New code that fetches should call `pypi.fetch_json` at call time (as `pyodide.py` does), not import the name, so the fixture catches it.
 - **Every behaviour change gets a test that fails without the change.** Check this by reverting your source change and running the test.
 - **Write test files that contain non-ASCII text with `encoding="utf-8"`** (or use `write_bytes`). Windows CI otherwise writes cp1252.
 - Put new cases in the existing parametrized tables where one fits, e.g. `test_dockerfiles_docker_rejects` and `test_parse_from` in `tests/test_dockerfile.py`.
+- **Real lockfiles:** `tests/fixtures/real/` holds unchanged copies of open-source projects' lockfiles, each with the project's `LICENSE` from the same commit, and `sources.toml` there records each one's repo, path, commit and licence (MIT, BSD or Apache only). `tests/test_real_lockfiles.py` reads them offline and pins what wheelgap reads from each (`EXPECTED`: packages, files, `n/a` cells, markers). The weekly [Lockfile corpus](.github/workflows/lockfile-corpus.yml) workflow runs `scripts/check_real_lockfiles.py` on each project's current file; it's a dev script, so it downloads with `urllib` directly rather than through `pypi.fetch_json`. Each failure says whether wheelgap **misread** the file (a bug to fix in `sources.py`) or the project **changed** it upstream (a new format version, a git dependency, a moved file: refresh the copy, add the version to `KNOWN_FORMATS` in the script once wheelgap reads it, or pick another project). To refresh a copy, download it and its licence at a pinned commit, update `commit` in `sources.toml` and the copy's line in `EXPECTED`, then check it:
+
+  ```bash
+  sha=$(gh api repos/pytest-dev/pluggy/commits/HEAD --jq .sha)
+  gh api -H "Accept: application/vnd.github.raw" "repos/pytest-dev/pluggy/contents/uv.lock?ref=$sha" > tests/fixtures/real/pluggy/uv.lock
+  gh api -H "Accept: application/vnd.github.raw" "repos/pytest-dev/pluggy/contents/LICENSE?ref=$sha" > tests/fixtures/real/pluggy/LICENSE
+  uv run python scripts/check_real_lockfiles.py --pinned pluggy
+  ```
+
+  Keep each copy under 100 KB, and leave the Poetry 1.x one (`cleo`) at its old commit.
 
 ## House rules
 
@@ -58,7 +70,7 @@ uv run --group dev pytest
 - **All network access goes through `pypi.fetch_json`.**
 - **Wheel tags:** use `packaging.tags` where it has an API, and mirror what pip accepts. The manylinux/musllinux platform lists in `targets.py` follow pip's rules; keep them that way.
 - **`--dockerfile` must match Docker exactly or raise `DockerfileError`.** When you port BuildKit behaviour, link the file and commit in a comment (see `_heredocs` in `dockerfile.py`).
-- **Output:** `--json` keys are a public interface. Add keys; don't rename or remove them. Notes go to stderr, never into `--json` or `--markdown` stdout.
+- **Output:** `--json` keys are a public interface. Add keys; don't rename or remove them. Diagnostic notes (`wheelgap: note: ...`) go to stderr, never into `--json` or `--markdown` stdout.
 - **Style:** match the surrounding code; ruff's line length is 120. Don't reformat or refactor code your change doesn't need.
 - **`CHANGELOG.md`:** if users would notice the change, add one bullet at the top of `## Unreleased`, written for users, ending with the **PR** number and your handle: `(#123, thanks [@you](https://github.com/you))`. Add it once the PR is open and you know the number. Docs-only changes get no entry, and released sections are never edited.
 - **Agent integrations:** when a flag, JSON key, status or exit code changes, update `integrations/claude-code/skills/check-wheels/SKILL.md` and `integrations/cursor/wheelgap.mdc` too, and only describe what's already released on PyPI.
