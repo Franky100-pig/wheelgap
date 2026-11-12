@@ -163,3 +163,61 @@ def test_write_command_passes_the_guard(capsys):
         print("::error::from a lockfile")
         write_command("::error file=uv.lock,line=3::from wheelgap", sys.stdout)
     assert capsys.readouterr().out == "\\u003a:error::from a lockfile\n::error file=uv.lock,line=3::from wheelgap\n"
+
+
+def test_write_command_ends_a_held_line_first(capsys):
+    with guarded_output():
+        print("::partial", end="")
+        write_command("::warning::x", sys.stdout)
+    assert capsys.readouterr().out == "\\u003a:partial\n::warning::x\n"
+
+
+@pytest.mark.parametrize("command", ["::error::a\n::error::b", "::error::a\rb", "x ::error::a", ""])
+def test_write_command_takes_one_command_line(command):
+    with pytest.raises(ValueError):
+        write_command(command, io.StringIO())
+
+
+ANNOTATED_LOCK = UV_LOCK + (
+    '\n[[package]]\nname = "c"\nversion = "1.0"\nsource = {{ registry = "https://pypi.org/simple" }}\n'
+    'wheels = [{{ url = "https://files.example/c-1.0-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:00" }}]\n'
+)
+
+
+@pytest.mark.parametrize("flags", [[], ["--explain"], ["--json"], ["--markdown"]])
+def test_github_annotations_pass_the_guard(capsys, fake_pypi, tmp_path, monkeypatch, flags):
+    # wheelgap's own ::error / ::warning lines come out as commands; the lockfile's text never does.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    lock = ANNOTATED_LOCK.format(version=json.dumps(VERSION)).replace(
+        '{ name = "b" }', '{ name = "b" }, { name = "c" }'
+    )
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    argv = [str(tmp_path), "-p", "3.13", "-t", "linux-x86_64,win-arm64", "--advisory", "win-arm64"]
+    code, out, err = run(capsys, *argv, "--github-annotations", *flags)
+    assert code == 1
+    escaped = "1.0%0A::error::pwn %0D::add-mask::x ##[error]legacy"  # by workflow_command, once
+    assert commands(out + err) == [
+        f"::error file=uv.lock,line=11,title=b {escaped.replace(':', '%3A')}%3A builds from source::"
+        f"b {escaped} builds from source on linux-x86_64, win-arm64 (advisory).",
+        "::warning file=uv.lock,line=17,title=c 1.0%3A can't install::"
+        "c 1.0 can't install on win-arm64 (advisory). Gaps on advisory targets don't fail the run.",
+    ]
+    assert "pwn" in (out if "--json" in flags else out.split("\n", 2)[2])  # the injected text, shown but escaped
+    if "--json" in flags:
+        assert json.loads(out)["packages"][0]["version"] == VERSION
+
+
+@pytest.mark.parametrize("where", ["config", "cli"])
+def test_advisory_values_cant_run_workflow_commands(capsys, fake_pypi, tmp_path, where):
+    # A PR can edit [tool.wheelgap] advisory = [...]; the error quoting it must not be a command either.
+    value = "x\n::error::pwn ##[error]y"
+    (tmp_path / "uv.lock").write_text(UV_LOCK.format(version='"1.0"'), encoding="utf-8")
+    config = f"advisory = [{json.dumps(value)}]\n" if where == "config" else ""
+    (tmp_path / "pyproject.toml").write_text(
+        f'[project]\nname = "demo"\nversion = "0.1.0"\n\n[tool.wheelgap]\n{config}', encoding="utf-8"
+    )
+    flags = ["--advisory", value] if where == "cli" else []
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", *flags)
+    assert code == 2
+    assert "unknown target" in err
+    assert not commands(out + err)

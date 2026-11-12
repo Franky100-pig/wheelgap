@@ -90,9 +90,19 @@ class CommandGuard(io.TextIOBase):
 
 def write_command(command: str, stream: TextIO) -> None:
     """Write a workflow command wheelgap means to send (such as an annotation it built and escaped itself) on its own
-    line, past the guard. Everything else goes through it."""
-    raw = stream.raw if isinstance(stream, CommandGuard) else stream
-    raw.write(command + "\n")
+    line, past the guard. Everything else goes through it.
+
+    The command must be one line, so it can only ever carry itself. A partial line the guard is holding is ended
+    first (and neutralized as usual), so the command starts its own line.
+    """
+    if not command.startswith("::") or "\n" in command or "\r" in command:
+        raise ValueError(f"not a single workflow command line: {command!r}")
+    if isinstance(stream, CommandGuard):
+        if stream._pending:
+            stream.write("\n")
+        stream.raw.write(command + "\n")
+    else:
+        stream.write(command + "\n")
 
 
 @contextmanager

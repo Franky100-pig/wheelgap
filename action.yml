@@ -29,7 +29,13 @@ runs:
       # WHEELGAP_ARGS is deliberately unquoted so it splits into separate arguments.
       run: |
         set +e
-        pipx run --spec "$GITHUB_ACTION_PATH" wheelgap $WHEELGAP_ARGS
+        # --github-annotations marks each gap on its lockfile line in the PR diff. It goes first, like the summary
+        # run's flags, so a `--` in args can't turn it into a package name; but `diff` must stay the first argument
+        # to run `wheelgap diff`, which has no annotations.
+        set -- $WHEELGAP_ARGS
+        annotate=--github-annotations
+        [ "${1:-}" = diff ] && annotate=
+        pipx run --spec "$GITHUB_ACTION_PATH" wheelgap $annotate $WHEELGAP_ARGS
         code=$?
         # The summary is a second, never-failing run; the step's result is the real run's exit code.
         # Exit code 2 means bad input, which the log above already explains. The extra flags go first
