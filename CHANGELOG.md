@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- `--explain` is about 2.5 times faster on big lockfiles checked on many targets (8.7 s down to 3.4 s for 2,000 packages on `-t everything` with three Pythons): each wheel's filename is now read once rather than once per target, and each target's platform tags are worked out once. The results are unchanged. (#PR)
+- `--explain` is about 2.5 times faster on big lockfiles checked on many targets (8.7 s down to 3.4 s for 2,000 packages on `-t everything` with three Pythons): each wheel's filename is now read once rather than once per target, and each target's platform tags are worked out once. The results are unchanged. (#245)
 
 ## 0.9.0 (2026-11-12)
 
