@@ -290,12 +290,14 @@ GAP_WORDS = {
 }
 
 
-def annotation(row: Row, targets: list[Target], level: str, locator: Locator) -> str:
+def annotation(
+    row: Row, targets: list[Target], level: str, locator: Locator, advisory: frozenset[Target] = frozenset()
+) -> str:
     multi_py = len({t.python for t in targets}) > 1
     by_status: dict[Status, list[str]] = {}
     for t in targets:
         if t not in row.ignored and (status := row.results[t]) in GAP_WORDS:
-            by_status.setdefault(status, []).append(t.label(multi_py))
+            by_status.setdefault(status, []).append(t.label(multi_py) + (" (advisory)" if t in advisory else ""))
     worst = next(s for s in GAP_WORDS if s in by_status)
     pkg = row.package
     name = f"{pkg.name} {pkg.version}" if pkg.version else pkg.name
@@ -304,7 +306,11 @@ def annotation(row: Row, targets: list[Target], level: str, locator: Locator) ->
     if pkg.error:
         message += f" Lookup error: {pkg.error}."
     if level == "warning":
-        message += " Source builds are allowed (fail-on missing), so this doesn't fail the run."
+        required = [s for t, s in row.results.items() if t not in row.ignored and t not in advisory]
+        if Status.SOURCE in required:
+            message += " Source builds are allowed (fail-on missing), so this doesn't fail the run."
+        else:
+            message += " Gaps on advisory targets don't fail the run."
     location = locator.locate(pkg)
     file = line = None
     if location is not None:
@@ -315,16 +321,23 @@ def annotation(row: Row, targets: list[Target], level: str, locator: Locator) ->
     return workflow_command(level, message, file, line, f"{name}: {GAP_WORDS[worst][0]}")
 
 
-def github_annotations(rows: list[Row], targets: list[Target], sources: list[Source], failing: list[Row]) -> list[str]:
-    """One ::error per failing package and one ::warning per package whose gaps are allowed (--fail-on missing),
-    at most ANNOTATION_LIMIT of each: past that, the last one says how many more there are."""
+def github_annotations(
+    rows: list[Row],
+    targets: list[Target],
+    sources: list[Source],
+    failing: list[Row],
+    advisory: frozenset[Target] = frozenset(),
+) -> list[str]:
+    """One ::error per failing package and one ::warning per package whose gaps don't fail the run (source builds
+    that --fail-on missing allows, or gaps only on --advisory targets), at most ANNOTATION_LIMIT of each: past that,
+    the last one says how many more there are."""
     failing_ids = {id(r) for r in failing}
     locator = Locator(sources)
     out = []
     for level in ("error", "warning"):
         chosen = [r for r in rows if not r.ok and (id(r) in failing_ids) == (level == "error")]
         shown = chosen if len(chosen) <= ANNOTATION_LIMIT else chosen[: ANNOTATION_LIMIT - 1]
-        out += [annotation(r, targets, level, locator) for r in shown]
+        out += [annotation(r, targets, level, locator, advisory) for r in shown]
         if more := len(chosen) - len(shown):
             what = f"{more} more packages with gaps"  # never 1: a single extra would fit in the limit
             out.append(workflow_command(level, f"{what}; the log lists them all.", title=f"wheelgap: {what}"))

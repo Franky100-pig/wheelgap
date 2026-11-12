@@ -149,3 +149,11 @@ it. The server's working directory may not be your project, so the agent should
 pass an absolute path or a `file://` URI. A relative path such as `uv.lock`
 works only when the client shares its
 [roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots).
+
+`check_lockfile` and `check_dockerfile` apply the project's `[tool.wheelgap]`
+settings. Their `ok` is true only when no package has a gap on any target;
+`passes` is the command line's verdict (exit code 0), which also accepts gaps on
+the project's advisory targets (`advisory = [...]`) and, with
+`fail-on = "missing"`, source builds. The result lists the advisory targets
+under `advisory`, and each entry in `gaps` has `advisory_gaps`: which of its
+`gaps` are on advisory targets.

@@ -2086,6 +2086,7 @@ def _assert_matches_output_schema(data):
         assert set(item["platforms"]) <= {t["platform"] for t in data["targets"]}
         ignored_on[item["name"]] = {t["label"] for t in data["targets"] if t["platform"] in item["platforms"]}
     assert len(labels) == len(set(labels))
+    assert set(data.get("advisory", [])) <= set(labels)
     for pkg in data["packages"]:
         assert {"name", "version", "error", "results"} <= set(pkg)
         assert set(pkg) <= {
@@ -2157,6 +2158,8 @@ def test_json_output_matches_schema(capsys, fixtures):
         [str(fixtures / "uvproj"), "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--json", "--ignore", "winonly"],
         [str(fixtures / "armgap"), "-p", "3.13,3.14", "-t", "linux-aarch64,musl-aarch64", "--json", "--explain"]
         + ["--ignore", "armlib:musl-aarch64,newglibc:linux-aarch64"],
+        [str(fixtures / "armgap"), "-p", "3.13,3.14", "-t", "linux-aarch64,musl-aarch64", "--json"]
+        + ["--advisory", "musl-aarch64"],
     ]
     for args in cases:
         code, out, err = run(capsys, *args)
@@ -2582,6 +2585,35 @@ def test_github_annotations_fail_on_missing_mixes_levels(capsys, fake_pypi, fixt
         ("::warning", "nativeext"),
         ("::warning", "puresdist"),
     ]
+
+
+def test_github_annotations_advisory_targets_are_warnings(capsys, fake_pypi, fixtures, monkeypatch):
+    # A package whose gaps are all on --advisory targets doesn't fail the run, so it's a warning that says why;
+    # advisory targets are marked in every message.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(fixtures))
+    code, out, _ = run(
+        capsys,
+        str(fixtures / "uvproj"),
+        "-p",
+        "3.13",
+        "-t",
+        "linux-x86_64,win-arm64",
+        "--github-annotations",
+        "--advisory",
+        "win-arm64",
+    )
+    assert code == 1
+    lines = annotation_lines(out)
+    levels = [(line.split()[0], line.split("title=")[1].split()[0]) for line in lines]
+    assert levels == [
+        ("::error", "nativeext"),
+        ("::error", "puresdist"),
+        ("::warning", "fastlib"),
+        ("::warning", "winonly"),
+    ]
+    assert lines[0].endswith("builds from source on linux-x86_64, win-arm64 (advisory).")
+    assert lines[3].endswith("can't install on win-arm64 (advisory). Gaps on advisory targets don't fail the run.")
+    assert "fail-on missing" not in out
 
 
 def test_github_annotations_ignore_and_exit_zero(capsys, fake_pypi, fixtures, monkeypatch):

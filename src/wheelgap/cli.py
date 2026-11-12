@@ -234,6 +234,14 @@ def make_parser() -> argparse.ArgumentParser:
         help="ignore known package gaps (repeatable, comma-separated), on every target or only on TARGET "
         "(e.g. psycopg2:musl-x86_64); list ignored names in the report",
     )
+    p.add_argument(
+        "--advisory",
+        action="append",
+        default=[],
+        metavar="TARGET",
+        help="report gaps on TARGET (anything -t takes; repeatable, comma-separated) without letting them fail "
+        "the run; TARGET must be a checked target, and a group like all means the checked ones among its members",
+    )
     p.add_argument("--exit-zero", action="store_true", help="exit 0 even when gaps are found")
     p.add_argument(
         "--github-annotations",
@@ -259,7 +267,7 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 FAIL_ON = ("source", "missing")
-LIST_KEYS = ("python", "targets", "ignore", "extras", "groups")
+LIST_KEYS = ("python", "targets", "ignore", "extras", "groups", "advisory")
 STR_KEYS = ("glibc", "musl", "macos", "ios", "android-api", "fail-on", "distro", "pyodide-lock", "index-url")
 
 
@@ -435,9 +443,74 @@ def hidden_line(hidden: list[Row]) -> str:
     return " and ".join(parts) + " hidden"
 
 
-def render_table(rows: list[Row], targets: list[Target], style: Style) -> list[str]:
+GAP_STATUSES = (Status.SOURCE, Status.MISSING, Status.UNKNOWN)
+
+
+def heading(target: Target, multi_py: bool, advisory: frozenset[Target]) -> str:
+    """A target's column heading: its label, marked when --advisory makes its gaps not fail the run."""
+    label = target.label(multi_py)
+    return f"{label} (advisory)" if target in advisory else label
+
+
+def required_statuses(row: Row, advisory: frozenset[Target]) -> list[Status]:
+    """The results that can fail the run: every target's except ignored (NAME:TARGET) and advisory ones."""
+    return [s for t, s in row.results.items() if t not in row.ignored and t not in advisory]
+
+
+def advisory_line(rows: list[Row], targets: list[Target], advisory: frozenset[Target]) -> str:
+    """'4 gaps in 2 packages on advisory targets win-arm64, 3.14t linux-x86_64 don't fail the run.', or ''.
+
+    It counts cells (a package with gaps on two advisory targets has two), so it names the packages too: the gap
+    summary above it counts packages.
+    """
     multi_py = len({t.python for t in targets}) > 1
-    headers = ["package", "version"] + [t.label(multi_py) for t in targets]
+    cells = [
+        (r, t) for r in rows for t in targets if t in advisory and t not in r.ignored and r.results[t] in GAP_STATUSES
+    ]
+    if not cells:
+        return ""
+    labels = [t.label(multi_py) for t in targets if any(t is cell_target for _, cell_target in cells)]
+    n, packages = len(cells), len({id(r) for r, _ in cells})
+    return (
+        f"{n} gap{'s' * (n != 1)} in {packages} package{'s' * (packages != 1)} on advisory "
+        f"target{'s' * (len(labels) != 1)} {', '.join(labels)} {'do' if n != 1 else 'does'}n't fail the run."
+    )
+
+
+# -t names that stand for several platforms (see resolve_platforms): as --advisory values they mean the checked ones.
+PLATFORM_GROUPS = ("all", "everything", "mobile")
+
+
+def resolve_advisory(values: list[str], how: str, docker_musl: bool, checked: list[str]) -> tuple[list[str], list[str]]:
+    """The checked platforms --advisory (or advisory = [...]) names, and the entries that name none of them.
+
+    A single target (a name, an alias, a Docker name) must be checked itself. A group such as all stands for the
+    checked targets among its members, so `-t linux-x86_64,win-arm64 --advisory all` marks both; it names none
+    only when no member is checked.
+    """
+    platforms: list[str] = []
+    unchecked: list[str] = []
+    for value in values:
+        for entry in (part.strip() for part in value.split(",")):
+            if not entry:
+                continue
+            try:
+                members = resolve_platforms([musl_docker_names(entry) if docker_musl else entry])
+            except TargetError as e:
+                raise TargetError(f"{how}: {e}") from None
+            hits = [p for p in members if p in checked]
+            if hits and (entry.lower() in PLATFORM_GROUPS or len(hits) == len(members)):
+                platforms += hits
+            else:
+                unchecked.append(entry)
+    return list(dict.fromkeys(platforms)), unchecked
+
+
+def render_table(
+    rows: list[Row], targets: list[Target], style: Style, advisory: frozenset[Target] = frozenset()
+) -> list[str]:
+    multi_py = len({t.python for t in targets}) > 1
+    headers = ["package", "version"] + [heading(t, multi_py, advisory) for t in targets]
     body = []
     for r in rows:
         cells = [r.package.name, r.package.version or "?"]
@@ -575,6 +648,7 @@ def report_json(
     ignored: list[tuple[str, list[str] | None]],
     explained: bool,
     pyodide_lock: PyodideLock | None = None,
+    advisory: frozenset[Target] = frozenset(),
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     gaps = [r for r in rows if not r.ok]
@@ -609,6 +683,7 @@ def report_json(
         "ignored_targets": [
             {"name": name, "platforms": platforms} for name, platforms in ignored if platforms is not None
         ],
+        "advisory": [t.label(multi_py) for t in targets if t in advisory],
         "summary": {"packages": len(rows), "with_gaps": len(gaps), "per_target": target_counts(gaps, targets)},
     }
     if blocking is not None:
@@ -744,10 +819,22 @@ def target_counts_text(counts: dict[str, int], style: Style) -> str:
     return ", ".join(parts)
 
 
-def target_lines(gaps: list[Row], targets: list[Target], style: Style) -> list[str]:
+def shown_target_lines(
+    gaps: list[Row], targets: list[Target], style: Style, advisory: frozenset[Target]
+) -> list[tuple[str, str]]:
+    """shown_target_counts as (heading, counts text) pairs, with advisory targets marked as in the table."""
+    multi_py = len({t.python for t in targets}) > 1
+    headings = {t.label(multi_py): heading(t, multi_py, advisory) for t in targets}
     per_target = shown_target_counts(gaps, targets)
-    width = max(map(len, per_target), default=0)
-    return [f"{label:<{width}}  {target_counts_text(counts, style)}" for label, counts in per_target.items()]
+    return [(headings[label], target_counts_text(counts, style)) for label, counts in per_target.items()]
+
+
+def target_lines(
+    gaps: list[Row], targets: list[Target], style: Style, advisory: frozenset[Target] = frozenset()
+) -> list[str]:
+    lines = shown_target_lines(gaps, targets, style, advisory)
+    width = max((len(head) for head, _ in lines), default=0)
+    return [f"{head:<{width}}  {text}" for head, text in lines]
 
 
 _MD_SPECIAL = re.compile(r"([\\`*_\[\]<>#|~&])")
@@ -776,6 +863,7 @@ def render_markdown(
     args: argparse.Namespace,
     pyodide_lock: PyodideLock | None,
     source_allowed: bool = False,
+    advisory: frozenset[Target] = frozenset(),
 ) -> list[str]:
     """The same report as the text output, as GitHub-flavoured Markdown (for a job summary or a PR comment)."""
     plain = Style(False)
@@ -797,7 +885,7 @@ def render_markdown(
     shown = rows if args.all else gaps
     if shown:
         multi_py = len({t.python for t in targets}) > 1
-        headers = ["package", "version"] + [t.label(multi_py) for t in targets]
+        headers = ["package", "version"] + [heading(t, multi_py, advisory) for t in targets]
         out.append("| " + " | ".join(_md(h) for h in headers) + " |")
         out.append("| " + " | ".join("---" for _ in headers) + " |")
         for r in shown:
@@ -809,13 +897,15 @@ def render_markdown(
             out += [f"{hidden_line(hidden)} (`--all` to show).", ""]
 
     if gaps:
-        per_target = shown_target_counts(gaps, targets)
+        per_target = shown_target_lines(gaps, targets, plain, advisory)
         if per_target:
-            out += [f"- {_md(label)}: {target_counts_text(counts, plain)}" for label, counts in per_target.items()]
+            out += [f"- {_md(head)}: {text}" for head, text in per_target]
             out.append("")
         out += [gap_summary(gaps, len(rows), plain), ""]
         if blocking := blocking_newer_python(rows, targets):
             out += [_md(blocking_line(blocking)), ""]
+        if line := advisory_line(rows, targets, advisory):
+            out += [_md(line), ""]
         if source_allowed:
             out += ["Source builds are allowed (fail-on missing), so this run passes.", ""]
     bundled = [r for r in rows if Status.BUNDLED in r.results.values()]
@@ -1032,6 +1122,32 @@ def main(argv: list[str] | None = None) -> int:
             for value in args.ignore or config.get("ignore", [])
             for entry in split_ignore_value(value, ignore_how, docker_musl)
         ]
+        # Like --ignore, --advisory replaces the configured list (and --advisory "" clears it).
+        advisory_how = "--advisory" if args.advisory else "advisory in [tool.wheelgap]"
+        checked_platforms = list(dict.fromkeys(t.platform for t in targets))
+        advisory_platforms, unchecked_advisory = resolve_advisory(
+            args.advisory or config.get("advisory", []), advisory_how, docker_musl, checked_platforms
+        )
+        if unchecked_advisory:
+            if args.advisory:  # asked for on this run, so not checking it is a mistake
+                raise TargetError(
+                    f"--advisory {', '.join(unchecked_advisory)}: matches no checked target "
+                    f"(this run checks {', '.join(checked_platforms)}); add it to -t as well"
+                )
+            if not quiet:  # a project default for runs that check other targets (-t, --dockerfile): say so
+                print(
+                    f"wheelgap: note: advisory in [tool.wheelgap] names targets this run doesn't check: "
+                    f"{', '.join(unchecked_advisory)}",
+                    file=sys.stderr,
+                )
+        advisory = frozenset(t for t in targets if t.platform in advisory_platforms)
+        if advisory and len(advisory) == len(targets) and not quiet:
+            # Then nothing can fail the run, not even a failed lookup (unknown) during an index outage.
+            print(
+                f"wheelgap: note: every checked target is advisory ({advisory_how}), so this run won't fail, "
+                "not even when a lookup fails",
+                file=sys.stderr,
+            )
         index_url = args.index_url if args.index_url is not None else config.get("index-url")
         if index_url is not None:
             _, auth = split_credentials(index_url)
@@ -1231,31 +1347,36 @@ def main(argv: list[str] | None = None) -> int:
             r.ignored = frozenset(t for t in targets if t.platform in ignore_on[r.package.key])
     gaps = [r for r in rows if not r.ok]
     source_labels = [s.label for s in sources]
-    # With --fail-on missing, source builds are accepted; missing and unknown packages still fail.
-    failing = gaps if fail_on == "source" else [r for r in gaps if r.fails_install]
+    # With --fail-on missing, source builds are accepted; missing and unknown packages still fail. Gaps on
+    # --advisory targets never fail the run.
+    fail_statuses = GAP_STATUSES if fail_on == "source" else (Status.MISSING, Status.UNKNOWN)
+    failing = [r for r in gaps if any(s in fail_statuses for s in required_statuses(r, advisory))]
     code = 0 if args.exit_zero or not failing else 1
+    # The run passes only because --fail-on missing accepts a source build on a required target.
+    source_allowed = not failing and any(Status.SOURCE in required_statuses(r, advisory) for r in gaps)
 
     if args.junit is not None:  # an empty PATH (an unset CI variable) is an error, not "no report"
         try:
-            write_junit(args.junit, rows, targets, fail_on)
+            write_junit(args.junit, rows, targets, fail_on, advisory)
         except OSError as e:
             print(f"wheelgap: error: {e}", file=sys.stderr)
             return input_error_json(e) if args.json else 2
 
     if args.github_annotations:
         # Workflow commands work on stdout and stderr alike; stderr keeps --json and --markdown output clean.
-        for command in github_annotations(rows, targets, sources, failing):
+        for command in github_annotations(rows, targets, sources, failing, advisory):
             print(command, file=sys.stderr if args.json or args.markdown else sys.stdout)
 
     if args.json:
-        print(report_json(rows, targets, source_labels, skipped, ignored, args.explain, pyodide_lock))
+        print(report_json(rows, targets, source_labels, skipped, ignored, args.explain, pyodide_lock, advisory))
         return code
 
     if args.markdown:
-        source_allowed = bool(gaps) and not failing  # judged on --fail-on alone, not --exit-zero
         print(
             "\n".join(
-                render_markdown(rows, targets, source_labels, skipped, ignored, args, pyodide_lock, source_allowed)
+                render_markdown(
+                    rows, targets, source_labels, skipped, ignored, args, pyodide_lock, source_allowed, advisory
+                )
             )
         )
         return code
@@ -1267,6 +1388,8 @@ def main(argv: list[str] | None = None) -> int:
             print("gaps: " + ", ".join(r.package.name for r in gaps))
             if blocking := blocking_newer_python(rows, targets):
                 print(blocking_line(blocking))
+            if line := advisory_line(rows, targets, advisory):
+                print(style.dim(line))
         if ignored:
             print(style.dim("ignored: " + ignored_list(ignored)))
         if pyodide_lock:  # a bundled build of another version passes, but quiet mode mustn't hide that (#75)
@@ -1289,7 +1412,7 @@ def main(argv: list[str] | None = None) -> int:
 
     shown = rows if args.all else gaps
     if shown:
-        for ln in render_table(shown, targets, style):
+        for ln in render_table(shown, targets, style, advisory):
             print(ln)
         print()
         hidden = [] if args.all else [r for r in rows if r.ok]
@@ -1323,14 +1446,16 @@ def main(argv: list[str] | None = None) -> int:
         print(style.green(f"✓ {what} a wheel for {every}."))
         return 0
 
-    for line in target_lines(gaps, targets, style):
+    for line in target_lines(gaps, targets, style, advisory):
         print(line)
     print(gap_summary(gaps, len(rows), style))
     if blocking := blocking_newer_python(rows, targets):
         print(blocking_line(blocking))
+    if line := advisory_line(rows, targets, advisory):
+        print(style.dim(line))
     if not args.explain:
         print(style.dim("Run with --explain to see which wheels were rejected and why."))
-    if gaps and not failing and not args.exit_zero:
+    if source_allowed and not args.exit_zero:
         print(style.dim("Source builds are allowed (--fail-on missing), so this run passes."))
     return code
 
