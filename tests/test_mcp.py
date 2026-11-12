@@ -1417,11 +1417,32 @@ def test_modern_relative_path_asks_the_client_for_its_roots(fake_pypi, tmp_path,
     assert fake_pypi == ["https://pypi.org/pypi/winonly/311/json"]  # nothing looked up for the first try
 
 
-def test_modern_roots_answer_without_the_file_falls_back_to_the_working_directory(fake_pypi, tmp_path, monkeypatch):
-    _, cwd = two_projects(tmp_path, monkeypatch)
+def test_modern_roots_answer_without_the_file_is_a_tool_error(fake_pypi, tmp_path, monkeypatch):
+    # The client named its projects; the working directory's requirements.txt is another project's, so it must not
+    # be checked in their place.
+    two_projects(tmp_path, monkeypatch)
     other = tmp_path / "other"
     other.mkdir()
-    (reply,) = run(roots_call(1, {"roots": [{"uri": other.as_uri()}]}, path="requirements.txt", python="3.13"))
+    roots = {"roots": [{"uri": other.as_uri()}, {"uri": "https://example.com/"}]}
+    (reply,) = run(roots_call(1, roots, path="requirements.txt", python="3.13"))
+    assert reply["result"]["resultType"] == "complete"
+    assert reply["result"]["isError"] is True
+    text = reply["result"]["content"][0]["text"]
+    assert text == f"requirements.txt: not in any of the client's roots ({other}); pass an absolute path"
+    assert not fake_pypi
+
+
+def test_modern_roots_with_no_local_folder_is_a_tool_error(fake_pypi, tmp_path, monkeypatch):
+    two_projects(tmp_path, monkeypatch)
+    (reply,) = run(roots_call(1, {"roots": [{"uri": "https://example.com/"}]}, path="requirements.txt"))
+    assert reply["result"]["isError"] is True
+    assert "none of them is a local folder" in reply["result"]["content"][0]["text"]
+
+
+def test_modern_empty_roots_answer_means_the_working_directory(fake_pypi, tmp_path, monkeypatch):
+    _, cwd = two_projects(tmp_path, monkeypatch)
+    (reply,) = run(roots_call(1, {"roots": []}, path="requirements.txt", python="3.13"))
+    assert reply["result"]["isError"] is False
     assert reply["result"]["structuredContent"]["path"] == str((cwd / "requirements.txt").resolve())
 
 

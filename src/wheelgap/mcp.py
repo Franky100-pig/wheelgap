@@ -25,7 +25,8 @@ Paths may be file:// URIs. If the client has the roots capability, the server as
 notifications/initialized (and again on notifications/roots/list_changed), and a relative path is resolved against the
 first root that contains it, then against the working directory. 2026-07-28 requests are stateless and the server may
 not send requests of its own, so there a tools/call with a relative path from a client with the roots capability gets
-an input_required result asking for roots/list, and the client retries with the roots in inputResponses.
+an input_required result asking for roots/list, and the client retries with the roots in inputResponses. That relative
+path must then be in one of those roots (unless the list is empty): it is never looked for in the working directory.
 """
 
 from __future__ import annotations
@@ -475,6 +476,8 @@ def _check_dockerfile(args: dict[str, Any]) -> dict[str, Any]:
 
 # The client's roots (from roots/list) for the call running on this thread; Server._call sets it.
 _ROOTS: ContextVar[tuple[Path, ...]] = ContextVar("wheelgap_mcp_roots", default=())
+# True when a relative path must be in one of those roots: a 2026 client named its roots for this very call.
+_ROOTS_ONLY: ContextVar[bool] = ContextVar("wheelgap_mcp_roots_only", default=False)
 _URI_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
 
 
@@ -526,7 +529,8 @@ def _diff_lockfiles(args: dict[str, Any]) -> dict[str, Any]:
 
 def _existing(raw: str) -> Path:
     """An argument naming a file or directory: a path or a file:// URI. A relative path is looked for in the client's
-    roots first (the first root that contains it wins), then in the server's working directory."""
+    roots first (the first root that contains it wins), then in the server's working directory, unless the roots came
+    with a 2026 call: then a same-named file elsewhere would be another project's, so it's an error."""
     if _URI_RE.match(raw):
         uri_path = _file_uri_path(raw)
         if uri_path is None:
@@ -535,7 +539,11 @@ def _existing(raw: str) -> Path:
     else:
         path = Path(raw).expanduser()
         if not path.is_absolute():
-            path = next((root / path for root in _ROOTS.get() if (root / path).exists()), path)
+            found = next((root / path for root in _ROOTS.get() if (root / path).exists()), None)
+            if found is None and _ROOTS_ONLY.get():
+                searched = ", ".join(str(root) for root in _ROOTS.get()) or "none of them is a local folder"
+                raise ToolError(f"{raw}: not in any of the client's roots ({searched}); pass an absolute path")
+            path = path if found is None else found
     if not path.exists():
         raise ToolError(f"{raw}: no such file or directory (pass an absolute path)")
     return path
@@ -632,11 +640,16 @@ class _Call:
     """A tools/call that is queued or running on the worker."""
 
     def __init__(
-        self, token: str | int | None, version: str | None = None, roots: tuple[Path, ...] | None = None
+        self,
+        token: str | int | None,
+        version: str | None = None,
+        roots: tuple[Path, ...] | None = None,
+        roots_only: bool = False,
     ) -> None:
         self.token = token
         self.version = version  # a 2026 request's own protocol version; None for the handshake's
         self.roots = roots  # a 2026 request's roots (from its inputResponses); None for the handshake's
+        self.roots_only = roots_only  # a relative path must be in those roots (the client listed some)
         self.cancelled = False
         self.base = 0  # lookups in fill_all runs that have finished (check_lockfile may run more than one)
         self.total = 0  # lookups in the current fill_all run
@@ -790,6 +803,7 @@ class Server:
                 if not isinstance(answer, dict) or not isinstance(answer.get("roots"), list):
                     return _error(msg_id, INVALID_PARAMS, f"inputResponses.{_ROOTS_INPUT} must be a roots/list result")
                 roots = _root_paths(answer["roots"])
+                roots_only = bool(answer["roots"])  # an empty list: the client has none, so the working directory
             elif isinstance(meta[_CAPABILITIES_KEY].get("roots"), dict) and _relative_paths(params):
                 # The client has roots, and a relative path may name a file in them rather than in the working
                 # directory: ask for them (a 2026 server can't send roots/list itself), then the client retries.
@@ -798,8 +812,8 @@ class Server:
                     _complete({"inputRequests": {_ROOTS_INPUT: {"method": "roots/list"}}}, "input_required"),
                 )
             else:
-                roots = ()
-            return self._tools_call(msg_id, params, version, roots, inline)
+                roots, roots_only = (), False
+            return self._tools_call(msg_id, params, version, roots, inline, roots_only=roots_only)
         # ping, logging/setLevel and the rest are gone in 2026, and this server has no prompts or resources.
         return _error(msg_id, METHOD_NOT_FOUND, f"method not found: {method}")
 
@@ -810,6 +824,8 @@ class Server:
         version: str | None,
         roots: tuple[Path, ...] | None,
         inline: bool,
+        *,
+        roots_only: bool = False,
     ) -> dict[str, Any] | None:
         """tools/call, on the worker unless inline. version and roots are a 2026 request's own, or None for the
         handshake's."""
@@ -822,12 +838,12 @@ class Server:
         if not isinstance(arguments, dict):
             return _error(msg_id, INVALID_PARAMS, "arguments must be an object")
         if inline or self._worker is None:
-            return _reply(msg_id, self._call(name, arguments, version, roots))
+            return _reply(msg_id, self._call(name, arguments, version, roots, roots_only))
         meta = params.get("_meta")
         token = meta.get("progressToken") if isinstance(meta, dict) else None
         if not isinstance(token, (str, int)) or isinstance(token, bool):
             token = None
-        call = _Call(token, version, roots)
+        call = _Call(token, version, roots, roots_only)
         with self._lock:
             self._calls[msg_id] = call
         self._worker.submit(self._run, msg_id, call, name, arguments)
@@ -849,10 +865,10 @@ class Server:
             return
         try:
             if call.token is None:
-                result = self._call(name, arguments, call.version, call.roots)
+                result = self._call(name, arguments, call.version, call.roots, call.roots_only)
             else:
                 with pypi.reporting_progress(lambda done, total: self._progress(call, done, total)):
-                    result = self._call(name, arguments, call.version, call.roots)
+                    result = self._call(name, arguments, call.version, call.roots, call.roots_only)
             reply = _reply(msg_id, result)
         except Exception as e:  # a bug: the client still gets an answer rather than waiting forever
             reply = _error(msg_id, INTERNAL_ERROR, f"internal error: {type(e).__name__}: {e}")
@@ -911,18 +927,23 @@ class Server:
         }
 
     def _call(
-        self, name: str, arguments: dict[str, Any], version: str | None = None, roots: tuple[Path, ...] | None = None
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        version: str | None = None,
+        roots: tuple[Path, ...] | None = None,
+        roots_only: bool = False,
     ) -> dict[str, Any]:
         """A tool's result. version and roots are a 2026 request's own (with resultType and serverInfo in the
         result), or None for the handshake's."""
         if version is None:
-            return self._tool_result(name, arguments, self.protocol_version, self._roots)
-        return _complete(self._tool_result(name, arguments, version, roots or ()))
+            return self._tool_result(name, arguments, self.protocol_version, self._roots, False)
+        return _complete(self._tool_result(name, arguments, version, roots or (), roots_only))
 
     def _tool_result(
-        self, name: str, arguments: dict[str, Any], version: str, roots: tuple[Path, ...]
+        self, name: str, arguments: dict[str, Any], version: str, roots: tuple[Path, ...], roots_only: bool
     ) -> dict[str, Any]:
-        token = _ROOTS.set(roots)
+        token, only_token = _ROOTS.set(roots), _ROOTS_ONLY.set(roots_only)
         try:
             # wheelgap's own messages go to stderr already; this keeps any stray print off the protocol stream.
             with contextlib.redirect_stdout(sys.stderr):
@@ -934,6 +955,7 @@ class Server:
             return {"content": [{"type": "text", "text": f"internal error: {type(e).__name__}: {e}"}], "isError": True}
         finally:
             _ROOTS.reset(token)
+            _ROOTS_ONLY.reset(only_token)
         result: dict[str, Any] = {"content": [{"type": "text", "text": text}], "isError": False}
         if version >= _STRUCTURED_FROM:
             result["structuredContent"] = data

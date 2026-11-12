@@ -185,7 +185,10 @@ with older and newer clients alike:
   of its own. So when a client that shares roots passes a relative path, the server
   answers with `resultType: "input_required"` asking for `roots/list`, and the
   client retries the call with its roots in `inputResponses`. The official
-  Python SDK's client does this for you.
+  Python SDK's client does this for you. The path must then be in one of those
+  roots: if it isn't, the call is an error saying to pass an absolute path, rather
+  than a check of a same-named file in the server's working directory. A client
+  that answers with no roots gets the working directory.
 
 The server picks the version for each request, so clients of both kinds can
 share one server process.
