@@ -392,7 +392,9 @@ On Claude Code 2.1.275 or later, `/plugin install wheelgap --marketplace wheelga
 claude mcp add wheelgap -- uvx --from wheelgap wheelgap-mcp
 ```
 
-Other clients take the same command (`uvx`) and arguments in their MCP settings; the [MCP setup guide](https://github.com/wheelgap/wheelgap/blob/main/docs/mcp.md) has a copy-paste snippet for Claude Code, Cursor, VS Code, Codex and Claude Desktop. Pass `check_lockfile`, `check_dockerfile` and `diff_lockfiles` an absolute path or a `file://` URI, since the server's working directory may not be your project. If the client shares its [roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots), a relative path such as `uv.lock` is resolved against the first root that contains it.
+In releases after 0.9.0, `uvx wheelgap mcp` starts the same server. Other clients take the same command (`uvx`) and arguments in their MCP settings; the [MCP setup guide](https://github.com/wheelgap/wheelgap/blob/main/docs/mcp.md) has a copy-paste snippet for Claude Code, Cursor, VS Code, Codex and Claude Desktop. Pass `check_lockfile`, `check_dockerfile` and `diff_lockfiles` an absolute path or a `file://` URI, since the server's working directory may not be your project. If the client shares its [roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots), a relative path such as `uv.lock` is resolved against the first root that contains it.
+
+<!-- mcp-name: io.github.wheelgap/wheelgap -->
 
 Contributing to wheelgap with an agent? See [AGENTS.md](https://github.com/wheelgap/wheelgap/blob/main/AGENTS.md).
 

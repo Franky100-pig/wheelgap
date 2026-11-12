@@ -9,9 +9,13 @@ client below starts it with the same command:
 uvx --from wheelgap wheelgap-mcp
 ```
 
-That needs [uv](https://docs.astral.sh/uv/getting-started/installation/). If you ran wheelgap with `uvx` before 0.9.0 and get "An executable named `wheelgap-mcp` is not provided", uvx is reusing its cached copy: run `uvx --refresh --from wheelgap wheelgap-mcp --version` once. Pick
-your client, paste the snippet, restart the client (or reload its MCP servers)
-and try the prompt at the end.
+That needs [uv](https://docs.astral.sh/uv/getting-started/installation/). If
+you ran wheelgap with `uvx` before 0.9.0 and get "An executable named
+`wheelgap-mcp` is not provided", uvx is reusing its cached copy: run
+`uvx --refresh --from wheelgap wheelgap-mcp --version` once. Pick your client,
+paste the snippet, restart the client (or reload its MCP servers) and try the
+prompt at the end. In releases after 0.9.0, `uvx wheelgap mcp` starts the same
+server too.
 
 ## Claude Code
 
