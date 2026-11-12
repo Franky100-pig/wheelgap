@@ -13,6 +13,14 @@ command:
 Both are JSON escapes, so in `--json` output, where such text can only be inside a string, the decoded values are
 unchanged; in text and Markdown the escape shows. Normal output never contains either, so it's never changed.
 
+"Whitespace" is what .NET's TrimStart removes (NBSP, U+0085, U+3000, ...); str.lstrip removes all of those. The
+runner reads the log as UTF-8, so the guard writes UTF-8 to a pipe whatever PYTHONIOENCODING says: in latin-1,
+`Â` + NBSP would be the bytes C2 A0, which the runner reads as NBSP alone, then `::`. A traceback, printed after
+the guard is gone, would print exception text unguarded, so guarded_output prints it itself.
+
+Problem matchers (`::add-matcher::`, set up by other steps) turn ordinary lines into annotations by design; they're
+out of scope here.
+
 See ActionCommand.TryParseV2 / TryParse and ActionCommandManager in https://github.com/actions/runner.
 """
 
@@ -21,6 +29,7 @@ from __future__ import annotations
 import io
 import re
 import sys
+import traceback
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TextIO
@@ -42,33 +51,46 @@ class CommandGuard(io.TextIOBase):
     """A text stream that writes each complete line to `raw` through neutralize().
 
     A line is held until its line break arrives, since a command can be split over several writes; finish()
-    writes what's left at the end.
+    writes what's left at the end. To a stream that isn't a terminal, it writes UTF-8 to the binary buffer, as the
+    runner reads it.
     """
 
     def __init__(self, raw: TextIO):
         self.raw = raw
-        self._pending = ""
+        buffer = getattr(raw, "buffer", None)
+        self._buffer = None if buffer is None or raw.isatty() else buffer
+        if self._buffer is not None:
+            raw.flush()  # anything already written to the text layer goes first
+        self._pending: list[str] = []  # the held partial line, in pieces (joined once its line ends)
+
+    def _emit(self, text: str) -> None:
+        if self._buffer is None:
+            self.raw.write(text)
+        else:
+            self._buffer.write(text.encode("utf-8", "backslashreplace"))
+            if getattr(self.raw, "line_buffering", False):
+                self._buffer.flush()
 
     def write(self, s: str) -> int:
-        text = self._pending + s
-        end = max(text.rfind("\n"), text.rfind("\r")) + 1
-        # A CR at the very end may be the first half of CRLF: keep it until the next write.
-        if end and text[end - 1] == "\r" and end == len(text):
-            end -= 1
-        self._pending = text[end:]
-        if end:
-            parts = _BREAK.split(text[:end])
-            self.raw.write("".join(part if i % 2 else neutralize(part) for i, part in enumerate(parts)))
+        end = max(s.rfind("\n"), s.rfind("\r")) + 1
+        if not end:
+            self._pending.append(s)
+            return len(s)
+        # A CR that turns out to be half of a CRLF is fine: the empty "line" between them is left as it is.
+        text = "".join(self._pending) + s[:end]
+        self._pending = [s[end:]] if end < len(s) else []
+        parts = _BREAK.split(text)
+        self._emit("".join(part if i % 2 else neutralize(part) for i, part in enumerate(parts)))
         return len(s)
 
     def finish(self) -> None:
         if self._pending:
-            pending, self._pending = self._pending, ""
-            self.raw.write(neutralize(pending))
-        self.raw.flush()
+            pending, self._pending = "".join(self._pending), []
+            self._emit(neutralize(pending))
+        self.flush()
 
-    def flush(self) -> None:
-        self.raw.flush()  # a held partial line stays held: it may still turn into a command
+    def flush(self) -> None:  # a held partial line stays held: it may still turn into a command
+        (self.raw if self._buffer is None else self._buffer).flush()
 
     def close(self) -> None:
         pass  # the raw stream isn't ours to close (IOBase's finalizer would also flush it, maybe after it's gone)
@@ -81,11 +103,11 @@ class CommandGuard(io.TextIOBase):
 
     @property
     def encoding(self) -> str:  # type: ignore[override]
-        return self.raw.encoding
+        return self.raw.encoding if self._buffer is None else "utf-8"
 
     @property
     def errors(self) -> str | None:  # type: ignore[override]
-        return self.raw.errors
+        return self.raw.errors if self._buffer is None else "backslashreplace"
 
 
 def write_command(command: str, stream: TextIO) -> None:
@@ -100,15 +122,20 @@ def write_command(command: str, stream: TextIO) -> None:
     if isinstance(stream, CommandGuard):
         if stream._pending:
             stream.write("\n")
-        stream.raw.write(command + "\n")
+        stream._emit(command + "\n")
     else:
         stream.write(command + "\n")
 
 
 @contextmanager
 def guarded_output() -> Iterator[None]:
-    """Route sys.stdout and sys.stderr through CommandGuard for the duration (once, if nested)."""
-    if isinstance(sys.stdout, CommandGuard):
+    """Route sys.stdout and sys.stderr through CommandGuard for the duration (once, if nested).
+
+    An exception that escapes is printed here, through the guard, and becomes exit 2: left to the interpreter, its
+    traceback (with whatever input text the message quotes) would be printed after the guard is gone. So is the
+    message of sys.exit("...").
+    """
+    if isinstance(sys.stdout, CommandGuard) and isinstance(sys.stderr, CommandGuard):
         yield
         return
     out, err = sys.stdout, sys.stderr
@@ -116,6 +143,14 @@ def guarded_output() -> Iterator[None]:
     sys.stdout, sys.stderr = guards
     try:
         yield
+    except SystemExit as e:
+        if e.code is None or isinstance(e.code, int):
+            raise
+        print(e.code, file=sys.stderr)
+        raise SystemExit(1) from None  # as the interpreter does for sys.exit("message")
+    except Exception:  # not KeyboardInterrupt: its traceback is wheelgap's own code, no input text
+        traceback.print_exc()
+        raise SystemExit(2) from None
     finally:
         sys.stdout, sys.stderr = out, err
         for guard in guards:

@@ -973,7 +973,20 @@ def load_file(path: Path) -> Source:
     kind = file_kind(path)
     source = READERS[kind](path)
     source.path, source.kind = path, kind
+    _check_field_types(path, source)
     return source
+
+
+def _check_field_types(path: Path, source: Source) -> None:
+    """SourceError for a package field of the wrong type (`version = 1`, a list of markers), which would otherwise
+    crash later, far from the file."""
+    for pkg in source.packages:
+        for what, value in (("version", pkg.version), ("index", pkg.registry)):
+            if value is not None and not isinstance(value, str):
+                raise SourceError(f"{path.name}: package {pkg.name} has a {what} that isn't a string")
+        for what, values in (("marker", pkg.markers), ("file name", pkg.files)):
+            if values is not None and not all(isinstance(v, str) for v in values):
+                raise SourceError(f"{path.name}: package {pkg.name} has a {what} that isn't a string")
 
 
 def file_kind(path: Path) -> str:

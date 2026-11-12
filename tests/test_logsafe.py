@@ -2,12 +2,16 @@
 
 import io
 import json
+import os
 import re
+import subprocess
 import sys
 
 import pytest
 
+from wheelgap import cli
 from wheelgap.cli import main
+from wheelgap.diff import main as diff_main
 from wheelgap.logsafe import CommandGuard, guarded_output, neutralize, write_command
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -36,7 +40,18 @@ TOML_LOCKS = {
 }
 
 
-@pytest.mark.parametrize("name", ["::warning file=a,line=1::pwned", "x\n::error::pwn", "a ##[error]b", "x_", ""])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "::warning file=a,line=1::pwned",
+        "x\n::error::pwn",
+        "a ##[error]b",
+        "x_",
+        "",
+        "\u017fix",  # long s and the Kelvin sign match [a-z] case-insensitively unless the pattern is ASCII-only
+        "\u212aelvin",
+    ],
+)
 @pytest.mark.parametrize("lockfile", [*TOML_LOCKS, "Pipfile.lock"])
 def test_invalid_package_names_are_input_errors(capsys, fake_pypi, tmp_path, lockfile, name):
     # pip can't install a name that isn't PEP 508, so it's bad input (exit 2), not a package with a gap.
@@ -84,12 +99,15 @@ def test_lockfile_text_cant_run_workflow_commands(capsys, fake_pypi, tmp_path, f
         assert json.loads(out)["packages"][0]["version"] == VERSION
 
 
-def test_diff_cant_run_workflow_commands(capsys, fake_pypi, tmp_path):
+@pytest.mark.parametrize("entry", [main, diff_main])
+def test_diff_cant_run_workflow_commands(capsys, fake_pypi, tmp_path, entry):
     (tmp_path / "old").mkdir()
     wheel = 'wheels = [{ url = "https://files.example/b-1.0-py3-none-any.whl", hash = "sha256:00" }]\n'
     (tmp_path / "old" / "uv.lock").write_text(UV_LOCK.format(version='"1.0"') + wheel, encoding="utf-8")
     (tmp_path / "uv.lock").write_text(UV_LOCK.format(version=json.dumps(VERSION)), encoding="utf-8")
-    code, out, err = run(capsys, "diff", str(tmp_path / "old"), str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    argv = [str(tmp_path / "old"), str(tmp_path), "-p", "3.13", "-t", "linux-x86_64"]
+    code = entry(["diff", *argv] if entry is main else argv)  # wheelgap diff, and python -m wheelgap.diff
+    out, err = capsys.readouterr()
     assert code == 1
     assert "pwn" in out + err
     assert not commands(out + err)
@@ -118,6 +136,8 @@ def test_requirements_text_cant_run_workflow_commands(capsys, fake_pypi, tmp_pat
         ("\x1b[1m::error::x\x1b[0m", "\x1b[1m\\u003a:error::x\x1b[0m"),
         ("a ##[error]b ##[warning]c", "a \\u0023#[error]b \\u0023#[warning]c"),
         ('  "version": "##[x"', '  "version": "\\u0023#[x"'),  # still valid JSON, with the same value
+        # What .NET's TrimStart skips: tab, VT, FF, NEL, NBSP, em space, line separator, ideographic space.
+        *[(f"{ws}::error::x", f"{ws}\\u003a:error::x") for ws in "\t\v\f\x85\xa0\u2003\u2028\u3000"],
         # Normal output is never changed.
         ("numpy  2.3.4  ✓  ● source", "numpy  2.3.4  ✓  ● source"),
         ("  via: a → b", "  via: a → b"),
@@ -136,7 +156,7 @@ def test_command_guard_holds_partial_lines():
     guard.write(":")
     guard.flush()  # a partial line stays held: the rest may make it a command
     assert raw.getvalue() == ""
-    guard.write(":error::x\r")  # a CR may be half a CRLF
+    guard.write(":error::x\r")  # written at once: a CRLF split here only leaves an empty "line" between CR and LF
     guard.write("\n#")
     guard.write("#[warning]y\rok\n::tail")
     assert raw.getvalue() == "\\u003a:error::x\r\n\\u0023#[warning]y\rok\n"
@@ -148,10 +168,11 @@ def test_command_guard_holds_partial_lines():
 def test_guarded_output_restores_streams_and_nests(capsys):
     out, err = sys.stdout, sys.stderr
     with guarded_output():
-        guard = sys.stdout
+        guard, err_guard = sys.stdout, sys.stderr
         assert isinstance(guard, CommandGuard) and guard.isatty() == out.isatty()
+        assert isinstance(err_guard, CommandGuard) and err_guard.raw is err
         with guarded_output():
-            assert sys.stdout is guard  # not wrapped twice
+            assert (sys.stdout, sys.stderr) == (guard, err_guard)  # not wrapped twice
         print("::error::x")
         print("partial", end="")
     assert (sys.stdout, sys.stderr) == (out, err)
@@ -221,3 +242,78 @@ def test_advisory_values_cant_run_workflow_commands(capsys, fake_pypi, tmp_path,
     assert code == 2
     assert "unknown target" in err
     assert not commands(out + err)
+
+
+def test_command_guard_many_small_writes():
+    raw = io.StringIO()
+    guard = CommandGuard(raw)
+    for _ in range(200_000):  # quadratic string building would take minutes
+        guard.write(":")
+    guard.write("\n")
+    assert raw.getvalue() == "\\u003a" + ":" * 199_999 + "\n"
+
+
+@pytest.mark.parametrize("message", ["bad\n::error::x", "bad ##[error]x"])
+def test_tracebacks_go_through_the_guard(capsys, monkeypatch, message):
+    # Left to the interpreter, a traceback is printed after the guard has gone, and quotes the message.
+    def broken():
+        raise ValueError(message)
+
+    monkeypatch.setattr(cli, "make_parser", broken)
+    with pytest.raises(SystemExit) as caught:
+        main(["x"])
+    assert caught.value.code == 2
+    out, err = capsys.readouterr()
+    assert "Traceback" in err and "ValueError: bad" in err
+    assert not commands(out + err)
+
+
+def test_exit_messages_go_through_the_guard(capsys, monkeypatch):
+    def leaving():
+        sys.exit("bad\n::error::x")
+
+    monkeypatch.setattr(cli, "make_parser", leaving)
+    with pytest.raises(SystemExit) as caught:
+        main(["x"])
+    assert caught.value.code == 1
+    assert capsys.readouterr().err == "bad\n\\u003a:error::x\n"
+
+
+@pytest.mark.parametrize(
+    "lockfile,text",
+    [
+        ("uv.lock", 'version = 1\n[[package]]\nname = "a"\nversion = 1\n'),
+        ("poetry.lock", '[[package]]\nname = "a"\nversion = 1\nfiles = []\n[metadata]\nlock-version = "2.1"\n'),
+        ("pdm.lock", '[metadata]\ngroups = ["default"]\n[[package]]\nname = "a"\nversion = 1\nfiles = []\n'),
+        ("pdm.lock", '[[package]]\nname = "a"\nversion = "1"\nmarker = ["x"]\nfiles = []\n'),
+        ("pylock.toml", 'lock-version = "1.0"\n[[packages]]\nname = "a"\nversion = 1\n'),
+        ("pylock.toml", 'lock-version = "1.0"\n[[packages]]\nname = "a"\nversion = "1"\nmarker = 3\n'),
+    ],
+)
+def test_fields_of_the_wrong_type_are_input_errors(capsys, fake_pypi, tmp_path, lockfile, text):
+    (tmp_path / lockfile).write_text(text, encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path / lockfile), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2
+    assert f"wheelgap: error: {lockfile}: package a has a " in err and "that isn't a string" in err
+
+
+@pytest.mark.parametrize("encoding,lead", [("latin-1", "\xc2\xa0"), ("cp1252", "\xc2\u2026")])
+def test_output_is_utf8_whatever_pythonioencoding_says(tmp_path, encoding, lead):
+    # In latin-1, "Â" + NBSP is C2 A0: UTF-8 for NBSP, which the runner skips like a space, and then `::` starts the
+    # line. In cp1252, "Â…" is C2 85: UTF-8 for NEL, another such space.
+    version = f"1.0\n{lead}::error::pwn"
+    (tmp_path / "uv.lock").write_text(UV_LOCK.format(version=json.dumps(version)), encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k not in ("FORCE_COLOR", "NO_COLOR")} | {"PYTHONIOENCODING": encoding}
+    argv = [str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--offline", "--no-cache", "--explain"]
+    proc = subprocess.run([sys.executable, "-m", "wheelgap", *argv], capture_output=True, env=env, check=False)
+    out, err = proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")
+    assert proc.returncode == 1, err
+    assert version in out  # UTF-8, so the version comes back whole
+    assert not commands(out + err)
+
+
+def test_guarded_output_guards_stderr_even_when_stdout_already_is(capsys, monkeypatch):
+    monkeypatch.setattr(sys, "stdout", CommandGuard(sys.stdout))
+    with guarded_output():
+        print("::error::x", file=sys.stderr)
+    assert capsys.readouterr().err == "\\u003a:error::x\n"
