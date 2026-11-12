@@ -19,7 +19,7 @@ from packaging.markers import InvalidMarker, Marker
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
 
-from . import __version__, cache
+from . import __version__, cache, condaforge
 from .api import running_python
 from .check import CELL, EXPLAIN_LIMIT, Row, Status, check, explain, explain_lines, marker_holds, reachable
 from .dockerfile import DockerfileError, read_dockerfile
@@ -208,6 +208,12 @@ def make_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--all", action="store_true", help="show every package, not just the ones with gaps")
     p.add_argument("--explain", action="store_true", help="for each gap, list the wheels that were rejected and why")
+    p.add_argument(
+        "--conda-forge",
+        action="store_true",
+        help="with --explain, also say when conda-forge has a package of the same name with builds for a gap's "
+        "platform (sends the names of PyPI packages with gaps to anaconda.org)",
+    )
     p.add_argument(
         "-q",
         "--quiet",
@@ -538,7 +544,9 @@ def gap_targets(row: Row, targets: list[Target]) -> list[Target]:
     return [t for t in targets if row.results[t] in (Status.SOURCE, Status.MISSING) and t not in row.ignored]
 
 
-def render_explain(rows: list[Row], targets: list[Target], style: Style) -> list[str]:
+def render_explain(
+    rows: list[Row], targets: list[Target], style: Style, conda_forge: dict[str, list[str]] | None = None
+) -> list[str]:
     multi_py = len({t.python for t in targets}) > 1
     out = []
     for r in rows:
@@ -553,6 +561,8 @@ def render_explain(rows: list[Row], targets: list[Target], style: Style) -> list
             lines = explain_lines(files, t, yanked=r.package.yanked, limit=EXPLAIN_LIMIT, dim=style.dim, align=True)
             out += [f"  {line}" for line in lines]
             out.append("")
+        if conda_forge and (matched := condaforge.matches(r.package, gap_targets(r, targets), conda_forge)):
+            out += [condaforge.hint(r.package, matched), ""]
     return out
 
 
@@ -638,6 +648,7 @@ def report_json(
     explained: bool,
     pyodide_lock: PyodideLock | None = None,
     advisory: frozenset[Target] = frozenset(),
+    conda_forge: dict[str, list[str]] | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     gaps = [r for r in rows if not r.ok]
@@ -662,6 +673,11 @@ def report_json(
             }
             # Same targets as `rejected`, minus any without a path (inputs with no dependency graph).
             out["via"] = {t.label(multi_py): r.via[t] for t in gap_targets(r, targets) if t in r.via}
+            if conda_forge and (matched := condaforge.matches(r.package, gap_targets(r, targets), conda_forge)):
+                out["conda_forge"] = {
+                    "name": r.package.key,
+                    "builds": {t.label(multi_py): subdirs for t, subdirs in matched.items()},
+                }
         return out
 
     report: dict[str, object] = {
@@ -855,6 +871,7 @@ def render_markdown(
     pyodide_lock: PyodideLock | None,
     source_allowed: bool = False,
     advisory: frozenset[Target] = frozenset(),
+    conda_forge: dict[str, list[str]] | None = None,
 ) -> list[str]:
     """The same report as the text output, as GitHub-flavoured Markdown (for a job summary or a PR comment)."""
     plain = Style(False)
@@ -912,7 +929,7 @@ def render_markdown(
             out += [f"Could not check {_md(r.package.name)}: {_code(r.package.error)}", ""]
     if args.explain and gaps:
         # Fenced, so wheel filenames and reasons need no escaping.
-        lines = render_explain(gaps, targets, plain)
+        lines = render_explain(gaps, targets, plain, conda_forge)
         out += ["<details><summary>Why (rejected wheels)</summary>", "", "```", *lines, "```", "", "</details>", ""]
     return out
 
@@ -1054,6 +1071,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--list-targets has no Markdown form (use --json)")
     if args.offline and args.online:
         parser.error("--offline and --online can't be used together")
+    if args.conda_forge and not args.explain:
+        parser.error("--conda-forge only adds to --explain; pass --explain too")
     try:
         if args.clear_cache:
             folder, count = cache.clear()
@@ -1192,6 +1211,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         if offline:
             require_offline(sources, offline_how, simple_index=index_url)
+            if args.conda_forge:
+                raise SourceError(
+                    f"{offline_how}: --conda-forge would look packages up on anaconda.org; "
+                    f"drop --conda-forge, or {undo_offline(offline_how)}"
+                )
         fail_on = args.fail_on or config.get("fail-on", "source")
         pyodide_lock = None
         if args.pyodide_lock:
@@ -1337,6 +1361,22 @@ def main(argv: list[str] | None = None) -> int:
         if r.package.key in ignore_on:
             r.ignored = frozenset(t for t in targets if t.platform in ignore_on[r.package.key])
     gaps = [r for r in rows if not r.ok]
+    conda_forge: dict[str, list[str]] = {}
+    if args.conda_forge:
+        if not condaforge.index_allows(index_url):
+            if not quiet:
+                print(
+                    "wheelgap: note: --conda-forge looks nothing up when packages come from another index "
+                    "(--index-url, index-url or WHEELGAP_INDEX_URL), so no package names leave it",
+                    file=sys.stderr,
+                )
+        else:
+            keys = [
+                r.package.key
+                for r in gaps
+                if condaforge.may_send(r.package) and condaforge.wanted(gap_targets(r, targets))
+            ]
+            conda_forge = condaforge.look_up_all(keys, **cached)
     source_labels = [s.label for s in sources]
     # With --fail-on missing, source builds are accepted; missing and unknown packages still fail. Gaps on
     # --advisory targets never fail the run.
@@ -1359,14 +1399,27 @@ def main(argv: list[str] | None = None) -> int:
             print(command, file=sys.stderr if args.json or args.markdown else sys.stdout)
 
     if args.json:
-        print(report_json(rows, targets, source_labels, skipped, ignored, args.explain, pyodide_lock, advisory))
+        print(
+            report_json(
+                rows, targets, source_labels, skipped, ignored, args.explain, pyodide_lock, advisory, conda_forge
+            )
+        )
         return code
 
     if args.markdown:
         print(
             "\n".join(
                 render_markdown(
-                    rows, targets, source_labels, skipped, ignored, args, pyodide_lock, source_allowed, advisory
+                    rows,
+                    targets,
+                    source_labels,
+                    skipped,
+                    ignored,
+                    args,
+                    pyodide_lock,
+                    source_allowed,
+                    advisory,
+                    conda_forge,
                 )
             )
         )
@@ -1412,7 +1465,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.explain and gaps:
             if hidden:
                 print()
-            for ln in render_explain(gaps, targets, style):
+            for ln in render_explain(gaps, targets, style, conda_forge):
                 print(ln)
 
     bundled = [r for r in rows if Status.BUNDLED in r.results.values()]

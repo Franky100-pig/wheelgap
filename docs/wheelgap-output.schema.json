@@ -148,6 +148,20 @@
                     "description": "Present with --explain: dependency path that installs the package, keyed by target label, for the same targets as rejected (uv.lock, and poetry.lock before lock-version 2.1). Empty object when the input has no graph.",
                     "additionalProperties": {"type": "array", "items": {"type": "string"}}
                 },
+                "conda_forge": {
+                    "description": "Present with --explain --conda-forge, in versions after 0.9.0, when conda-forge has a package with exactly this package's canonical name and a build for at least one of the targets in rejected. A hint only: it doesn't change results, summary or the exit code, and the conda package may be another project or lack a build for this Python or version. Left out when nothing matched or the lookup failed.",
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name", "builds"],
+                    "properties": {
+                        "name": {"type": "string", "description": "The conda-forge package name that was looked up (the canonical PyPI name)."},
+                        "builds": {
+                            "type": "object",
+                            "description": "For each matching target label: the conda subdirs with a build on conda-forge's main label, its own (such as linux-aarch64 or osx-arm64) and/or noarch.",
+                            "additionalProperties": {"type": "array", "items": {"type": "string"}}
+                        }
+                    }
+                },
                 "bundled": {
                     "description": "Present with --pyodide-lock when this package is bundled on a Pyodide target: the version Pyodide ships.",
                     "type": "string"

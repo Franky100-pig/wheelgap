@@ -2098,6 +2098,7 @@ def _assert_matches_output_schema(data):
             "via",
             "bundled",
             "bundled_version_differs",
+            "conda_forge",
         }
         assert isinstance(pkg["name"], str) and pkg["name"]
         assert pkg["version"] is None or isinstance(pkg["version"], str)
@@ -2117,6 +2118,9 @@ def _assert_matches_output_schema(data):
             for label, path in pkg["via"].items():
                 assert label in labels
                 assert isinstance(path, list) and all(isinstance(s, str) for s in path)
+        if "conda_forge" in pkg:  # a hint for some of the targets in rejected, never an empty one
+            assert pkg["conda_forge"]["builds"] and set(pkg["conda_forge"]["builds"]) <= set(pkg["rejected"])
+            assert all(pkg["conda_forge"]["builds"].values())
     for item in data["skipped"]:
         assert set(item) == {"name", "reason"}
         assert isinstance(item["name"], str) and isinstance(item["reason"], str)

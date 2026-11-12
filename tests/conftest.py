@@ -35,6 +35,15 @@ FAKE_INDEX = {
     "halfyanked": {"2.0": [{"filename": "halfyanked-2.0-py3-none-any.whl", "yanked": True}, "halfyanked-2.0.tar.gz"]},
 }
 
+# Fake anaconda.org API for --conda-forge (https://api.anaconda.org/package/conda-forge/<name>): name -> each file's
+# (subdir, labels), or an exception the lookup raises. A name not listed is a 404.
+FAKE_CONDA_FORGE: dict[str, list[tuple[str, list[str]]] | Exception] = {
+    # linux-64 and linux-aarch64 on the main label; osx-arm64 only as a build marked broken.
+    "nowheels": [("linux-64", ["main", "cf202003"]), ("linux-aarch64", ["main"]), ("osx-arm64", ["broken"])],
+    "winonly": [("noarch", ["main"])],
+    "fastlib": TimeoutError("timed out"),
+}
+
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "slow: a timing test (skip it locally with -m 'not slow')")
@@ -70,8 +79,16 @@ def fake_pypi(monkeypatch):
 
     calls = []
 
-    def fetch_json(url, timeout=20.0):
+    def fetch_json(url, timeout=20.0, attempts=4, max_bytes=None):
         calls.append(url)
+        if url.startswith("https://api.anaconda.org/package/conda-forge/"):
+            assert max_bytes is not None, "anaconda.org answers can be large: cap them"
+            conda = FAKE_CONDA_FORGE.get(url.rsplit("/", 1)[-1])
+            if conda is None:
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+            if isinstance(conda, Exception):
+                raise conda
+            return {"files": [{"attrs": {"subdir": subdir}, "labels": labels} for subdir, labels in conda]}
         # Served at whatever WHEELGAP_INDEX_URL points at, so tests can assert which index was asked.
         parts = url.removeprefix(pypi.index_url() + "/").removesuffix("/json").split("/")
         name = parts[0]
