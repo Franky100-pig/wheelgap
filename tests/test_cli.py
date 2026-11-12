@@ -2096,6 +2096,7 @@ def _assert_matches_output_schema(data):
             "results",
             "rejected",
             "via",
+            "build_requires",
             "bundled",
             "bundled_version_differs",
         }
@@ -2117,6 +2118,9 @@ def _assert_matches_output_schema(data):
             for label, path in pkg["via"].items():
                 assert label in labels
                 assert isinstance(path, list) and all(isinstance(s, str) for s in path)
+        if "build_requires" in pkg:
+            reqs = pkg["build_requires"]
+            assert reqs is None or (isinstance(reqs, list) and all(isinstance(r, str) for r in reqs))
     for item in data["skipped"]:
         assert set(item) == {"name", "reason"}
         assert isinstance(item["name"], str) and isinstance(item["reason"], str)
@@ -2168,7 +2172,7 @@ def test_json_output_matches_schema(capsys, fixtures):
         assert "error" not in data, data
         _assert_matches_output_schema(data)
         if "--explain" in args:
-            assert all("rejected" in pkg and "via" in pkg for pkg in data["packages"])
+            assert all("rejected" in pkg and "via" in pkg and "build_requires" in pkg for pkg in data["packages"])
         if "winonly" in args:
             assert "winonly" in data["ignored"]
             assert all(pkg["name"] != "winonly" for pkg in data["packages"])

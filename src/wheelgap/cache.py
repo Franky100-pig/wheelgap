@@ -1,4 +1,5 @@
-"""A small on-disk cache of pinned index lookups (/<name>/<version>/json), so a repeat run needn't ask again.
+"""A small on-disk cache of pinned index lookups (/<name>/<version>/json), so a repeat run needn't ask again, and of
+what a release's sdist needs to build (--explain's build info).
 
 A cache that can't be read or written is only ever a miss: it never fails a run.
 """
@@ -42,42 +43,72 @@ def cache_dir() -> Path:
     return Path(base) / "wheelgap" / "pinned-v1"
 
 
-def _path(index: str, name: str, version: str) -> Path:
+def _path(index: str, name: str, version: str, kind: str = "") -> Path:
     # Credentials in the index URL (WHEELGAP_INDEX_URL=https://user:token@host/pypi) are left out of the key,
-    # and what's left is hashed, so no URL is written in clear text.
+    # and what's left is hashed, so no URL is written in clear text. `kind` keeps other entries for the same
+    # release (build info) apart from its file list.
     parts = urlsplit(index)
     index = urlunsplit(parts._replace(netloc=parts.netloc.rpartition("@")[2]))
-    digest = hashlib.sha256(f"{index}\n{name}\n{version}".encode()).hexdigest()
-    return cache_dir() / f"{digest}.json"
+    key = f"{index}\n{name}\n{version}" + (f"\n{kind}" if kind else "")
+    return cache_dir() / f"{hashlib.sha256(key.encode()).hexdigest()}.json"
+
+
+def _fresh(index: str, name: str, version: str, kind: str = "") -> dict | None:
+    """The entry if it's an object saved less than MAX_AGE ago, else None (a miss)."""
+    try:
+        entry = json.loads(_path(index, name, version, kind).read_text(encoding="utf-8"))
+        saved = entry["saved"]
+        if isinstance(saved, bool) or not isinstance(saved, int | float) or not 0 <= _now() - saved < MAX_AGE:
+            return None
+        return entry
+    except Exception:  # missing, corrupt or unreadable: a miss
+        return None
 
 
 def load_files(index: str, name: str, version: str) -> list[dict] | None:
     """The cached file list of a pinned release, or None: not cached, older than MAX_AGE, or unreadable."""
-    try:
-        entry = json.loads(_path(index, name, version).read_text(encoding="utf-8"))
-        saved, files = entry["saved"], entry["files"]
-        if isinstance(saved, bool) or not isinstance(saved, int | float) or not 0 <= _now() - saved < MAX_AGE:
-            return None
-        if isinstance(files, list) and all(isinstance(f, dict) and isinstance(f.get("filename"), str) for f in files):
-            return files
-    except Exception:  # missing, corrupt or unreadable: a miss
-        pass
+    entry = _fresh(index, name, version)
+    files = entry.get("files") if entry else None
+    if isinstance(files, list) and all(isinstance(f, dict) and isinstance(f.get("filename"), str) for f in files):
+        return files
     return None
 
 
 def save_files(index: str, name: str, version: str, files: list[dict]) -> None:
     """Store a pinned release's file list. Only `filename` and `yanked` are kept: they're all fill() reads,
     and a file's URL (which a private mirror may sign) never reaches the disk."""
+    kept = [{k: f[k] for k in ("filename", "yanked") if k in f} for f in files]
+    _save(index, name, version, "", {"files": kept})
+
+
+def load_build(index: str, name: str, version: str) -> dict | None:
+    """A release's cached build info, {"requires": [...] or None, "build_script": bool}, or None for a miss."""
+    entry = _fresh(index, name, version, "build")
+    if entry is None:
+        return None
+    requires, script = entry.get("requires"), entry.get("build_script")
+    if (requires is None or (isinstance(requires, list) and all(isinstance(r, str) for r in requires))) and (
+        isinstance(script, bool)
+    ):
+        return {"requires": requires, "build_script": script}
+    return None
+
+
+def save_build(index: str, name: str, version: str, requires: list[str] | None, build_script: bool) -> None:
+    """Store what a release's sdist says it needs to build (see build.py)."""
+    _save(index, name, version, "build", {"requires": requires, "build_script": build_script})
+
+
+def _save(index: str, name: str, version: str, kind: str, data: dict) -> None:
     try:
-        kept = [{k: f[k] for k in ("filename", "yanked") if k in f} for f in files]
-        path = _path(index, name, version)
+        path = _path(index, name, version, kind)
         path.parent.parent.mkdir(mode=0o700, parents=True, exist_ok=True)  # private to the user (not on Windows)
         path.parent.mkdir(mode=0o700, exist_ok=True)
         # Written next to the target, then renamed over it, so a reader never sees half a file.
         fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-", suffix=".json")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump({"saved": _now(), "files": kept}, f)
+                json.dump({"saved": _now(), **data}, f)
             os.utime(tmp, (_now(), _now()))  # prune() reads the age from the mtime
             os.replace(tmp, path)
         except BaseException:

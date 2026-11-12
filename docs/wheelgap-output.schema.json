@@ -148,6 +148,11 @@
                     "description": "Present with --explain: dependency path that installs the package, keyed by target label, for the same targets as rejected (uv.lock, and poetry.lock before lock-version 2.1). Empty object when the input has no graph.",
                     "additionalProperties": {"type": "array", "items": {"type": "string"}}
                 },
+                "build_requires": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string"},
+                    "description": "Present with --explain: the [build-system] requires of the release's .tar.gz sdist, as written, when a target in rejected is source and the sdist could be read; otherwise null (no source build, --no-build-info, --offline, --index-url, a .zip sdist, no pyproject.toml or [build-system] requires, or a failed download)."
+                },
                 "bundled": {
                     "description": "Present with --pyodide-lock when this package is bundled on a Pyodide target: the version Pyodide ships.",
                     "type": "string"

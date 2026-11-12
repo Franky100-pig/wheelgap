@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import http.client
 import json
 import math
 import os
+import tarfile
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator
@@ -109,6 +112,71 @@ def fetch_json(url: str, timeout: float = 20.0, attempts: int = 4) -> dict:
     """GET a JSON document (see _request for what is retried)."""
     req = urllib.request.Request(url, headers={"User-Agent": f"wheelgap/{__version__}", "Accept": "application/json"})
     return _request(req, timeout, attempts, json.load)
+
+
+# Caps on reading an sdist for --explain's build info: bytes downloaded, bytes of tar unpacked from them, and the
+# size of pyproject.toml itself. Past any of them the sdist gives no answer.
+SDIST_MAX_BYTES = 16 * 1024 * 1024
+SDIST_MAX_UNPACKED = 64 * 1024 * 1024
+PYPROJECT_MAX_BYTES = 1024 * 1024
+
+
+class SdistTooBig(Exception):
+    """A streamed sdist went past a byte cap before its pyproject.toml turned up."""
+
+
+class _Capped:
+    """A read-only stream over `read` that raises SdistTooBig once more than `cap` bytes have come through."""
+
+    def __init__(self, read: Callable[[int], bytes], cap: int):
+        self._read, self._left = read, cap
+
+    def read(self, n: int = -1) -> bytes:
+        want = self._left + 1 if n < 0 else min(n, self._left + 1)
+        data = self._read(want)
+        if len(data) > self._left:
+            raise SdistTooBig
+        self._left -= len(data)
+        return data
+
+
+def _top_level_pyproject(stream: _Capped) -> bytes | None:
+    """`<top>/pyproject.toml` from an uncompressed tar stream, or None if the first member by that name isn't a
+    regular file within PYPROJECT_MAX_BYTES (a link, a folder, a device...), or there is none."""
+    # typeshed's file protocols ask for seek() and more, which stream mode never calls.
+    with tarfile.open(fileobj=stream, mode="r|") as tar:  # type: ignore[call-overload]
+        for member in tar:
+            top, _, rest = member.name.partition("/")
+            if rest != "pyproject.toml" or top in ("", ".", ".."):
+                continue
+            if member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE) or member.size > PYPROJECT_MAX_BYTES:
+                return None
+            f = tar.extractfile(member)
+            return f.read(PYPROJECT_MAX_BYTES + 1) if f else None
+    return None
+
+
+def fetch_sdist_pyproject(url: str, timeout: float = 20.0, attempts: int = 4) -> dict | None:
+    """The parsed top-level pyproject.toml of the .tar.gz sdist at `url`, or None when it has none.
+
+    The sdist is streamed through tarfile and read only as far as that file: nothing is written to disk, and it
+    stops with SdistTooBig past SDIST_MAX_BYTES downloaded or SDIST_MAX_UNPACKED unpacked. The gzip layer is
+    unpacked here rather than by tarfile's r|gz, so the unpacked size can be capped too. Only https URLs are
+    fetched, with fetch_json's redirect rules, timeouts and retries. .zip sdists aren't read (ValueError): that
+    would need HTTP range requests. Anything that goes wrong raises; the caller treats it as "no answer".
+    """
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not parts.path.endswith(".tar.gz"):
+        raise ValueError("only https:// .tar.gz sdists are read")
+    req = urllib.request.Request(url, headers={"User-Agent": f"wheelgap/{__version__}"})
+
+    def read(resp) -> bytes | None:
+        packed = _Capped(resp.read, SDIST_MAX_BYTES)
+        with gzip.GzipFile(fileobj=packed, mode="rb") as unpacked:  # type: ignore[call-overload]
+            return _top_level_pyproject(_Capped(unpacked.read, SDIST_MAX_UNPACKED))
+
+    raw = _request(req, timeout, attempts, read)
+    return None if raw is None else tomllib.loads(raw.decode("utf-8"))
 
 
 SIMPLE_JSON = "application/vnd.pypi.simple.v1+json"

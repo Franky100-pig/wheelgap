@@ -21,6 +21,7 @@ from packaging.utils import canonicalize_name
 
 from . import __version__, cache
 from .api import running_python
+from .build import BuildInfo, describe, lookup_all
 from .check import CELL, EXPLAIN_LIMIT, Row, Status, check, explain, explain_lines, marker_holds, reachable
 from .dockerfile import DockerfileError, read_dockerfile
 from .github import github_annotations
@@ -208,6 +209,11 @@ def make_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--all", action="store_true", help="show every package, not just the ones with gaps")
     p.add_argument("--explain", action="store_true", help="for each gap, list the wheels that were rejected and why")
+    p.add_argument(
+        "--no-build-info",
+        action="store_true",
+        help="with --explain, don't download sdists to say what a source build needs (--offline implies it)",
+    )
     p.add_argument(
         "-q",
         "--quiet",
@@ -538,11 +544,24 @@ def gap_targets(row: Row, targets: list[Target]) -> list[Target]:
     return [t for t in targets if row.results[t] in (Status.SOURCE, Status.MISSING) and t not in row.ignored]
 
 
-def render_explain(rows: list[Row], targets: list[Target], style: Style) -> list[str]:
+def source_build(row: Row, targets: list[Target]) -> bool:
+    """Whether --explain explains a `source` cell of this row (a gap that isn't ignored)."""
+    return any(row.results[t] == Status.SOURCE for t in gap_targets(row, targets))
+
+
+def build_info_for(row: Row, build_info: dict[tuple[str, str], BuildInfo]) -> BuildInfo | None:
+    return build_info.get((row.package.key, row.package.version or ""))
+
+
+def render_explain(
+    rows: list[Row], targets: list[Target], style: Style, build_info: dict[tuple[str, str], BuildInfo] | None = None
+) -> list[str]:
     multi_py = len({t.python for t in targets}) > 1
     out = []
     for r in rows:
         files = r.package.files or []
+        info = build_info_for(r, build_info or {})
+        needs = describe(info) if info else None
         for t in gap_targets(r, targets):
             cell, color = CELL[r.results[t]]
             head = f"{r.package.name} {r.package.version or '?'} on {t.label(multi_py)}:"
@@ -550,6 +569,9 @@ def render_explain(rows: list[Row], targets: list[Target], style: Style) -> list
             path = r.via.get(t, [])
             if len(path) >= 2:  # a lone name says nothing about why the package is there
                 out.append(f"  via: {' → '.join(path)}")
+            if needs and r.results[t] == Status.SOURCE:  # once per release, under its first source cell
+                out.append(f"  build needs: {needs}")
+                needs = None
             lines = explain_lines(files, t, yanked=r.package.yanked, limit=EXPLAIN_LIMIT, dim=style.dim, align=True)
             out += [f"  {line}" for line in lines]
             out.append("")
@@ -638,6 +660,7 @@ def report_json(
     explained: bool,
     pyodide_lock: PyodideLock | None = None,
     advisory: frozenset[Target] = frozenset(),
+    build_info: dict[tuple[str, str], BuildInfo] | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     gaps = [r for r in rows if not r.ok]
@@ -662,6 +685,8 @@ def report_json(
             }
             # Same targets as `rejected`, minus any without a path (inputs with no dependency graph).
             out["via"] = {t.label(multi_py): r.via[t] for t in gap_targets(r, targets) if t in r.via}
+            info = build_info_for(r, build_info or {}) if source_build(r, targets) else None
+            out["build_requires"] = list(info.requires) if info else None
         return out
 
     report: dict[str, object] = {
@@ -855,6 +880,7 @@ def render_markdown(
     pyodide_lock: PyodideLock | None,
     source_allowed: bool = False,
     advisory: frozenset[Target] = frozenset(),
+    build_info: dict[tuple[str, str], BuildInfo] | None = None,
 ) -> list[str]:
     """The same report as the text output, as GitHub-flavoured Markdown (for a job summary or a PR comment)."""
     plain = Style(False)
@@ -912,7 +938,7 @@ def render_markdown(
             out += [f"Could not check {_md(r.package.name)}: {_code(r.package.error)}", ""]
     if args.explain and gaps:
         # Fenced, so wheel filenames and reasons need no escaping.
-        lines = render_explain(gaps, targets, plain)
+        lines = render_explain(gaps, targets, plain, build_info)
         out += ["<details><summary>Why (rejected wheels)</summary>", "", "```", *lines, "```", "", "</details>", ""]
     return out
 
@@ -1346,6 +1372,12 @@ def main(argv: list[str] | None = None) -> int:
     # The run passes only because --fail-on missing accepts a source build on a required target.
     source_allowed = not failing and any(Status.SOURCE in required_statuses(r, advisory) for r in gaps)
 
+    build_info: dict[tuple[str, str], BuildInfo] = {}
+    if args.explain and not (args.no_build_info or offline or index_url is not None):
+        # What each explained `source` release needs to build, from its sdist. Nothing here changes the exit code,
+        # and a release whose sdist can't be read just gets no line. --index-url lookups have no JSON API to ask.
+        build_info = lookup_all([r.package for r in gaps if source_build(r, targets)], **cached)
+
     if args.junit is not None:  # an empty PATH (an unset CI variable) is an error, not "no report"
         try:
             write_junit(args.junit, rows, targets, fail_on, advisory)
@@ -1359,14 +1391,27 @@ def main(argv: list[str] | None = None) -> int:
             print(command, file=sys.stderr if args.json or args.markdown else sys.stdout)
 
     if args.json:
-        print(report_json(rows, targets, source_labels, skipped, ignored, args.explain, pyodide_lock, advisory))
+        print(
+            report_json(
+                rows, targets, source_labels, skipped, ignored, args.explain, pyodide_lock, advisory, build_info
+            )
+        )
         return code
 
     if args.markdown:
         print(
             "\n".join(
                 render_markdown(
-                    rows, targets, source_labels, skipped, ignored, args, pyodide_lock, source_allowed, advisory
+                    rows,
+                    targets,
+                    source_labels,
+                    skipped,
+                    ignored,
+                    args,
+                    pyodide_lock,
+                    source_allowed,
+                    advisory,
+                    build_info,
                 )
             )
         )
@@ -1412,7 +1457,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.explain and gaps:
             if hidden:
                 print()
-            for ln in render_explain(gaps, targets, style):
+            for ln in render_explain(gaps, targets, style, build_info):
                 print(ln)
 
     bundled = [r for r in rows if Status.BUNDLED in r.results.values()]

@@ -31,8 +31,9 @@ uv run --group dev pytest
 | `sources.py` | Reads inputs: `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, requirements files |
 | `targets.py` | Targets (Python × platform) and the wheel tags each accepts |
 | `check.py` | The status per package and target (`wheel`, `source`, `missing`, `unknown`, `n/a`, `bundled`) and `--explain` reasons |
-| `pypi.py` | The only HTTP client (`fetch_json`: retries, https-only redirects) and the PyPI lookups (`fill`, `fill_all`, `recheck_lock`) |
+| `pypi.py` | The only HTTP client (`fetch_json`: retries, https-only redirects; `fetch_sdist_pyproject` streams an sdist) and the PyPI lookups (`fill`, `fill_all`, `recheck_lock`) |
 | `cache.py` | The 24-hour on-disk cache of pinned PyPI lookups (`--no-cache` and `--online` skip it) |
+| `build.py` | `--explain`'s build info: what a `source` build needs, from the sdist's `[build-system] requires` (read with `pypi.fetch_sdist_pyproject`) |
 | `dockerfile.py` | `--dockerfile`: reads the final stage's image and platform the way Docker/BuildKit does |
 | `offline.py` | `--offline`, `offline = true` and `check_lockfile(..., offline=True)`: refuse inputs that would need an index lookup |
 | `pyodide.py` | `--pyodide-lock`: packages Pyodide ships itself |

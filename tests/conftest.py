@@ -57,6 +57,55 @@ def lookup_cache(monkeypatch, tmp_path_factory) -> Path:
     return folder
 
 
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """Any real HTTP request, except to a test's own server on localhost, fails at once (for example --explain's
+    sdist downloads, on a fixture whose files the lock lists)."""
+    from urllib.parse import urlsplit
+
+    from wheelgap import pypi
+
+    real_open = pypi._OPENER.open
+
+    def refuse(req, timeout=None):
+        url = getattr(req, "full_url", req)
+        if urlsplit(url).hostname in pypi.LOOPBACK:  # a test's own local server
+            return real_open(req, timeout=timeout)
+        raise OSError(f"no network in tests: {url}")
+
+    monkeypatch.setattr(pypi._OPENER, "open", refuse)
+
+
+class FakeFiles:
+    """Files served over fake HTTPS (see fake_files): .files maps a filename to its bytes, .calls lists URLs."""
+
+    def __init__(self):
+        self.files: dict[str, bytes] = {}
+        self.calls: list[str] = []
+
+
+@pytest.fixture
+def fake_files(monkeypatch):
+    """Serves fake_files.files at https://files.example/<filename>, the URLs fake_pypi gives every file."""
+    import io
+    import urllib.error
+
+    from wheelgap import pypi
+
+    served = FakeFiles()
+
+    def open_(req, timeout=None):
+        url = req.full_url
+        served.calls.append(url)
+        name = url.removeprefix("https://files.example/")
+        if name not in served.files:
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
+        return io.BytesIO(served.files[name])
+
+    monkeypatch.setattr(pypi._OPENER, "open", open_)
+    return served
+
+
 @pytest.fixture
 def fixtures() -> Path:
     return FIXTURES
@@ -84,7 +133,11 @@ def fake_pypi(monkeypatch):
             raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
 
         def entries(fs):
-            return [f if isinstance(f, dict) else {"filename": f} for f in fs]
+            # With a URL, as PyPI gives them; fake_files serves it.
+            return [
+                {"url": f"https://files.example/{e['filename']}", **e}
+                for e in (f if isinstance(f, dict) else {"filename": f} for f in fs)
+            ]
 
         data = {"info": {"version": version}, "urls": entries(files)}
         if len(parts) == 1:  # the project endpoint lists every release, like PyPI
