@@ -560,10 +560,10 @@ def _in_roots(raw: str, path: PurePath) -> Path:
     for root in _ROOTS.get():
         candidate = root / path
         try:
-            inside = candidate.resolve().is_relative_to(root.resolve())
-        except (OSError, RuntimeError):  # a symlink loop, say
-            inside = False
-        if inside and candidate.exists():
+            found = candidate.resolve().is_relative_to(root.resolve()) and candidate.exists()
+        except (OSError, RuntimeError):  # a symlink loop, a name too long (exists() raises that before 3.14), ...
+            found = False
+        if found:
             return candidate
     searched = _clip(", ".join(str(root) for root in _ROOTS.get()) or "none of them is a local folder")
     raise ToolError(f"{_clip(raw)}: not in any of the client's roots ({searched}); pass an absolute path")

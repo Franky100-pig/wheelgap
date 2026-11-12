@@ -1655,6 +1655,7 @@ def test_the_roots_error_clips_long_paths_and_roots(fake_pypi, tmp_path, monkeyp
     (reply,) = run(roots_call(1, roots_answer_for(deep, deep), path="x" * 1000))
     text = reply["result"]["content"][0]["text"]
     assert reply["result"]["isError"] is True and len(text) < 500 and "..." in text
+    assert "not in any of the client's roots" in text  # not an OSError for the over-long name
 
 
 @pytest.mark.parametrize(
