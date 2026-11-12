@@ -151,7 +151,7 @@
                 "build_requires": {
                     "type": ["array", "null"],
                     "items": {"type": "string"},
-                    "description": "Present with --explain: the [build-system] requires of the release's .tar.gz sdist, as written, when a target in rejected is source and the sdist could be read; otherwise null (no source build, --no-build-info, --offline, --index-url, a .zip sdist, no pyproject.toml or [build-system] requires, or a failed download)."
+                    "description": "Present with --explain --build-info: the [build-system] requires of the release's sdist, normalized (name, extras, version range) and limited to those whose marker holds on a target in rejected that is source; null when there is no source build or no answer (the sdist isn't positively from PyPI, couldn't be read, or pip could read another pyproject.toml from it)."
                 },
                 "bundled": {
                     "description": "Present with --pyodide-lock when this package is bundled on a Pyodide target: the version Pyodide ships.",

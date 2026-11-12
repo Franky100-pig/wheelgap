@@ -21,7 +21,7 @@ from packaging.utils import canonicalize_name
 
 from . import __version__, cache
 from .api import running_python
-from .build import BuildInfo, describe, lookup_all
+from .build import BuildInfo, Release, describe, lookup_all, release_of, requires_for, shown
 from .check import CELL, EXPLAIN_LIMIT, Row, Status, check, explain, explain_lines, marker_holds, reachable
 from .dockerfile import DockerfileError, read_dockerfile
 from .github import github_annotations
@@ -210,9 +210,10 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--all", action="store_true", help="show every package, not just the ones with gaps")
     p.add_argument("--explain", action="store_true", help="for each gap, list the wheels that were rejected and why")
     p.add_argument(
-        "--no-build-info",
+        "--build-info",
         action="store_true",
-        help="with --explain, don't download sdists to say what a source build needs (--offline implies it)",
+        help="with --explain, read the sdist of each package that builds from source to say what the build needs "
+        "(downloads them from PyPI; also build-info = true)",
     )
     p.add_argument(
         "-q",
@@ -343,7 +344,7 @@ def load_config(path: Path) -> dict:
                 raise SourceError(f"{path}: [tool.wheelgap] {key} must be {example}")
             if key == "fail-on" and value not in FAIL_ON:
                 raise SourceError(f"{path}: [tool.wheelgap] fail-on must be one of: {', '.join(FAIL_ON)}")
-        elif key in ("quiet", "offline"):
+        elif key in ("quiet", "offline", "build-info"):
             if not isinstance(value, bool):
                 raise SourceError(f"{path}: [tool.wheelgap] {key} must be a boolean")
         else:
@@ -544,24 +545,26 @@ def gap_targets(row: Row, targets: list[Target]) -> list[Target]:
     return [t for t in targets if row.results[t] in (Status.SOURCE, Status.MISSING) and t not in row.ignored]
 
 
-def source_build(row: Row, targets: list[Target]) -> bool:
-    """Whether --explain explains a `source` cell of this row (a gap that isn't ignored)."""
-    return any(row.results[t] == Status.SOURCE for t in gap_targets(row, targets))
+def source_targets(row: Row, targets: list[Target]) -> list[Target]:
+    """The targets where --explain explains a `source` cell of this row (a gap that isn't ignored)."""
+    return [t for t in gap_targets(row, targets) if row.results[t] == Status.SOURCE]
 
 
-def build_info_for(row: Row, build_info: dict[tuple[str, str], BuildInfo]) -> BuildInfo | None:
-    return build_info.get((row.package.key, row.package.version or ""))
+def build_info_for(row: Row, build_info: dict[Release, BuildInfo]) -> BuildInfo | None:
+    release = release_of(row.package)
+    return build_info.get(release) if release else None
 
 
 def render_explain(
-    rows: list[Row], targets: list[Target], style: Style, build_info: dict[tuple[str, str], BuildInfo] | None = None
+    rows: list[Row], targets: list[Target], style: Style, build_info: dict[Release, BuildInfo] | None = None
 ) -> list[str]:
     multi_py = len({t.python for t in targets}) > 1
     out = []
     for r in rows:
         files = r.package.files or []
         info = build_info_for(r, build_info or {})
-        needs = describe(info) if info else None
+        sources = source_targets(r, targets)
+        needs = describe(info, sources) if info and sources else None
         for t in gap_targets(r, targets):
             cell, color = CELL[r.results[t]]
             head = f"{r.package.name} {r.package.version or '?'} on {t.label(multi_py)}:"
@@ -660,7 +663,7 @@ def report_json(
     explained: bool,
     pyodide_lock: PyodideLock | None = None,
     advisory: frozenset[Target] = frozenset(),
-    build_info: dict[tuple[str, str], BuildInfo] | None = None,
+    build_info: dict[Release, BuildInfo] | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     gaps = [r for r in rows if not r.ok]
@@ -685,8 +688,9 @@ def report_json(
             }
             # Same targets as `rejected`, minus any without a path (inputs with no dependency graph).
             out["via"] = {t.label(multi_py): r.via[t] for t in gap_targets(r, targets) if t in r.via}
-            info = build_info_for(r, build_info or {}) if source_build(r, targets) else None
-            out["build_requires"] = list(info.requires) if info else None
+            if build_info is not None:  # --build-info: what the sdist requires, on the targets that build it
+                info, sources = build_info_for(r, build_info), source_targets(r, targets)
+                out["build_requires"] = [shown(q) for q in requires_for(info, sources)] if info and sources else None
         return out
 
     report: dict[str, object] = {
@@ -880,7 +884,7 @@ def render_markdown(
     pyodide_lock: PyodideLock | None,
     source_allowed: bool = False,
     advisory: frozenset[Target] = frozenset(),
-    build_info: dict[tuple[str, str], BuildInfo] | None = None,
+    build_info: dict[Release, BuildInfo] | None = None,
 ) -> list[str]:
     """The same report as the text output, as GitHub-flavoured Markdown (for a job summary or a PR comment)."""
     plain = Style(False)
@@ -1372,11 +1376,17 @@ def main(argv: list[str] | None = None) -> int:
     # The run passes only because --fail-on missing accepts a source build on a required target.
     source_allowed = not failing and any(Status.SOURCE in required_statuses(r, advisory) for r in gaps)
 
-    build_info: dict[tuple[str, str], BuildInfo] = {}
-    if args.explain and not (args.no_build_info or offline or index_url is not None):
-        # What each explained `source` release needs to build, from its sdist. Nothing here changes the exit code,
-        # and a release whose sdist can't be read just gets no line. --index-url lookups have no JSON API to ask.
-        build_info = lookup_all([r.package for r in gaps if source_build(r, targets)], **cached)
+    build_info: dict[Release, BuildInfo] | None = None  # None: not asked for
+    if args.explain and (args.build_info or config.get("build-info", False)) and not offline:
+        # What each explained `source` release needs to build, from its sdist (only for releases positively from
+        # PyPI: see build.where). Nothing here changes the exit code, and a release whose sdist gives no answer just
+        # gets no line.
+        build_info, took = lookup_all([r.package for r in gaps if source_targets(r, targets)], **cached)
+        if took is not None and not quiet:
+            note = (
+                f"wheelgap: note: build info: stopped after {took:.0f} s; packages not read by then have no build line"
+            )
+            print(Style(use_color(args.color)).dim(note), file=sys.stderr)
 
     if args.junit is not None:  # an empty PATH (an unset CI variable) is an error, not "no report"
         try:

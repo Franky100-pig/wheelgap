@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import base64
 import gzip
+import hashlib
 import http.client
 import json
 import math
 import os
+import posixpath
 import tarfile
 import time
 import tomllib
 import urllib.error
 import urllib.request
+import zlib
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -114,69 +117,166 @@ def fetch_json(url: str, timeout: float = 20.0, attempts: int = 4) -> dict:
     return _request(req, timeout, attempts, json.load)
 
 
-# Caps on reading an sdist for --explain's build info: bytes downloaded, bytes of tar unpacked from them, and the
-# size of pyproject.toml itself. Past any of them the sdist gives no answer.
-SDIST_MAX_BYTES = 16 * 1024 * 1024
-SDIST_MAX_UNPACKED = 64 * 1024 * 1024
+# --explain --build-info reads sdists (see build.py). Past any of these caps an sdist gives no answer.
+SDIST_MAX_BYTES = 64 * 1024 * 1024  # downloaded (numpy's sdist is 19 MiB)
+SDIST_MAX_UNPACKED = 512 * 1024 * 1024  # of tar unpacked from them
+SDIST_MAX_HEADER = 1024 * 1024  # one pax or GNU long-name header, which tarfile reads whole into memory
 PYPROJECT_MAX_BYTES = 1024 * 1024
+_clock = time.monotonic  # deadlines are _clock() values; tests replace it
 
 
-class SdistTooBig(Exception):
-    """A streamed sdist went past a byte cap before its pyproject.toml turned up."""
+class SdistRefused(Exception):
+    """No answer from this sdist, now or on a later try: past a cap, unreadable, or pip could read another
+    pyproject.toml from it than wheelgap would (or would refuse to unpack it)."""
 
 
-class _Capped:
-    """A read-only stream over `read` that raises SdistTooBig once more than `cap` bytes have come through."""
+class SdistHashMismatch(Exception):
+    """The download isn't the file whose sha256 the lock or the index gave."""
 
-    def __init__(self, read: Callable[[int], bytes], cap: int):
-        self._read, self._left = read, cap
+
+class DeadlineExceeded(Exception):
+    """The time allowed for reading sdists ran out."""
+
+
+class _Limited:
+    """A read-only stream over `inner`, one network read at a time (read1, when it has one), so a slow server can't
+    hold a read past `deadline`. Raises SdistRefused past `cap` bytes; `digest` sees every byte."""
+
+    def __init__(self, inner, cap: int, deadline: float | None = None, digest=None):
+        self._read = getattr(inner, "read1", inner.read)
+        self._left, self._deadline, self._digest = cap, deadline, digest
 
     def read(self, n: int = -1) -> bytes:
-        want = self._left + 1 if n < 0 else min(n, self._left + 1)
-        data = self._read(want)
+        if self._deadline is not None and _clock() > self._deadline:
+            raise DeadlineExceeded
+        data = self._read(self._left + 1 if n < 0 else min(n, self._left + 1))
         if len(data) > self._left:
-            raise SdistTooBig
+            raise SdistRefused("too big")
         self._left -= len(data)
+        if self._digest is not None:
+            self._digest.update(data)
         return data
 
 
-def _top_level_pyproject(stream: _Capped) -> bytes | None:
-    """`<top>/pyproject.toml` from an uncompressed tar stream, or None if the first member by that name isn't a
-    regular file within PYPROJECT_MAX_BYTES (a link, a folder, a device...), or there is none."""
-    # typeshed's file protocols ask for seek() and more, which stream mode never calls.
-    with tarfile.open(fileobj=stream, mode="r|") as tar:  # type: ignore[call-overload]
-        for member in tar:
-            top, _, rest = member.name.partition("/")
-            if rest != "pyproject.toml" or top in ("", ".", ".."):
+class _TarInfo(tarfile.TarInfo):
+    """Refuses what tarfile would otherwise hold in memory whatever its size: a pax or GNU long-name header past
+    SDIST_MAX_HEADER, and the map of a sparse file (sdists have none)."""
+
+    def _proc_member(self, tar):
+        long_header = (tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK, tarfile.XHDTYPE, tarfile.XGLTYPE)
+        if self.type in (*long_header, tarfile.SOLARIS_XHDTYPE) and self.size > SDIST_MAX_HEADER:
+            raise SdistRefused("header too big")
+        if self.type == tarfile.GNUTYPE_SPARSE:
+            raise SdistRefused("sparse file")
+        return super()._proc_member(tar)  # type: ignore[misc]
+
+    def _proc_gnusparse_00(self, *args):  # pax sparse formats
+        raise SdistRefused("sparse file")
+
+    _proc_gnusparse_01 = _proc_gnusparse_10 = _proc_gnusparse_00
+
+
+def _escapes(member: tarfile.TarInfo, parts: list[str], top: str) -> bool:
+    """Whether a link points outside the unpacked sdist, which pip refuses (tarfile's data filter)."""
+    if member.issym():
+        if member.linkname.startswith("/"):
+            return True
+        target = posixpath.normpath(posixpath.join(posixpath.dirname("/".join(parts)) or ".", member.linkname))
+    else:  # a hard link names an archive member; pip strips the top folder from it as from names
+        lead, _, rest = member.linkname.lstrip("/").partition("/")
+        if lead != top or not rest:
+            return True
+        target = posixpath.normpath(rest)
+    return target == ".." or target.startswith("../")
+
+
+def _root_pyproject(stream: _Limited) -> bytes | None:
+    """The pyproject.toml pip finds at the root of the unpacked sdist, read from an uncompressed tar stream, or None.
+
+    pip's untar_file strips the one folder every member shares, and the last member for a path wins. Wherever pip
+    could end up with another file than this one, or would refuse the sdist, this raises SdistRefused: more than one
+    top folder, a name with `..` or a backslash, a link out of the sdist or one a later member is written through,
+    a device, or a pyproject.toml that isn't one plain file in lower case (macOS and Windows ignore case) with one
+    content. The whole tar is read, but only that file is kept.
+    """
+    top: str | None = None
+    links: set[str] = set()  # lower-cased paths of links seen so far
+    found: bytes | None = None
+    with tarfile.open(fileobj=stream, mode="r|", tarinfo=_TarInfo, encoding="utf-8") as tar:  # type: ignore[call-overload]
+        while (member := tar.next()) is not None:
+            tar.members.clear()  # stream mode keeps every header otherwise
+            if "\\" in member.name or "\\" in member.linkname:  # a separator on Windows only
+                raise SdistRefused("backslash in a name")
+            lead, _, rest = member.name.lstrip("/").partition("/")
+            if not lead or top not in (None, lead):
+                raise SdistRefused("not one top folder")
+            top = lead
+            parts = [p for p in rest.split("/") if p not in ("", ".")]
+            if ".." in parts:
+                raise SdistRefused("'..' in a name")
+            path = "/".join(parts).lower()
+            if any("/".join(parts[:i]).lower() in links for i in range(1, len(parts) + 1)):
+                raise SdistRefused("a member written through a link")
+            if member.issym() or member.islnk():
+                if not parts or _escapes(member, parts, lead):
+                    raise SdistRefused("a link out of the sdist")
+                links.add(path)
+            elif member.isdev():
+                raise SdistRefused("a device")
+            if path != "pyproject.toml":
                 continue
-            if member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE) or member.size > PYPROJECT_MAX_BYTES:
-                return None
+            if member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE) or parts != ["pyproject.toml"]:
+                raise SdistRefused("pyproject.toml isn't a plain file")
+            if member.size > PYPROJECT_MAX_BYTES:
+                raise SdistRefused("pyproject.toml too big")
             f = tar.extractfile(member)
-            return f.read(PYPROJECT_MAX_BYTES + 1) if f else None
-    return None
+            data = f.read() if f else b""
+            if found is not None and data != found:
+                raise SdistRefused("two different pyproject.toml")
+            found = data
+    return found
 
 
-def fetch_sdist_pyproject(url: str, timeout: float = 20.0, attempts: int = 4) -> dict | None:
-    """The parsed top-level pyproject.toml of the .tar.gz sdist at `url`, or None when it has none.
+def fetch_sdist_pyproject(
+    url: str, sha256: str | None = None, deadline: float | None = None, timeout: float = 10.0
+) -> dict | None:
+    """The parsed pyproject.toml at the root of the .tar.gz sdist at `url`, as pip would read it, or None if it has
+    none.
 
-    The sdist is streamed through tarfile and read only as far as that file: nothing is written to disk, and it
-    stops with SdistTooBig past SDIST_MAX_BYTES downloaded or SDIST_MAX_UNPACKED unpacked. The gzip layer is
-    unpacked here rather than by tarfile's r|gz, so the unpacked size can be capped too. Only https URLs are
-    fetched, with fetch_json's redirect rules, timeouts and retries. .zip sdists aren't read (ValueError): that
-    would need HTTP range requests. Anything that goes wrong raises; the caller treats it as "no answer".
+    The whole sdist is streamed in memory, never to disk, and checked against `sha256` when given. Raises
+    SdistRefused for an answer that won't change (see _root_pyproject, and the SDIST_MAX_* caps), SdistHashMismatch,
+    DeadlineExceeded past `deadline`, or the network error. One attempt only, with no retries, and https only, with
+    fetch_json's redirect rules. .zip sdists aren't read (ValueError).
     """
     parts = urlsplit(url)
     if parts.scheme != "https" or not parts.path.endswith(".tar.gz"):
         raise ValueError("only https:// .tar.gz sdists are read")
     req = urllib.request.Request(url, headers={"User-Agent": f"wheelgap/{__version__}"})
+    if deadline is not None:
+        timeout = max(0.1, min(timeout, deadline - _clock()))
 
     def read(resp) -> bytes | None:
-        packed = _Capped(resp.read, SDIST_MAX_BYTES)
-        with gzip.GzipFile(fileobj=packed, mode="rb") as unpacked:  # type: ignore[call-overload]
-            return _top_level_pyproject(_Capped(unpacked.read, SDIST_MAX_UNPACKED))
+        digest = hashlib.sha256()
+        packed = _Limited(resp, SDIST_MAX_BYTES, deadline, digest)
+        try:
+            with gzip.GzipFile(fileobj=packed, mode="rb") as unpacked:  # type: ignore[call-overload]
+                found = _root_pyproject(_Limited(unpacked, SDIST_MAX_UNPACKED, deadline))
+        except (tarfile.TarError, gzip.BadGzipFile, zlib.error) as e:
+            raise SdistRefused(f"not a .tar.gz ({type(e).__name__})") from None
+        if sha256 is not None:
+            while packed.read(1 << 16):  # the rest of the file, for the hash
+                pass
+            if digest.hexdigest() != sha256.lower():
+                raise SdistHashMismatch
+        return found
 
-    raw = _request(req, timeout, attempts, read)
-    return None if raw is None else tomllib.loads(raw.decode("utf-8"))
+    raw = _request(req, timeout, 1, read)
+    if raw is None:
+        return None
+    try:  # as pip reads it: UTF-8 text with universal newlines
+        return tomllib.loads(raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        raise SdistRefused(f"invalid pyproject.toml ({type(e).__name__})") from None
 
 
 SIMPLE_JSON = "application/vnd.pypi.simple.v1+json"
@@ -413,6 +513,7 @@ def fill(pkg: Package, python: str | None = None, read_cache: bool = False, writ
         else:
             names = [u["filename"] for u in urls if not u.get("yanked")]
         pkg.files = names
+        pkg.looked_up_on = base
         # Only a fresh answer that parsed and listed its files: a body with no "urls" ({}) reads as no files,
         # and caching that would turn a bad response into a day of false "missing" answers.
         if key and write_cache and cached is None and isinstance(data.get("urls"), list):

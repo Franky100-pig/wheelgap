@@ -77,10 +77,11 @@ def no_network(monkeypatch):
 
 
 class FakeFiles:
-    """Files served over fake HTTPS (see fake_files): .files maps a filename to its bytes, .calls lists URLs."""
+    """Files served over fake HTTPS (see fake_files): .files maps a filename to its bytes (or to an exception to raise,
+    or a function that returns the response), .calls lists URLs."""
 
     def __init__(self):
-        self.files: dict[str, bytes] = {}
+        self.files: dict[str, object] = {}
         self.calls: list[str] = []
 
 
@@ -100,7 +101,10 @@ def fake_files(monkeypatch):
         name = url.removeprefix("https://files.example/")
         if name not in served.files:
             raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
-        return io.BytesIO(served.files[name])
+        body = served.files[name]
+        if isinstance(body, BaseException):
+            raise body
+        return body() if callable(body) else io.BytesIO(body)  # type: ignore[arg-type]
 
     monkeypatch.setattr(pypi._OPENER, "open", open_)
     return served
@@ -119,7 +123,7 @@ def fake_pypi(monkeypatch):
 
     calls = []
 
-    def fetch_json(url, timeout=20.0):
+    def fetch_json(url, timeout=20.0, attempts=4):
         calls.append(url)
         # Served at whatever WHEELGAP_INDEX_URL points at, so tests can assert which index was asked.
         parts = url.removeprefix(pypi.index_url() + "/").removesuffix("/json").split("/")

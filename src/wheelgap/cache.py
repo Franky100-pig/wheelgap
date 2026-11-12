@@ -81,22 +81,36 @@ def save_files(index: str, name: str, version: str, files: list[dict]) -> None:
     _save(index, name, version, "", {"files": kept})
 
 
+_BUILD_FIELDS: dict[str, type | tuple[type, ...]] = {
+    "requires": list,
+    "backend": (str, type(None)),
+    "backend_path": bool,
+    "build_script": bool,
+}
+
+
 def load_build(index: str, name: str, version: str) -> dict | None:
-    """A release's cached build info, {"requires": [...] or None, "build_script": bool}, or None for a miss."""
+    """A release's cached build info: {"answer": None} when its sdist gives no answer, else {"answer": {"requires",
+    "backend", "backend_path", "build_script"}} (see build.py). None for a miss."""
     entry = _fresh(index, name, version, "build")
-    if entry is None:
+    if entry is None or "answer" not in entry:
         return None
-    requires, script = entry.get("requires"), entry.get("build_script")
-    if (requires is None or (isinstance(requires, list) and all(isinstance(r, str) for r in requires))) and (
-        isinstance(script, bool)
+    answer = entry["answer"]
+    if answer is None:
+        return {"answer": None}
+    if (
+        isinstance(answer, dict)
+        and set(answer) == set(_BUILD_FIELDS)
+        and all(isinstance(answer[k], t) for k, t in _BUILD_FIELDS.items())
+        and all(isinstance(r, str) for r in answer["requires"])
     ):
-        return {"requires": requires, "build_script": script}
+        return {"answer": answer}
     return None
 
 
-def save_build(index: str, name: str, version: str, requires: list[str] | None, build_script: bool) -> None:
-    """Store what a release's sdist says it needs to build (see build.py)."""
-    _save(index, name, version, "build", {"requires": requires, "build_script": build_script})
+def save_build(index: str, name: str, version: str, answer: dict | None) -> None:
+    """Store what a release's sdist says about its build, or None when it gives no answer for good."""
+    _save(index, name, version, "build", {"answer": answer})
 
 
 def _save(index: str, name: str, version: str, kind: str, data: dict) -> None:

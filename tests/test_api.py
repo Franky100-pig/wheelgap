@@ -366,7 +366,7 @@ def test_explain_matches_the_command_line(capsys, fake_pypi, fixtures):
         assert (data["rejected"], data["via"]) == (packages[r.name]["rejected"], packages[r.name]["via"])
         for t, text in r.reasons.items():
             block = out.split(f"{r.name} {r.version} on {t.label(True)}: ", 1)[1].split("\n\n", 1)[0]
-            lines = [line for line in block.split("\n")[1:] if not line.startswith("  via: ")]
+            lines = [line for line in block.split("\n")[1:] if not line.startswith(("  via: ", "  build needs: "))]
             # The command line lines the reasons up in a column; Result.reasons doesn't.
             assert [re.sub(r"^  (\S+\.whl) +", r"\1  ", line).removeprefix("  ") for line in lines] == text.split("\n")
 
