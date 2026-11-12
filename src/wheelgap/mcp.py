@@ -43,7 +43,7 @@ from packaging.version import InvalidVersion, Version
 
 from . import __version__, pypi
 from .api import Result, check_package, make_targets, running_python
-from .check import Status
+from .check import EXPLAIN_LIMIT, Status
 from .dockerfile import DockerfileError, read_dockerfile
 from .pyodide import PyodideLockError, load_pyodide_lock
 from .sources import SourceError
@@ -132,7 +132,9 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Check whether one PyPI package has a prebuilt wheel for each target platform and Python. Returns each "
             "target's status, the targets with a gap, ok (true only if every target installs without building) and "
-            "the libc and macOS versions assumed. " + _STATUS_HELP
+            "the libc and macOS versions assumed. With explain: true, also says why: rejected lists, for each "
+            f"source or missing target, up to {EXPLAIN_LIMIT} wheels it can't use and the reason for each, closest "
+            "misses first (rejected_omitted counts any more), as wheelgap --json --explain does. " + _STATUS_HELP
         ),
         "inputSchema": {
             "type": "object",
@@ -147,6 +149,11 @@ TOOLS: list[dict[str, Any]] = [
                 "targets": _TARGETS_PROP,
                 **_VERSION_PROPS,
                 "pyodide_lock": _PYODIDE_LOCK_PROP,
+                "explain": {
+                    "type": "boolean",
+                    "description": "Also return rejected (and via, always empty for one package): why each source "
+                    "or missing target can't use the published wheels. Default: false.",
+                },
             },
             "required": ["name"],
             "additionalProperties": False,
@@ -338,6 +345,9 @@ def _lock_spec(args: dict[str, Any]) -> str:
 
 def _check_package(args: dict[str, Any]) -> dict[str, Any]:
     _check_keys("check_package", args)
+    explain = args.get("explain", False)
+    if not isinstance(explain, bool):
+        raise ToolError("'explain' must be true or false")
     name = (_string(args, "name", required=True) or "").strip()
     if not _NAME_RE.fullmatch(name):
         raise ToolError(f"{name!r} isn't a package name: pass the name alone, and an exact version as 'version'")
@@ -363,7 +373,14 @@ def _check_package(args: dict[str, Any]) -> dict[str, Any]:
         result: Result = check_package(name, version, targets, pyodide_locks=locks)
     except PyodideLockError as e:  # a lock for a Python no pyodide target uses
         raise ToolError(str(e)) from e
-    out: dict[str, Any] = result.to_dict()
+    out: dict[str, Any] = result.to_dict(explain=explain)
+    if explain:  # as many wheels per cell as --explain's text shows, so a reply stays small
+        out["rejected_omitted"] = {
+            label: len(wheels) - EXPLAIN_LIMIT
+            for label, wheels in out["rejected"].items()
+            if len(wheels) > EXPLAIN_LIMIT
+        }
+        out["rejected"] = {label: wheels[:EXPLAIN_LIMIT] for label, wheels in out["rejected"].items()}
     out["ok"] = result.ok
     out["gaps"] = [t.label(True) for t in result.gaps]
     out["targets"] = [t.label(True) for t in targets]

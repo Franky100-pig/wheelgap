@@ -7,7 +7,7 @@ result = wheelgap.check_package("numpy", "2.3.4", targets=targets)
 result.ok                   # True if every target has a wheel
 result.statuses[targets[1]] # Status.WHEEL / SOURCE / MISSING / ...
 result.reasons[targets[1]]  # for a source or missing target: the wheels --explain lists and why they don't fit
-result.to_dict()            # JSON-friendly, keyed by "3.13 musl-aarch64"
+result.to_dict()            # JSON-friendly, keyed by "3.13 musl-aarch64"; explain=True adds rejected and via
 """
 
 from __future__ import annotations
@@ -16,9 +16,10 @@ import sys
 import sysconfig
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 
-from .check import Row, Status, check, explain_lines, status_for, wheel_tags
+from .check import Row, Status, check, explain, explain_lines, status_for, wheel_tags
 from .offline import require_offline
 from .pyodide import PyodideLock, bundled_version_differs, bundles, check_locks
 from .pypi import fill_all, recheck_lock
@@ -36,6 +37,7 @@ from .targets import (
 )
 
 _OK = (Status.WHEEL, Status.NOT_NEEDED, Status.BUNDLED)
+_EXPLAINED = (Status.SOURCE, Status.MISSING)  # the statuses --explain explains
 
 
 def running_python() -> str:
@@ -78,12 +80,12 @@ class Result:
     # pin or range asked for (it still counts as ok, as in the CLI).
     bundled_version: str | None = None
     bundled_version_differs: bool = False
-    # Per SOURCE or MISSING target, what --explain prints under it: each rejected wheel and why, one per line.
-    reasons: dict[Target, str] = field(default_factory=dict)
-    # check_lockfile() with a dependency graph (uv.lock, poetry.lock, ...): the path from a root down to this
-    # package, as --explain's "via" line shows it, e.g. ("app", "pandas", "numpy"). Taken from the first target
-    # with a gap (or, with none, the first that installs it); empty when unknown.
-    via: tuple[str, ...] = ()
+    # Per SOURCE or MISSING target, the dependency path from a root down to this package, as --explain shows it:
+    # ("app", "pandas", "numpy"), or ("(dev group)", "pytest") for a dependency group. Only check_lockfile() fills
+    # it, and only for inputs with a dependency graph (uv.lock, and poetry.lock before lock-version 2.1).
+    via: dict[Target, tuple[str, ...]] = field(default_factory=dict)
+    # Files of a pinned release that the index marks as yanked: pip skips them when the release has others it can use.
+    yanked: frozenset[str] = frozenset()
 
     @property
     def ok(self) -> bool:
@@ -102,7 +104,28 @@ class Result:
             for t in tags
         )
 
-    def to_dict(self) -> dict[str, object]:
+    @cached_property
+    def rejected(self) -> dict[Target, list[tuple[str, str]]]:
+        """Per SOURCE or MISSING target, (filename, reason) for every wheel it can't use, the closest misses first."""
+        files = list(self.files)
+        return {t: explain(files, t, self.yanked) for t, s in self.statuses.items() if s in _EXPLAINED}
+
+    @cached_property
+    def reasons(self) -> dict[Target, str]:
+        """Per SOURCE or MISSING target, the text --explain prints under it, one "file  reason" per line, unaligned
+        and with every rejected wheel (or "no wheels published for this version"), plus "there is an sdist, but
+        ... can't build packages from source" where that applies."""
+        files = list(self.files)
+        return {
+            t: "\n".join(explain_lines(files, t, yanked=self.yanked))
+            for t, s in self.statuses.items()
+            if s in _EXPLAINED
+        }
+
+    def to_dict(self, explain: bool = False) -> dict[str, object]:
+        """JSON-friendly, keyed by target label. explain=True adds "rejected" and "via" as `wheelgap --json --explain`
+        does: each SOURCE or MISSING target's rejected wheels as {"file", "reason"} objects, and its dependency path
+        where there is one."""
         out: dict[str, object] = {
             "name": self.name,
             "version": self.version,
@@ -112,8 +135,12 @@ class Result:
         if self.bundled_version is not None:  # the same keys as the CLI's --json
             out["bundled"] = self.bundled_version
             out["bundled_version_differs"] = self.bundled_version_differs
-        out["reasons"] = {t.label(True): text for t, text in self.reasons.items()}
-        out["via"] = list(self.via)
+        if explain:
+            out["rejected"] = {
+                t.label(True): [{"file": f, "reason": why} for f, why in rejected]
+                for t, rejected in self.rejected.items()
+            }
+            out["via"] = {t.label(True): list(path) for t, path in self.via.items()}
         return out
 
 
@@ -128,7 +155,6 @@ def _result(
         t: Status.BUNDLED if any(bundles(lock, pkg.key, t, s) for lock in applied) else s for t, s in statuses.items()
     }
     via = via or {}
-    gaps_first = [t for t, s in statuses.items() if s not in _OK] + list(statuses)
     return Result(
         pkg.name,
         pkg.version,
@@ -138,12 +164,8 @@ def _result(
         # Locks for different Pythons can ship different versions: report the first, and a difference in any.
         applied[0].packages[pkg.key] if applied else None,
         any(bundled_version_differs(pkg, lock) for lock in applied),
-        {
-            t: "\n".join(explain_lines(pkg.files or [], t))
-            for t, s in statuses.items()
-            if s in (Status.SOURCE, Status.MISSING)
-        },
-        tuple(next((via[t] for t in gaps_first if t in via), ())),
+        {t: tuple(via[t]) for t, s in statuses.items() if s in _EXPLAINED and t in via},
+        pkg.yanked,
     )
 
 
