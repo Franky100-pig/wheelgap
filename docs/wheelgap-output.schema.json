@@ -145,7 +145,7 @@
                 },
                 "via": {
                     "type": "object",
-                    "description": "Present with --explain: dependency path that installs the package, keyed by target label, for the same targets as rejected (uv.lock). Empty object when the input has no graph.",
+                    "description": "Present with --explain: dependency path that installs the package, keyed by target label, for the same targets as rejected (uv.lock, and poetry.lock before lock-version 2.1). Empty object when the input has no graph.",
                     "additionalProperties": {"type": "array", "items": {"type": "string"}}
                 },
                 "bundled": {
