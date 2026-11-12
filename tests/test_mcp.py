@@ -523,6 +523,52 @@ def test_main_flags(argv, code, capsys):
     assert mcp.main(argv) == code
 
 
+def test_wheelgap_mcp_subcommand_over_real_stdio(tmp_path):
+    import subprocess
+    import sys
+
+    messages = [
+        init(),
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    ]
+    proc = subprocess.run(
+        [sys.executable, "-m", "wheelgap", "mcp"],
+        input=b"".join(json.dumps(m).encode() + b"\n" for m in messages),
+        capture_output=True,
+        timeout=60,
+        check=True,
+        cwd=tmp_path,
+    )
+    replies = [json.loads(line) for line in proc.stdout.splitlines()]
+    assert [r["id"] for r in replies] == [0, 1]
+    assert replies[0]["result"]["serverInfo"] == {"name": "wheelgap", "version": __version__}
+    assert [t["name"] for t in replies[1]["result"]["tools"]] == [t["name"] for t in mcp.TOOLS]
+
+
+@pytest.mark.parametrize(("argv", "code"), [(["--version"], 0), (["-V"], 0), (["--help"], 0), (["--bogus"], 2)])
+def test_wheelgap_mcp_subcommand_flags(argv, code, capsys, tmp_path, monkeypatch):
+    from wheelgap.cli import main as cli_main
+
+    monkeypatch.chdir(tmp_path)
+    assert cli_main(["mcp", *argv]) == code
+    out, err = capsys.readouterr()
+    if argv[0] in ("--version", "-V"):
+        assert out == f"wheelgap-mcp {__version__}\n"
+    else:
+        assert err.startswith("usage: wheelgap mcp\n")
+
+
+def test_a_folder_named_mcp_is_still_an_input(fake_pypi, tmp_path, capsys, monkeypatch):
+    from wheelgap.cli import main as cli_main
+
+    (tmp_path / "mcp").mkdir()
+    (tmp_path / "mcp" / "requirements.txt").write_text("purewheel==3.1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    assert cli_main(["mcp", "-p", "3.13", "-t", "linux-x86_64"]) == 0  # the server would exit 2 on these arguments
+    assert "reading ./mcp as an input" in capsys.readouterr().err
+
+
 def with_token(message: dict, token: object) -> dict:
     message["params"]["_meta"] = {"progressToken": token}
     return message

@@ -17,7 +17,13 @@
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
-      }
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ]
     }
   ]
 }

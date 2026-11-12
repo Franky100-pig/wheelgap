@@ -834,15 +834,15 @@ def serve(stdin: BinaryIO, stdout: BinaryIO) -> None:
         server.close(wait=finished)  # on Ctrl-C, don't start the calls still queued
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, prog: str = "wheelgap-mcp") -> int:
     args = sys.argv[1:] if argv is None else argv
     if args in (["--version"], ["-V"]):
         print(f"wheelgap-mcp {__version__}")
         return 0
     if args:
         print(
-            "usage: wheelgap-mcp\n\nAn MCP server for wheelgap over stdio. Add it to your agent's MCP settings with "
-            "the command `uvx --from wheelgap wheelgap-mcp`.",
+            f"usage: {prog}\n\nAn MCP server for wheelgap over stdio. Add it to your agent's MCP settings with "
+            "the command `uvx --from wheelgap wheelgap-mcp` (or `uvx wheelgap mcp`).",
             file=sys.stderr,
         )
         return 0 if args in (["-h"], ["--help"]) else 2
