@@ -46,6 +46,8 @@ def test_rejection_reasons():
     )
     assert rejection("x-1-cp313-cp313-win_amd64.whl", target()) == "win_amd64 doesn't match linux-x86_64"
     assert rejection("x-1-py3-none-any.whl", target()) is None
+    for _ in range(2):  # the second time from the filename cache
+        assert rejection("bad.whl", target()) == "unparseable wheel filename"
 
 
 def test_explain_puts_closest_misses_first(fixtures):
@@ -54,6 +56,12 @@ def test_explain_puts_closest_misses_first(fixtures):
     got = [f for f, _ in explain(armlib.files, target(plat="musl-aarch64"))]
     assert got[0] == GLIBC_ARM  # same arch, wrong libc: the one a bug reporter cares about
     assert not any(f.endswith(".tar.gz") for f in got)
+    # A wheel name that doesn't parse sorts last, cold or from the filename cache.
+    for _ in range(2):
+        assert explain([*armlib.files, "bad.whl"], target(plat="musl-aarch64"))[-1] == (
+            "bad.whl",
+            "unparseable wheel filename",
+        )
 
 
 def test_cli_explain(capsys, fixtures):

@@ -6,7 +6,7 @@ targets = wheelgap.make_targets(python="3.13", platforms=["linux-aarch64", "musl
 result = wheelgap.check_package("numpy", "2.3.4", targets=targets)
 result.ok                   # True if every target has a wheel
 result.statuses[targets[1]] # Status.WHEEL / SOURCE / MISSING / ...
-result.reasons[targets[1]]  # for a source or missing target: the wheels --explain lists and why they don't fit
+result.reasons.get(targets[1])  # for a source or missing target: the wheels --explain lists and why they don't fit
 result.to_dict()            # JSON-friendly, keyed by "3.13 musl-aarch64"; explain=True adds rejected and via
 """
 

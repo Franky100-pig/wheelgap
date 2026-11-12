@@ -7,6 +7,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from functools import lru_cache
 
 from packaging.markers import InvalidMarker, Marker
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -88,16 +89,20 @@ class Row:
         return any(s is not Status.NOT_NEEDED for s in self.results.values())
 
 
+# A wheel's tags, or None if its filename doesn't parse. --explain asks again for every file on every target,
+# so parse each name once. lru_cache is thread-safe (also on free-threaded Python). The bound counts entries,
+# a few MB with realistic names (about 4 MB, keys included), and keeps a long-running process (wheelgap-mcp)
+# from growing without limit; one release's wheels fit many times over.
+@lru_cache(maxsize=16384)
+def _parsed_tags(filename: str) -> frozenset[Tag] | None:
+    try:
+        return parse_wheel_filename(filename)[3]
+    except InvalidWheelFilename:
+        return None
+
+
 def wheel_tags(files: list[str]) -> list[frozenset[Tag]]:
-    out = []
-    for f in files:
-        if not f.endswith(".whl"):
-            continue
-        try:
-            out.append(parse_wheel_filename(f)[3])
-        except InvalidWheelFilename:
-            continue
-    return out
+    return [tags for f in files if f.endswith(".whl") and (tags := _parsed_tags(f)) is not None]
 
 
 def has_sdist(files: list[str]) -> bool:
@@ -190,14 +195,13 @@ def _platform_reason(plat: str, target: Target) -> str:
 
 def rejection(filename: str, target: Target) -> str | None:
     """Why `target` can't install this wheel, or None if it can."""
-    try:
-        wheel = parse_wheel_filename(filename)[3]
-    except InvalidWheelFilename:
+    wheel = _parsed_tags(filename)
+    if wheel is None:
         return "unparseable wheel filename"
     if target.accepts(wheel):
         return None
     platforms = sorted({t.platform for t in wheel})
-    if "any" in platforms or set(platforms) & set(target.platform_tags()):
+    if "any" in platforms or not target.platform_tag_set.isdisjoint(platforms):
         if target.freethreaded:
             stable = [t for t in wheel if t.abi == "abi3t"]
             if stable:  # PEP 803: the free-threaded stable ABI, cpXY-abi3t works on CPython X.Y+ only
@@ -228,13 +232,12 @@ _OS_PREFIX: dict[str, tuple[str, ...]] = {
 
 def _closeness(filename: str, target: Target) -> tuple[int, int, str]:
     """Sort key: right platform first, then same arch, then same OS, then nearest Python version."""
-    try:
-        wheel = parse_wheel_filename(filename)[3]
-    except InvalidWheelFilename:
+    wheel = _parsed_tags(filename)
+    if wheel is None:
         return (3, 99, filename)
     platforms = {t.platform for t in wheel}
     family, arch = PLATFORMS[target.platform]
-    if "any" in platforms or platforms & set(target.platform_tags()):
+    if "any" in platforms or not target.platform_tag_set.isdisjoint(platforms):
         group = 0
     elif any(p.endswith(arch) or (p.endswith("universal2") and family == "macos") for p in platforms):
         group = 1
