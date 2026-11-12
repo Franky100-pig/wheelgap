@@ -49,12 +49,14 @@ def workflow_command(
 
 
 def _lines(path: Path) -> list[str] | None:
-    """The file's lines as GitHub numbers them (split on LF; CRLF is fine). None if it can't be read."""
+    """The file's lines as GitHub numbers them (split on LF; CRLF is fine). None if it can't be read, or has a CR
+    on its own, which the parsers (reading with universal newlines) would count as a line break and GitHub may not."""
     try:
         text = path.read_bytes().decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return None
-    return [line.removesuffix("\r") for line in text.split("\n")]
+    lines = [line.removesuffix("\r") for line in text.split("\n")]
+    return None if any("\r" in line for line in lines) else lines
 
 
 _STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"', re.DOTALL)
@@ -69,7 +71,8 @@ def toml_lines(path: Path, table: str) -> dict[tuple[str, str | None], list[int]
     blocks found must match the parsed array one for one, name for name, or no lines are returned at all.
     """
     lines = _lines(path)
-    if lines is None:
+    # A multi-line string can hold text that looks like a header or a name line, so don't try.
+    if lines is None or any('"""' in line or "'''" in line for line in lines):
         return {}
     try:
         entries = tomllib.loads("\n".join(lines)).get(table)
@@ -166,9 +169,13 @@ def pipfile_lines(path: Path) -> dict[tuple[str, str | None], list[int]]:
 _OTHER_BREAKS = re.compile("[\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
 
 
-def requirement_lines(path: Path, seen: set[Path] | None = None) -> list[tuple[Package, Path, int]] | None:
-    """Each requirement line of a requirements file and the files it includes with -r, as the parser reads them:
-    the package, the file and the line it starts on. None if a file can't be read the same way."""
+_NAME_START_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def requirement_lines(path: Path, seen: set[Path] | None = None) -> list[tuple[Package, Path, int | None]] | None:
+    """Each requirement of a requirements file and the files it includes with -r, as the parser reads them: the
+    package, the file and the line its name is on (None if that isn't clear). None if a file can't be read the
+    same way."""
     seen = set() if seen is None else seen
     path = path.resolve()
     if path in seen:
@@ -177,13 +184,14 @@ def requirement_lines(path: Path, seen: set[Path] | None = None) -> list[tuple[P
     lines = _lines(path)
     if lines is None or any(_OTHER_BREAKS.search(line) for line in lines):
         return None
-    out: list[tuple[Package, Path, int]] = []
+    out: list[tuple[Package, Path, int | None]] = []
     number = 0
     while number < len(lines):
-        start = number
+        group = [number]  # the physical lines of this logical line
         raw = lines[number]
         while raw.endswith("\\") and number + 1 < len(lines):  # the parser joins "\\\n" continuations
             number += 1
+            group.append(number)
             raw = raw[:-1] + " " + lines[number]
         number += 1
         line = _COMMENT_RE.split(raw, 1)[0].strip()
@@ -208,7 +216,12 @@ def requirement_lines(path: Path, seen: set[Path] | None = None) -> list[tuple[P
         except SourceError:
             continue
         if not package.skip:
-            out.append((package, path, start + 1))
+            # The first physical line with anything on it, if it starts with the package's name.
+            texts = [lines[i][:-1] if i != group[-1] else lines[i] for i in group]
+            first = next((i for i, text in zip(group, texts, strict=True) if text.strip()), None)
+            name = _NAME_START_RE.match(lines[first].strip()) if first is not None else None
+            found = first + 1 if first is not None and name and canonicalize_name(name.group()) == package.key else None
+            out.append((package, path, found))
     return out
 
 
@@ -226,7 +239,7 @@ class Locator:
         if id(source) not in self.found:
             self.found[id(source)] = self._read(source, source.path)
         found = self.found[id(source)]
-        if source.requirements:
+        if source.kind == "requirements":
             # The package came from a line with its name and markers (constraints change only the version). If
             # there are two such lines, it could be either, so neither is used.
             matches = [(f, n) for p, f, n in found.get(package.key, []) if p.markers == package.markers]
@@ -234,41 +247,30 @@ class Locator:
         numbers = found.get((package.key, package.version), [])
         # pdm.lock and Pipfile.lock keep the first entry of a name and version (sources._add_once); the other
         # lockfiles keep each entry, so two entries of one name and version could be either.
-        if len(numbers) == 1 or (numbers and lockfile_kind(source, source.path) in ("pdm", "pipfile")):
+        if len(numbers) == 1 or (numbers and source.kind in ("pdm", "pipfile")):
             return source.path, numbers[0]
         return source.path, None
 
     @staticmethod
     def _read(source: Source, path: Path) -> dict:
-        kind = lockfile_kind(source, path)
-        if kind == "requirements":
-            by_name: dict[str, list[tuple[Package, Path, int]]] = {}
-            for package, file, number in requirement_lines(path) or []:
+        if source.kind == "requirements":
+            scanned = requirement_lines(path)
+            # The scan must find the same requirements as the parser, in the same order, or no line is trusted.
+            if scanned is None or [(p.key, p.markers) for p, _, _ in scanned] != [
+                (p.key, p.markers) for p in source.packages if not p.skip
+            ]:
+                return {}
+            by_name: dict[str, list[tuple[Package, Path, int | None]]] = {}
+            for package, file, number in scanned:
                 by_name.setdefault(package.key, []).append((package, file, number))
             return by_name
-        if kind == "pipfile":
+        if source.kind == "pipfile":
             return pipfile_lines(path)
-        if kind == "pylock":
+        if source.kind == "pylock":
             return toml_lines(path, "packages")
-        if kind is not None:
+        if source.kind in ("uv", "poetry", "pdm"):
             return toml_lines(path, "package")
         return {}  # pyproject.toml: the file, but no line
-
-
-def lockfile_kind(source: Source, path: Path) -> str | None:
-    """Which reader parsed the file (see sources.load_file), or None for pyproject.toml."""
-    name = path.name
-    if source.requirements:
-        return "requirements"
-    if source.pyproject_extras is not None:
-        return None
-    if name in ("Pipfile.lock", "pdm.lock", "poetry.lock"):
-        return {"Pipfile.lock": "pipfile", "pdm.lock": "pdm", "poetry.lock": "poetry"}[name]
-    if source.uv_packages is not None:
-        return "uv"
-    if name.startswith("pylock.") and name.endswith(".toml"):
-        return "pylock"
-    return None
 
 
 def relative_path(path: Path) -> str | None:
@@ -324,6 +326,6 @@ def github_annotations(rows: list[Row], targets: list[Target], sources: list[Sou
         shown = chosen if len(chosen) <= ANNOTATION_LIMIT else chosen[: ANNOTATION_LIMIT - 1]
         out += [annotation(r, targets, level, locator) for r in shown]
         if more := len(chosen) - len(shown):
-            what = f"{more} more package{'s' * (more != 1)} with gaps"
+            what = f"{more} more packages with gaps"  # never 1: a single extra would fit in the limit
             out.append(workflow_command(level, f"{what}; the log lists them all.", title=f"wheelgap: {what}"))
     return out

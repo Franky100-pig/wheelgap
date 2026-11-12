@@ -2534,10 +2534,11 @@ def uv_lock(packages: list[tuple[str, str]], extra: str = "") -> str:
     return text
 
 
+@pytest.mark.parametrize("count", [10, 11, 12])
 @pytest.mark.parametrize("fail_on,level", [("source", "error"), ("missing", "warning")])
-def test_github_annotations_cap(capsys, fake_pypi, tmp_path, monkeypatch, fail_on, level):
-    # GitHub shows 10 errors and 10 warnings per step, so the 10th says how many more there are.
-    names = [f"pkg{i:02}" for i in range(12)]
+def test_github_annotations_cap(capsys, fake_pypi, tmp_path, monkeypatch, fail_on, level, count):
+    # GitHub shows 10 errors and 10 warnings per step: 10 packages fit, and past that the 10th says how many more.
+    names = [f"pkg{i:02}" for i in range(count)]
     (tmp_path / "uv.lock").write_text(uv_lock([(name, "1.0") for name in names]), encoding="utf-8")
     monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
     code, out, _ = run(
@@ -2546,11 +2547,15 @@ def test_github_annotations_cap(capsys, fake_pypi, tmp_path, monkeypatch, fail_o
     assert code == (1 if fail_on == "source" else 0)
     lines = annotation_lines(out)
     assert len(lines) == 10
-    assert all(line.startswith(f"::{level} file=uv.lock,line=") for line in lines[:9])
-    assert [line.split("title=")[1].split("%3A")[0] for line in lines[:9]] == [f"{n} 1.0" for n in names[:9]]
-    assert lines[9] == (
-        f"::{level} title=wheelgap%3A 3 more packages with gaps::3 more packages with gaps; the log lists them all."
-    )
+    shown = 10 if count == 10 else 9
+    assert all(line.startswith(f"::{level} file=uv.lock,line=") for line in lines[:shown])
+    assert [line.split("title=")[1].split("%3A")[0] for line in lines[:shown]] == [f"{n} 1.0" for n in names[:shown]]
+    if count > 10:
+        more = count - 9
+        assert lines[9] == (
+            f"::{level} title=wheelgap%3A {more} more packages with gaps::"
+            f"{more} more packages with gaps; the log lists them all."
+        )
     if level == "warning":
         assert lines[0].endswith("Source builds are allowed (fail-on missing), so this doesn't fail the run.")
 
@@ -2663,3 +2668,220 @@ def test_github_annotations_pipfile_lock_entry_the_parser_kept(capsys, fake_pypi
     monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
     _, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--github-annotations")
     assert [line.split(",title=")[0] for line in annotation_lines(out)] == ["::error file=Pipfile.lock,line=4"]
+
+
+UV_ROOT = (
+    'version = 1\nrequires-python = ">=3.12"\n\n[[package]]\nname = "demo"\nversion = "0.1.0"\n'
+    'source = { editable = "." }\n'
+)
+
+
+def sdist_block(name, version="1.0", header="[[package]]"):
+    return (
+        f'\n{header}\nname = "{name}"\nversion = "{version}"\nsource = {{ registry = "https://pypi.org/simple" }}\n'
+        f'sdist = {{ url = "https://files.example/{name}-{version}.tar.gz", hash = "sha256:00" }}\n'
+    )
+
+
+def annotate(capsys, tmp_path, *argv, targets="linux-x86_64"):
+    """Run with --github-annotations from tmp_path as the workspace; the annotation lines up to their title."""
+    code, out, _ = run(capsys, *argv, "-p", "3.13", "-t", targets, "--github-annotations")
+    return [line.split("title=")[0] for line in annotation_lines(out)]
+
+
+@pytest.mark.parametrize(
+    "lock",
+    [
+        # A name line inside a multi-line string, before the block's real one.
+        UV_ROOT
+        + 'dependencies = [{ name = "a" }]\n\n[[package]]\nsummary = """\nname = "a"\n"""\n'
+        + sdist_block("a").removeprefix("\n[[package]]\n"),
+        # A [[package]] inside a string, balanced by a real header the scan doesn't read ([["package"]]).
+        UV_ROOT
+        + 'dependencies = [{ name = "a" }]\n'
+        + sdist_block("b")
+        + "notes = '''\n[[package]]\nname = \"a\"\n'''\n"
+        + sdist_block("a", header='[["package"]]'),
+    ],
+)
+def test_github_annotations_multiline_strings_give_no_line(capsys, fake_pypi, tmp_path, monkeypatch, lock):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    assert annotate(capsys, tmp_path, str(tmp_path)) == ["::error file=uv.lock,"]
+
+
+def test_github_annotations_toml_names_are_cross_checked(capsys, fake_pypi, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    # The block's name is a quoted key the scan doesn't read; the wheel table's `name` after it isn't the block's.
+    lock = (
+        UV_ROOT
+        + 'dependencies = [{ name = "a" }]\n\n[[package]]\n"name" = "a"\nversion = "1.0"\n'
+        + 'source = { registry = "https://pypi.org/simple" }\n'
+        + 'sdist = { url = "https://files.example/a-1.0.tar.gz", hash = "sha256:00" }\n\n'
+        + '[[package.wheels]]\nname = "a"\nurl = "https://files.example/a-1.0-py3-none-win_amd64.whl"\n'
+    )
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    assert annotate(capsys, tmp_path, str(tmp_path)) == ["::error file=uv.lock,"]
+
+    # When the scan's names don't match the parsed array, name for name, no line in the file is used.
+    from wheelgap import github
+
+    (tmp_path / "uv.lock").write_text(UV_ROOT + sdist_block("a") + sdist_block("b"), encoding="utf-8")
+    assert github.toml_lines(tmp_path / "uv.lock", "package") == {
+        ("demo", "0.1.0"): [5],
+        ("a", "1.0"): [10],
+        ("b", "1.0"): [16],
+    }
+    real = github.tomllib.loads
+    monkeypatch.setattr(github.tomllib, "loads", lambda text: {"package": real(text)["package"][::-1]})
+    assert github.toml_lines(tmp_path / "uv.lock", "package") == {}
+
+
+def test_github_annotations_versions_of_one_name(capsys, fake_pypi, tmp_path, monkeypatch):
+    # A forked uv.lock with two versions of a name: each on its own line.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    lock = (
+        UV_ROOT
+        + "dependencies = [\n"
+        + '    { name = "a", version = "1.0", source = { registry = "https://pypi.org/simple" }, '
+        + "marker = \"sys_platform == 'linux'\" },\n"
+        + '    { name = "a", version = "2.0", source = { registry = "https://pypi.org/simple" }, '
+        + "marker = \"sys_platform == 'win32'\" },\n]\n"
+        + sdist_block("a", "1.0")
+        + sdist_block("a", "2.0")
+    )
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    assert annotate(capsys, tmp_path, str(tmp_path), targets="linux-x86_64,win-amd64") == [
+        "::error file=uv.lock,line=14,",
+        "::error file=uv.lock,line=20,",
+    ]
+
+
+def test_github_annotations_pdm_lock_first_entry(capsys, fake_pypi, tmp_path, monkeypatch):
+    # PDM writes one entry per extras variant; the parser keeps the first, so that's the line.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    entry = (
+        '\n[[package]]\nname = "a"\nversion = "1.0"\n{extras}groups = ["default"]\n'
+        'files = [{{file = "a-1.0.tar.gz", hash = "sha256:00"}}]\n'
+    )
+    (tmp_path / "pdm.lock").write_text(
+        '[metadata]\ngroups = ["default"]\nstrategy = ["inherit_metadata"]\n'
+        + entry.format(extras="")
+        + entry.format(extras='extras = ["x"]\n'),
+        encoding="utf-8",
+    )
+    assert annotate(capsys, tmp_path, str(tmp_path)) == ["::error file=pdm.lock,line=6,"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"default": {"nowheels": {"version": "==0.9"}, "nowheels": {"version": "==0.9"}}}',  # a duplicate key
+        '{"default": {"nowheels": {"version": "==0.9"}},\n "default": {"nowheels": {"version": "==0.9"}}}',
+        '{"_meta": {},\r"default": {\n"nowheels": {"version": "==0.9"}}}',  # a CR on its own
+    ],
+)
+def test_github_annotations_pipfile_lock_without_a_line(capsys, fake_pypi, tmp_path, monkeypatch, text):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    (tmp_path / "Pipfile.lock").write_bytes(text.encode())
+    assert annotate(capsys, tmp_path, str(tmp_path)) == ["::error file=Pipfile.lock,"]
+
+
+def test_github_annotations_crlf(capsys, fake_pypi, tmp_path, monkeypatch):
+    # GitHub counts lines as LF does, CRLF included.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    (tmp_path / "uv.lock").write_bytes(uv_lock([("a", "1.0")]).replace("\n", "\r\n").encode())
+    assert annotate(capsys, tmp_path, str(tmp_path)) == ["::error file=uv.lock,line=13,"]
+    (tmp_path / "requirements.txt").write_bytes(
+        b"# a comment\r\npurewheel==3.1\r\nnowheels==0.9 \\\r\n    --hash=sha256:00\r\n"
+    )
+    assert annotate(capsys, tmp_path, str(tmp_path / "requirements.txt")) == ["::error file=requirements.txt,line=3,"]
+
+
+@pytest.mark.parametrize("brk", ["\x0c", "\x85", " "])
+def test_github_annotations_requirements_other_line_breaks(capsys, fake_pypi, tmp_path, monkeypatch, brk):
+    # The parser splits lines on these too (str.splitlines), and GitHub doesn't: no line is safe.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    (tmp_path / "requirements.txt").write_text(f"purewheel==3.1{brk}\nnowheels==0.9\n", encoding="utf-8")
+    assert annotate(capsys, tmp_path, str(tmp_path / "requirements.txt")) == ["::error file=requirements.txt,"]
+
+
+def test_github_annotations_requirements_lines(capsys, fake_pypi, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    req = tmp_path / "requirements.txt"
+    # Options, editables, paths and URLs aren't requirements with a line; an include cycle is read once.
+    req.write_text(
+        "--index-url https://pypi.org/simple\n-e ./editable\n./local\n"
+        "git+https://example.invalid/x.git#egg=gitpkg\nnamed @ https://example.invalid/named-1.0.tar.gz\n"
+        "-r other.txt\nnowheels==0.9\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "other.txt").write_text("-r requirements.txt\npurewheel==3.1\n", encoding="utf-8")
+    assert annotate(capsys, tmp_path, str(req)) == ["::error file=requirements.txt,line=7,"]
+    # A continued requirement is on the first line with something on it.
+    req.write_text("purewheel==3.1\n\\\n\\\nnowheels==0.9\n", encoding="utf-8")
+    assert annotate(capsys, tmp_path, str(req)) == ["::error file=requirements.txt,line=4,"]
+
+
+def test_github_annotations_requirements_cross_check(capsys, fake_pypi, tmp_path, monkeypatch):
+    # The file is read twice; if the scan doesn't find what the parser read (here the file changed in between, so
+    # every line moved down), no line is used.
+    from wheelgap import github
+
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    req = tmp_path / "requirements.txt"
+    req.write_text("nowheels==0.9\n", encoding="utf-8")
+    scan = github.requirement_lines
+
+    def changed(path, seen=None):
+        req.write_text("purewheel==3.1\nnowheels==0.9\n", encoding="utf-8")
+        return scan(path, seen)
+
+    monkeypatch.setattr(github, "requirement_lines", changed)
+    assert annotate(capsys, tmp_path, str(req)) == ["::error file=requirements.txt,"]
+    # An include the scan can't read gives no lines at all.
+    req.write_text("-r gone.txt\n", encoding="utf-8")
+    assert scan(req) is None
+
+
+def test_github_annotations_messages(capsys, fake_pypi, fixtures, tmp_path, monkeypatch):
+    # A file outside the workspace loses its line too; several Pythons label targets with the Python.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    code, out, _ = run(
+        capsys, str(fixtures / "uvproj"), "-p", "3.13", "-p", "3.14", "-t", "linux-aarch64", "--github-annotations"
+    )
+    assert annotation_lines(out)[0] == (
+        "::error title=fastlib 2.0.0%3A builds from source::fastlib 2.0.0 builds from source on "
+        f"3.13 linux-aarch64, 3.14 linux-aarch64. (in {fixtures / 'uvproj' / 'uv.lock'})"
+    )
+    # A lookup error is quoted, and the title names the worst status of several.
+    (tmp_path / "requirements.txt").write_text("nowheels==0.9\nnotreal==1.0\n", encoding="utf-8")
+    code, out, _ = run(
+        capsys, str(tmp_path / "requirements.txt"), "-p", "3.13", "-t", "linux-x86_64,ios-arm64", "--github-annotations"
+    )
+    assert annotation_lines(out) == [
+        "::error file=requirements.txt,line=2,title=notreal 1.0%3A couldn't be checked::"
+        "notreal 1.0 couldn't be checked on linux-x86_64, ios-arm64. Lookup error: not on index.",
+        "::error file=requirements.txt,line=1,title=nowheels 0.9%3A can't install::"
+        "nowheels 0.9 can't install on ios-arm64; builds from source on linux-x86_64.",
+    ]
+
+
+def test_github_annotations_partial_ignore(capsys, fake_pypi, fixtures, monkeypatch):
+    # An ignored target leaves the package's other gaps annotated, without the ignored target.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(fixtures))
+    code, out, _ = run(
+        capsys,
+        str(fixtures / "uvproj"),
+        "-p",
+        "3.13",
+        "-t",
+        "linux-aarch64,win-arm64",
+        "--github-annotations",
+        "--ignore",
+        "fastlib:win-arm64",
+    )
+    assert annotation_lines(out)[0] == (
+        "::error file=uvproj/uv.lock,line=23,title=fastlib 2.0.0%3A builds from source::"
+        "fastlib 2.0.0 builds from source on linux-aarch64."
+    )
