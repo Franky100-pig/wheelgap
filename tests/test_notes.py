@@ -8,8 +8,11 @@ import urllib.error
 
 import pytest
 
-from wheelgap import notes
-from wheelgap.cli import main
+from wheelgap import cache, notes
+from wheelgap.check import Row, Status
+from wheelgap.cli import Style, main, render_explain
+from wheelgap.sources import Package
+from wheelgap.targets import build_targets
 
 PYPI = "https://pypi.org/simple"
 NOTE = {
@@ -21,6 +24,7 @@ NOTE = {
     "updated": "2026-11-11",
 }
 HEAD = "pkg 1.0: note from the wheelgap tracker for"
+CHECKED = "(alternative, checked 2026-11-11)"
 
 
 def note(**changes) -> dict:
@@ -58,7 +62,7 @@ def test_note_shown_for_a_matching_target_and_not_another(capsys, tmp_path, trac
     assert code == 1 and not err
     # Under the explanation, once per package, with the gap targets it covers, its text as is, and its links.
     assert out.index("pkg 1.0 on win-amd64:") < out.index(HEAD)
-    assert f"{HEAD} linux-x86_64 (alternative)\n  - {NOTE['text']}\n    https://example.org/pkg#install\n" in out
+    assert f"{HEAD} linux-x86_64 {CHECKED}\n  - {NOTE['text']}\n    https://example.org/pkg#install\n" in out
     assert out.count(NOTE["text"]) == 1
     assert "Only about macOS." not in out
     assert tracker.calls == [f"{notes.TRACKER}/pkg.json"]
@@ -78,7 +82,7 @@ def test_all_platforms_note(capsys, tmp_path, tracker):
     tracker.add("pkg", note(platforms=["all"]))
     folder = uv_lock(tmp_path)
     code, out, _ = run(capsys, folder, "-p", "3.13,3.14t", "-t", "linux-x86_64,win-amd64", "--explain", "--notes")
-    assert f"{HEAD} linux-x86_64, win-amd64 (alternative)" in out
+    assert f"{HEAD} linux-x86_64, win-amd64 {CHECKED}" in out
     pkg = explain_json(capsys, folder, "-p", "3.13,3.14t", "-t", "linux-x86_64,win-amd64")["pkg"]
     assert pkg["notes"][0]["targets"] == [
         "3.13 linux-x86_64",
@@ -101,6 +105,8 @@ def test_all_platforms_note(capsys, tmp_path, tracker):
         ("1.0.post1", ">=1", False),
         ("1.0+local", ">=1", False),
         ("1.0", "not a specifier", False),
+        ("1.0.dev1", ">=0", False),
+        ("1!1.0", ">=1", False),
     ],
 )
 def test_versions(capsys, tmp_path, tracker, checked, versions, shown):
@@ -195,7 +201,6 @@ def test_nothing_fetched_for_a_pdm_entry_wheelgap_looked_up(capsys, tmp_path, tr
         ["--explain", "--notes", "--no-notes"],
         ["--explain", "--notes", "--offline"],
         ["--explain", "--notes", "--index-url", "https://private.example/simple"],
-        ["--notes"],  # no --explain
     ],
 )
 def test_nothing_fetched_with(capsys, tmp_path, tracker, flags):
@@ -249,6 +254,35 @@ def test_failed_lookup_prints_nothing_extra(capsys, tmp_path, tracker, respond):
         {"updated": "yesterday"},
         {"versions": 3},
         {"extra": "key"},
+        # As strict as the published format and the tracker's checker.
+        {"kind": "tip"},
+        {"updated": "2026-02-30"},
+        {"updated": 20261111},
+        {"platforms": ["linux-x86_64", "linux-x86_64"]},
+        {"platforms": ["ios-arm64"]},  # a wheelgap target the tracker doesn't scan
+        {"platforms": []},
+        {"versions": "~=1.0"},
+        {"versions": "===1.0"},
+        {"versions": "==1!1.0"},
+        {"versions": ">=1.0rc1"},
+        {"versions": "<1.0.post1"},
+        {"versions": "<1.0.dev0"},
+        {"versions": "==1.0+local"},
+        {"versions": ">=1.*"},  # .* only after == or !=
+        {"versions": ""},
+        {"links": [f"https://example.org/{i}" for i in range(6)]},
+        {"links": ["https://example.org/" + "x" * 281]},  # 301 characters
+        {"links": ["https://example.org/a", "https://example.org/a"]},
+        {"links": ["https:///no-host"]},
+        {"links": ["https://"]},
+        # GitHub Actions workflow commands, legacy (##[ anywhere) and v2 (:: starting a word).
+        {"text": "x ##[set-output name=ok;]true"},
+        {"text": "##[add-mask]secret"},
+        {"text": "see ##[error]this"},
+        {"links": ["https://example.org/##[warning]hi"]},
+        {"text": "::warning::pwned"},
+        {"text": "then ::error file=a::pwn"},
+        {"text": "(::stop-commands::x)"},
     ],
 )
 def test_malformed_note_is_dropped(capsys, tmp_path, tracker, bad):
@@ -294,23 +328,66 @@ def test_one_short_attempt_per_request(capsys, tmp_path, tracker):
     assert all(attempts == 1 and timeout <= 10 for timeout, attempts in tracker.options)
 
 
-def _fail(name):
-    raise urllib.error.URLError("connection refused")
+def _refused(name):
+    raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
 
 
-CUT = "wheelgap: note: couldn't reach wheelgap.github.io in time"
+UNREACHABLE = "wheelgap: note: couldn't reach wheelgap.github.io, so some of the tracker's notes may be missing"
+TIMED_OUT = "wheelgap: note: wheelgap.github.io didn't answer in time, so some of the tracker's notes may be missing"
+
+
+@pytest.mark.parametrize(
+    "error,message",
+    [
+        (urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")), UNREACHABLE),
+        (urllib.error.URLError(OSError(8, "nodename nor servname provided")), UNREACHABLE),  # DNS
+        (urllib.error.URLError(OSError("CERTIFICATE_VERIFY_FAILED")), UNREACHABLE),  # TLS
+        (urllib.error.URLError(TimeoutError("timed out")), TIMED_OUT),
+        (TimeoutError("timed out"), TIMED_OUT),
+    ],
+)
+def test_connection_failure_wording(capsys, tmp_path, tracker, error, message):
+    def fail(name):
+        raise error
+
+    tracker.respond = fail
+    code, out, err = run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
+    assert code == 1 and err == message + "\n"
 
 
 def test_stops_after_the_first_connection_failure(capsys, tmp_path, tracker, monkeypatch):
     monkeypatch.setattr(notes, "WORKERS", 1)
-    tracker.respond = _fail
+    tracker.respond = _refused
     folder = uv_lock(tmp_path, ("a", "1.0", PYPI), ("b", "1.0", PYPI), ("c", "1.0", PYPI))
     code, out, err = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
     assert code == 1 and len(tracker.calls) == 1
-    assert err.count(CUT) == 1 and len(err.splitlines()) == 1
+    assert err == UNREACHABLE + "\n"
     tracker.calls.clear()
     code, out, err = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes", "--json", "-q")
     assert code == 1 and json.loads(out) and err == ""  # -q drops the note
+
+
+def test_connection_failure_doesnt_wait_for_the_other_lookups(capsys, tmp_path, tracker, monkeypatch):
+    """More names than workers: the first failure ends the phase at once, without waiting for requests in flight."""
+    monkeypatch.setattr(notes, "WORKERS", 2)
+    release = threading.Event()
+
+    def respond(name):
+        if name == "a":
+            _refused(name)
+        release.wait(10)
+        return {"schema": 1, "name": name, "notes": [NOTE]}
+
+    tracker.respond = respond
+    folder = uv_lock(tmp_path, *[(n, "1.0", PYPI) for n in "abcdef"])
+    try:
+        start = time.monotonic()
+        code, out, err = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
+        assert time.monotonic() - start < 3
+        assert code == 1 and err == UNREACHABLE + "\n" and "note from the wheelgap tracker" not in out
+        assert f"{notes.TRACKER}/a.json" in tracker.calls and len(tracker.calls) <= 2
+    finally:
+        release.set()
 
 
 def test_deadline_for_all_lookups(capsys, tmp_path, tracker, monkeypatch):
@@ -321,7 +398,7 @@ def test_deadline_for_all_lookups(capsys, tmp_path, tracker, monkeypatch):
         start = time.monotonic()
         code, out, err = run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
         assert time.monotonic() - start < 5
-        assert code == 1 and HEAD not in out and CUT in err
+        assert code == 1 and HEAD not in out and err == TIMED_OUT + "\n"
     finally:
         release.set()
 
@@ -398,3 +475,299 @@ def test_notes_in_config_must_be_a_boolean(capsys, tmp_path):
     (tmp_path / "pyproject.toml").write_text('[tool.wheelgap]\nnotes = "yes"\n', encoding="utf-8")
     code, _, err = run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
     assert code == 2 and "notes must be a boolean" in err
+
+
+def test_a_note_may_mention_a_cpp_scope(capsys, tmp_path, tracker):
+    tracker.add("pkg", note(text="Needs `std::vector` from a C++17 compiler."))
+    pkg = explain_json(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64")["pkg"]
+    assert [n["text"] for n in pkg["notes"]] == ["Needs `std::vector` from a C++17 compiler."]
+
+
+def test_note_text_never_starts_a_line():
+    """Even a note that got past tracker.parse with a leading "::" can't be a workflow command: the runner only reads
+    "::" as the first text on a line, and the text follows "  - "."""
+    (target,) = build_targets(["3.13"], ["linux-x86_64"])
+    row = Row(Package("pkg", "1.0", files=["pkg-1.0.tar.gz"]), {target: Status.SOURCE})
+    rows = [row]
+    sneaky = notes.Note(("linux-x86_64",), "alternative", "::warning::x", ("https://example.org/",), None, "2026-11-11")
+    lines = render_explain(rows, [target], Style(False), {id(row): [(sneaky, [target])]})
+    assert "  - ::warning::x" in lines
+    assert not any(line.lstrip().startswith("::") for line in lines)
+
+
+@pytest.mark.parametrize("schema", [True, 1.0, "1", 2])
+def test_schema_must_be_the_integer_1(capsys, tmp_path, tracker, schema):
+    tracker.files["pkg"] = {"schema": schema, "name": "pkg", "version": "1.0", "notes": [NOTE]}
+    assert explain_json(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64")["pkg"]["notes"] == []
+
+
+def test_at_most_20_notes_per_package(capsys, tmp_path, tracker):
+    tracker.add("pkg", *[note(text=f"Note {i}.") for i in range(25)])
+    pkg = explain_json(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64")["pkg"]
+    assert [n["text"] for n in pkg["notes"]] == [f"Note {i}." for i in range(20)]
+
+
+def test_all_means_the_trackers_platforms_only(capsys, tmp_path, tracker):
+    tracker.add("pkg", note(platforms=["all"]))
+    pkg = explain_json(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64,linux-ppc64le,pyodide")["pkg"]
+    assert set(pkg["rejected"]) >= {"linux-x86_64", "linux-ppc64le"}
+    assert pkg["notes"][0]["targets"] == [
+        "linux-x86_64",
+        "pyodide",
+    ]  # not linux-ppc64le, which the tracker doesn't scan
+
+
+def test_only_gap_targets(capsys, tmp_path, tracker):
+    """A package with a wheel on Linux and a gap on Windows: an "all" note covers the Windows gap only."""
+    (tmp_path / "uv.lock").write_text(
+        f'version = 1\n[[package]]\nname = "pkg"\nversion = "1.0"\nsource = {{ registry = "{PYPI}" }}\n'
+        'sdist = { url = "https://files.example/pkg-1.0.tar.gz", hash = "sha256:00", size = 1 }\n'
+        'wheels = [{ url = "https://files.example/pkg-1.0-cp313-cp313-manylinux_2_17_x86_64.whl", hash = "sha256:00",'
+        " size = 1 }]\n",
+        encoding="utf-8",
+    )
+    tracker.add("pkg", note(platforms=["all"]))
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--explain", "--notes")
+    assert f"{HEAD} win-amd64 {CHECKED}" in out
+    pkg = explain_json(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64,win-amd64")["pkg"]
+    assert pkg["notes"][0]["targets"] == ["win-amd64"]
+
+
+def test_only_packages_with_a_gap_are_looked_up(capsys, tmp_path, tracker):
+    lock = 'version = 1\nrequires-python = ">=3.13"\n'
+    for name in ("gap", "ignored", "partly"):
+        lock += (
+            f'[[package]]\nname = "{name}"\nversion = "1.0"\nsource = {{ registry = "{PYPI}" }}\n'
+            f'sdist = {{ url = "https://files.example/{name}-1.0.tar.gz", hash = "sha256:00", size = 1 }}\n'
+        )
+    lock += (
+        f'[[package]]\nname = "fine"\nversion = "1.0"\nsource = {{ registry = "{PYPI}" }}\n'
+        'wheels = [{ url = "https://files.example/fine-1.0-py3-none-any.whl", hash = "sha256:00", size = 1 }]\n'
+    )
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    args = (str(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
+    run(capsys, *args, "--ignore", "ignored", "--ignore", "partly:linux-x86_64")
+    assert tracker.calls == [f"{notes.TRACKER}/gap.json"]  # fine has no gap; the others' gaps are ignored
+
+
+def test_failed_lookup_isnt_cached(capsys, tmp_path, tracker):
+    folder = uv_lock(tmp_path)
+    tracker.respond = lambda name: (_ for _ in ()).throw(urllib.error.HTTPError("u", 503, "Unavailable", {}, None))
+    run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
+    tracker.respond = None
+    tracker.add("pkg", note())
+    _, out, _ = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
+    assert HEAD in out and len(tracker.calls) == 2
+
+
+def test_no_cache_saves_nothing(capsys, tmp_path, tracker):
+    tracker.add("pkg", note())
+    folder = uv_lock(tmp_path)
+    run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes", "--no-cache")
+    run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
+    assert len(tracker.calls) == 2
+
+
+def test_cached_notes_are_checked_again(capsys, tmp_path, tracker):
+    cache.save_notes(notes.TRACKER, "pkg", [note(text="::error::from a tampered cache"), note(text="Cached.")])
+    pkg = explain_json(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64")["pkg"]
+    assert [n["text"] for n in pkg["notes"]] == ["Cached."] and tracker.calls == []
+
+
+def test_only_normalized_names_are_looked_up(tracker):
+    found, cut = notes.lookup(["../../evil", "Pkg", "a.b", "-x", "ok-name"], read_cache=False, write_cache=False)
+    assert tracker.calls == [f"{notes.TRACKER}/ok-name.json"] and found == {"ok-name": []} and cut is None
+
+
+def test_notes_needs_explain(capsys, tmp_path):
+    with pytest.raises(SystemExit) as e:
+        main([uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--notes"])
+    assert e.value.code == 2 and "--notes only adds to --explain" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "flags,env,why",
+    [
+        (["--offline"], {}, "--offline"),
+        (["--index-url", "https://private.example/simple"], {}, "--index-url"),
+        ([], {"WHEELGAP_INDEX_URL": "https://mirror.example/pypi"}, "WHEELGAP_INDEX_URL"),
+    ],
+)
+def test_notes_off_says_so(capsys, tmp_path, tracker, monkeypatch, flags, env, why):
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    tracker.add("pkg", note())
+    folder = uv_lock(tmp_path)
+    code, out, err = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes", *flags)
+    assert code == 1 and HEAD not in out and tracker.calls == []
+    assert (
+        err == f"wheelgap: note: the tracker's notes are off with {why}, so no package names leave for "
+        "wheelgap.github.io\n"
+    )
+    # No hint either, since --notes would do nothing; and -q drops the note.
+    assert run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", *flags)[2] == ""
+    assert (
+        run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes", "--json", "-q", *flags)[2] == ""
+    )
+
+
+# Where a name comes from. --notes sends a name only when it's positively a PyPI package: its lock says so (uv.lock,
+# pylock.toml), or wheelgap found it on pypi.org and nothing names another index.
+
+
+def _requirements(tmp_path, *lines: str, extra: dict[str, str] | None = None) -> str:
+    (tmp_path / "requirements.txt").write_text("\n".join([*lines, "nowheels==0.9"]) + "\n", encoding="utf-8")
+    for name, text in (extra or {}).items():
+        (tmp_path / name).write_text(text, encoding="utf-8")
+    return str(tmp_path / "requirements.txt")
+
+
+@pytest.mark.parametrize(
+    "lines,extra,sent",
+    [
+        ([], None, True),
+        (["--index-url https://private.example/simple"], None, False),
+        (["--index-url=https://private.example/simple"], None, False),
+        (["-i https://private.example/simple"], None, False),
+        (["--extra-index-url https://private.example/simple"], None, False),
+        (["-r more.txt"], {"more.txt": "--extra-index-url https://private.example/simple\n"}, False),
+        (["-c constraints.txt"], {"constraints.txt": "-i https://private.example/simple\n"}, False),
+        (["-r more.txt"], {"more.txt": "purewheel==3.1\n"}, True),
+    ],
+)
+def test_requirements_naming_another_index(capsys, tmp_path, tracker, fake_pypi, lines, extra, sent):
+    tracker.add("nowheels", note())
+    code, out, _ = run(
+        capsys, _requirements(tmp_path, *lines, extra=extra), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes"
+    )
+    assert code == 1 and fake_pypi  # found on pypi.org either way
+    assert bool(tracker.calls) is sent
+
+
+@pytest.mark.parametrize("variable", notes.INDEX_ENV)
+def test_installer_index_in_the_environment(capsys, tmp_path, tracker, fake_pypi, monkeypatch, variable):
+    monkeypatch.setenv(variable, "https://private.example/simple")
+    tracker.add("nowheels", note())
+    tracker.add("pkg", note())
+    run(capsys, _requirements(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
+    assert tracker.calls == []  # found on pypi.org, but pip or uv may install it from elsewhere
+    # A lock that says pypi.org is still positive.
+    run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
+    assert tracker.calls == [f"{notes.TRACKER}/pkg.json"]
+
+
+def test_wheelgap_index_url_mirror_sends_nothing(capsys, tmp_path, tracker, monkeypatch):
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://mirror.example/pypi")
+    tracker.add("pkg", note())
+    code, out, err = run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain")
+    assert code == 1 and err == "" and tracker.calls == []  # no hint, and nothing looked up
+
+
+def test_wheelgap_index_url_set_to_pypi_is_the_default(capsys, tmp_path, tracker, fake_pypi, monkeypatch):
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://pypi.org/pypi/")
+    tracker.add("nowheels", note())
+    run(capsys, _requirements(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
+    assert tracker.calls == [f"{notes.TRACKER}/nowheels.json"]
+
+
+PIPFILE_LOCK = """{
+    "_meta": {"sources": [%s]},
+    "default": {"nowheels": {"version": "==0.9"}}
+}
+"""
+PYPI_SOURCE = '{"name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": true}'
+PRIVATE_SOURCE = '{"name": "corp", "url": "https://private.example/simple", "verify_ssl": true}'
+
+
+@pytest.mark.parametrize(
+    "sources,sent",
+    [
+        ([PYPI_SOURCE], True),
+        ([PRIVATE_SOURCE], False),  # the package has no "index": it comes from the default source, which is private
+        ([PYPI_SOURCE, PRIVATE_SOURCE], False),
+        ([], False),  # no sources recorded: unknown
+    ],
+)
+def test_pipfile_lock_sources(capsys, tmp_path, tracker, fake_pypi, sources, sent):
+    (tmp_path / "Pipfile.lock").write_text(PIPFILE_LOCK % ", ".join(sources), encoding="utf-8")
+    tracker.add("nowheels", note())
+    code, _, _ = run(capsys, str(tmp_path / "Pipfile.lock"), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
+    assert code == 1 and fake_pypi
+    assert bool(tracker.calls) is sent
+
+
+@pytest.mark.parametrize(
+    "tool,sent",
+    [
+        ("", True),
+        ('[[tool.uv.index]]\nname = "corp"\nurl = "https://private.example/simple"\n', False),
+        ('[tool.uv.sources]\nnowheels = { index = "corp" }\n', False),
+        ('[[tool.poetry.source]]\nname = "corp"\nurl = "https://private.example/simple"\n', False),
+        ('[[tool.pdm.source]]\nname = "corp"\nurl = "https://private.example/simple"\n', False),
+    ],
+)
+def test_pyproject_naming_another_index(capsys, tmp_path, tracker, fake_pypi, tool, sent):
+    (tmp_path / "pyproject.toml").write_text(
+        f'[project]\nname = "app"\nversion = "0"\ndependencies = ["nowheels==0.9"]\n\n{tool}', encoding="utf-8"
+    )
+    tracker.add("nowheels", note())
+    code, _, _ = run(
+        capsys, str(tmp_path / "pyproject.toml"), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes"
+    )
+    assert code == 1 and fake_pypi
+    assert bool(tracker.calls) is sent
+
+
+@pytest.mark.parametrize(
+    "lock",
+    [
+        # poetry.lock never: even one whose source says pypi.org, or one wheelgap looks up itself (no files).
+        '[[package]]\nname = "nowheels"\nversion = "0.9"\n'
+        'files = [{file = "nowheels-0.9.tar.gz", hash = "sha256:00"}]\n'
+        '[package.source]\ntype = "legacy"\nurl = "https://pypi.org/simple"\nreference = "pypi"\n',
+        '[[package]]\nname = "nowheels"\nversion = "0.9"\n',
+    ],
+)
+def test_poetry_lock_never(capsys, tmp_path, tracker, fake_pypi, lock):
+    (tmp_path / "poetry.lock").write_text(lock + '\n[metadata]\nlock-version = "2.0"\n', encoding="utf-8")
+    tracker.add("nowheels", note())
+    code, out, _ = run(
+        capsys, str(tmp_path / "poetry.lock"), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes"
+    )
+    assert code == 1 and "nowheels 0.9 on linux-x86_64" in out
+    assert tracker.calls == []
+
+
+def test_pylock_without_index_never_even_online(capsys, tmp_path, tracker, fake_pypi):
+    """--online finds the entry on pypi.org, but a pylock.toml entry with no index doesn't say where it came from."""
+    (tmp_path / "pylock.toml").write_text(
+        'lock-version = "1.0"\n[[packages]]\nname = "nowheels"\nversion = "0.9"\n'
+        'sdist = { url = "https://files.example/nowheels-0.9.tar.gz", hashes = { sha256 = "00" } }\n',
+        encoding="utf-8",
+    )
+    tracker.add("nowheels", note())
+    args = (str(tmp_path / "pylock.toml"), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes", "--online")
+    code, out, _ = run(capsys, *args)
+    assert code == 1 and fake_pypi and tracker.calls == []
+
+
+def test_cached_notes_are_capped_too(capsys, tmp_path, tracker):
+    cache.save_notes(notes.TRACKER, "pkg", [note(text=f"Note {i}.") for i in range(25)])
+    pkg = explain_json(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64")["pkg"]
+    assert len(pkg["notes"]) == 20 and tracker.calls == []
+
+
+def test_eligible_only_with_a_gap():
+    """A row that isn't ok only because it's unknown (or whose gaps are all ignored) has nothing to explain."""
+    from wheelgap.cli import notes_eligible
+    from wheelgap.sources import Source
+
+    linux, win = build_targets(["3.13"], ["linux-x86_64", "win-amd64"])
+    pkg = Package("pkg", "1.0", files=["pkg-1.0.tar.gz"], registry=PYPI)
+    source = Source("uv.lock", [pkg], kind="uv")
+    source_of = {id(pkg): source}
+    assert notes_eligible(Row(pkg, {linux: Status.SOURCE, win: Status.WHEEL}), [linux, win], source_of)
+    assert not notes_eligible(Row(pkg, {linux: Status.UNKNOWN, win: Status.WHEEL}), [linux, win], source_of)
+    ignored = Row(pkg, {linux: Status.SOURCE, win: Status.WHEEL}, ignored=frozenset({linux}))
+    assert not notes_eligible(ignored, [linux, win], source_of)
+    assert not notes_eligible(Row(pkg, {linux: Status.SOURCE}), [linux], {})  # not from any input

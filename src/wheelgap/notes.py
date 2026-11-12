@@ -5,15 +5,18 @@ publishes them in each package's file, https://wheelgap.github.io/tracker/data/p
 https://github.com/wheelgap/tracker/blob/main/notes/README.md). They come from a public repository, so they're
 untrusted: a note that isn't exactly in the published format is dropped whole, never shown in part.
 
-Looking a package up sends its name to wheelgap.github.io, so the CLI only asks for packages known to come from PyPI
-(see from_pypi), only with --notes (or notes = true), and never with --offline or --index-url. The lookups are
+Looking a package up sends its name to wheelgap.github.io, so the CLI only asks for packages that are positively PyPI's
+(see may_send), only with --notes (or notes = true), and never with --offline, --index-url or a WHEELGAP_INDEX_URL
+mirror (see index_allows). The lookups are
 optional extras, so they are bounded: one attempt each, a short timeout, a deadline for them all, and none after
 the first connection failure.
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import http.client
+import os
 import queue
 import re
 import threading
@@ -26,18 +29,43 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
 
 from . import cache, pypi
-from .sources import Package
+from .sources import Package, Source
 
 TRACKER = "https://wheelgap.github.io/tracker/data/packages"
 SCHEMA = 1  # of the tracker's package files: it goes up if a field changes meaning or goes away
 TIMEOUT = 10.0  # seconds, for each request (one attempt, no retries)
 DEADLINE = 15.0  # seconds, for all the lookups of a run
 WORKERS = 16
-MAX_TEXT = 500  # the format's limit: shorter than this
+# The format, as notes/README.md and scripts/check_notes.py in https://github.com/wheelgap/tracker define it.
+# The platforms the tracker scans: a note names some of these, or ["all"], which means these and no other target.
+PLATFORMS = frozenset(
+    {
+        "linux-x86_64",
+        "linux-aarch64",
+        "musl-x86_64",
+        "musl-aarch64",
+        "macos-x86_64",
+        "macos-arm64",
+        "win-amd64",
+        "win-arm64",
+        "pyodide",
+    }
+)
+KINDS = frozenset({"workaround", "alternative", "upstream-issue", "other-source"})
+MAX_TEXT = 500  # shorter than this
+MAX_LINKS = 5
+MAX_LINK = 300  # characters
+MAX_NOTES = 20  # per package; any more are dropped
+# A versions clause: ==, !=, <=, >=, < or > and a plain release, with .* only after == or != (check_notes.py's
+# SPEC_CLAUSE_RE). No ~=, ===, epochs, pre-, post-, dev or local versions.
+_CLAUSE = re.compile(r"\s*(?:(?:==|!=)\s*\d+(?:\.\d+)*(?:\.\*)?|(?:<=|>=|<|>)\s*\d+(?:\.\d+)*)\s*", re.ASCII)
+_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
 # A normalized name is also a safe path segment: no slashes, dots or leading dashes.
 _NAME = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*", re.ASCII)
-_KIND = re.compile(r"[a-z]+(-[a-z]+)*", re.ASCII)
-_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
+# GitHub Actions reads a line as a workflow command when it starts with "::" (after whitespace) and, in the legacy
+# form, when it has "##[" anywhere. A note with either is dropped, whatever prints it: a word starting with "::" in
+# its text (C++'s std::vector is fine), or "##[" in its text or a link.
+_COMMAND = re.compile(r"(?<![\w:])::")
 
 
 @dataclass(frozen=True)
@@ -50,7 +78,7 @@ class Note:
     updated: str  # YYYY-MM-DD
 
     def covers(self, platform: str) -> bool:
-        return self.platforms == ("all",) or platform in self.platforms
+        return platform in (PLATFORMS if self.platforms == ("all",) else self.platforms)
 
     def applies_to(self, version: str | None) -> bool:
         """Whether the note is about this release. A note limited to some releases is shown only when the version
@@ -84,65 +112,108 @@ def _line(value: object) -> bool:
 
 
 def _link(value: object) -> bool:
-    if not _line(value) or not isinstance(value, str) or " " in value or not value.startswith("https://"):
+    """An https:// URL with a host, and no whitespace, control or format characters or user@ part."""
+    if not isinstance(value, str) or not _line(value) or " " in value or len(value) > MAX_LINK or "##[" in value:
         return False
     try:
         parts = urlsplit(value)
-        return bool(parts.hostname) and "@" not in parts.netloc
+        return parts.scheme == "https" and bool(parts.hostname) and "@" not in parts.netloc
     except ValueError:
         return False
+
+
+def _date(value: object) -> bool:
+    if not isinstance(value, str) or not _DATE.fullmatch(value):
+        return False
+    try:
+        dt.date.fromisoformat(value)
+    except ValueError:  # 2026-02-30
+        return False
+    return True
 
 
 def _note(raw: object) -> Note | None:
     """A published note, or None if it isn't exactly in the format."""
     if not isinstance(raw, dict) or set(raw) != {"platforms", "kind", "text", "links", "versions", "updated"}:
         return None
-    platforms, links, versions = raw["platforms"], raw["links"], raw["versions"]
-    if not isinstance(platforms, list) or not platforms or not all(_line(p) and " " not in p for p in platforms):
+    platforms, kind, text, links, versions = raw["platforms"], raw["kind"], raw["text"], raw["links"], raw["versions"]
+    if not isinstance(platforms, list) or not platforms or len(set(map(str, platforms))) != len(platforms):
         return None
-    if "all" in platforms and len(platforms) != 1:
+    if platforms != ["all"] and not all(isinstance(p, str) and p in PLATFORMS for p in platforms):
         return None
-    if not isinstance(links, list) or not links or not all(_link(link) for link in links):
+    if not isinstance(kind, str) or kind not in KINDS or not _date(raw["updated"]):
         return None
-    if versions is not None and not _line(versions):
+    if not isinstance(text, str) or not _line(text) or len(text) >= MAX_TEXT or "##[" in text or _COMMAND.search(text):
         return None
-    kind, text, updated = raw["kind"], raw["text"], raw["updated"]
-    if not (isinstance(kind, str) and _KIND.fullmatch(kind)) or not (
-        isinstance(updated, str) and _DATE.fullmatch(updated)
+    if not isinstance(links, list) or not 0 < len(links) <= MAX_LINKS or len(set(map(str, links))) != len(links):
+        return None
+    if not all(_link(link) for link in links):
+        return None
+    if versions is not None and not (
+        isinstance(versions, str) and versions.strip() and all(_CLAUSE.fullmatch(c) for c in versions.split(","))
     ):
         return None
-    if not _line(text) or len(text) >= MAX_TEXT:
-        return None
-    return Note(tuple(platforms), kind, text, tuple(links), versions, updated)
+    return Note(tuple(platforms), kind, text, tuple(links), versions, raw["updated"])
 
 
 def parse(data: object, name: str) -> list[Note] | None:
     """The notes in a package file, or None if the file isn't one for `name` in a schema this version reads."""
-    if not isinstance(data, dict) or data.get("schema") != SCHEMA or data.get("name") != name:
+    if not isinstance(data, dict) or type(data.get("schema")) is not int or data["schema"] != SCHEMA:
+        return None  # not true, which == 1 in Python
+    if data.get("name") != name:
         return None
     raw = data.get("notes", [])  # files published before notes existed have none
     if not isinstance(raw, list):
         return None
-    return [n for n in map(_note, raw) if n is not None]
+    return [n for n in map(_note, raw[:MAX_NOTES]) if n is not None]
 
 
-def from_pypi(package: Package, looked_up: bool) -> bool:
-    """Whether the package's name may go to the tracker: wheelgap looked it up on pypi.org itself this run
-    (`looked_up`), or the lock says it came from pypi.org (a uv.lock registry, a pylock.toml index). Never for a
-    skipped package (private index, URL, path, git), nor one whose lock names no index (pdm.lock, a pylock.toml
-    entry without one): it may be a private name."""
-    if package.skip or package.error:
+# Installer settings that point pip or uv at another index: with any of them set, a name found on pypi.org may still be
+# installed from somewhere else, and may be private.
+INDEX_ENV = (
+    "PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL",
+    "UV_INDEX_URL",
+    "UV_DEFAULT_INDEX",
+    "UV_INDEX",
+    "UV_EXTRA_INDEX_URL",
+)
+
+
+def index_allows(simple_index: str | None) -> bool:
+    """Whether this run may look anything up: not when packages come from another index (--index-url, or
+    WHEELGAP_INDEX_URL set to a mirror), which may hold private names alongside PyPI's."""
+    return simple_index is None and pypi.index_url() == pypi.DEFAULT_INDEX
+
+
+def may_send(pkg: Package, source: Source) -> bool:
+    """Whether the package's name may go to the tracker: it's positively a PyPI package. Either its lock says it came
+    from PyPI (uv.lock's registry, pylock.toml's index), or this run found it on pypi.org and its input names no
+    other index (Source.pypi_only) and neither does the environment (INDEX_ENV). Never a pdm.lock or poetry.lock
+    entry, a pylock.toml entry with no index, or a skipped package (git, path, URL, private index)."""
+    if pkg.skip:
         return False
-    return looked_up or (package.registry is not None and package.registry.rstrip("/") == pypi.PYPI_SIMPLE)
+    if source.kind in ("uv", "pylock") and pkg.registry is not None and pypi.is_pypi(pkg.registry):
+        return True
+    return pkg.found_on_pypi and source.pypi_only and not any(os.environ.get(k) for k in INDEX_ENV)
 
 
 _CONNECTION = (urllib.error.URLError, OSError, http.client.HTTPException)  # HTTPError is handled before these
 
 
-def lookup(names: list[str], read_cache: bool = True, write_cache: bool = True) -> tuple[dict[str, list[Note]], bool]:
-    """Each name's notes, keyed by name, for the names that could be looked up (a 404 is no notes); and whether
-    the lookups were cut short, by the deadline or a connection failure. Nothing here raises: a lookup that fails
-    just leaves its name out."""
+TIMED_OUT, UNREACHABLE = "timed out", "unreachable"
+
+
+def _timed_out(e: BaseException) -> bool:
+    return isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError)
+
+
+def lookup(
+    names: list[str], read_cache: bool = True, write_cache: bool = True
+) -> tuple[dict[str, list[Note]], str | None]:
+    """Each name's notes, keyed by name, for the names that could be looked up (a 404 is no notes); and why the
+    lookups were cut short, if they were: TIMED_OUT (the deadline, or a request's timeout) or UNREACHABLE (no
+    connection: DNS, TLS, refused). Nothing here raises: a lookup that fails just leaves its name out."""
     found: dict[str, list[Note]] = {}
     todo = []
     for name in dict.fromkeys(names):
@@ -150,16 +221,16 @@ def lookup(names: list[str], read_cache: bool = True, write_cache: bool = True) 
             continue
         cached = cache.load_notes(TRACKER, name) if read_cache else None
         if cached is not None:
-            found[name] = [n for n in map(_note, cached) if n is not None]
+            found[name] = [n for n in map(_note, cached[:MAX_NOTES]) if n is not None]  # checked again
         else:
             todo.append(name)
     if not todo:
-        return found, False
+        return found, None
 
     work: queue.SimpleQueue[str] = queue.SimpleQueue()
     for name in todo:
         work.put(name)
-    done: queue.SimpleQueue[tuple[str, object, bool]] = queue.SimpleQueue()
+    done: queue.SimpleQueue[tuple[str, object, str | None]] = queue.SimpleQueue()
     stop = threading.Event()
 
     def worker() -> None:
@@ -172,27 +243,27 @@ def lookup(names: list[str], read_cache: bool = True, write_cache: bool = True) 
                 data: object = pypi.fetch_json(f"{TRACKER}/{name}.json", timeout=TIMEOUT, attempts=1)
             except urllib.error.HTTPError as e:
                 data = {"schema": SCHEMA, "name": name, "notes": []} if e.code == 404 else None
-            except _CONNECTION:
+            except _CONNECTION as e:
                 stop.set()  # the tracker can't be reached (a firewalled runner): don't try the rest
-                done.put((name, None, True))
+                done.put((name, None, TIMED_OUT if _timed_out(e) else UNREACHABLE))
                 return
             except Exception:  # a body that isn't JSON, and the like
                 data = None
-            done.put((name, data, False))
+            done.put((name, data, None))
 
     # Daemon threads, so a request still waiting on its timeout can't hold up the end of the run.
     for _ in range(min(WORKERS, len(todo))):
         threading.Thread(target=worker, daemon=True).start()
     deadline = time.monotonic() + DEADLINE
-    cut = False
+    cut: str | None = None
     for _ in todo:
         try:
             name, data, failed = done.get(timeout=max(0.0, deadline - time.monotonic()))
         except queue.Empty:
-            cut = True
+            cut = TIMED_OUT
             break
         if failed:
-            cut = True
+            cut = failed
             break
         notes = parse(data, name)
         if notes is not None:

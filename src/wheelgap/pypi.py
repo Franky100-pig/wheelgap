@@ -345,6 +345,7 @@ def fill(pkg: Package, python: str | None = None, read_cache: bool = False, writ
         else:
             names = [u["filename"] for u in urls if not u.get("yanked")]
         pkg.files = names
+        pkg.found_on_pypi = base == DEFAULT_INDEX
         # Only a fresh answer that parsed and listed its files: a body with no "urls" ({}) reads as no files,
         # and caching that would turn a bad response into a day of false "missing" answers.
         if key and write_cache and cached is None and isinstance(data.get("urls"), list):

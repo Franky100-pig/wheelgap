@@ -36,7 +36,7 @@ uv run --group dev pytest
 | `dockerfile.py` | `--dockerfile`: reads the final stage's image and platform the way Docker/BuildKit does |
 | `offline.py` | `--offline`, `offline = true` and `check_lockfile(..., offline=True)`: refuse inputs that would need an index lookup |
 | `pyodide.py` | `--pyodide-lock`: packages Pyodide ships itself |
-| `notes.py` | `--explain`: the [coverage tracker](https://wheelgap.github.io/tracker/)'s notes for packages with gaps, opt-in with `--notes`, looked up only for names known to come from PyPI, never with `--offline` or `--index-url` |
+| `notes.py` | `--explain`: the [coverage tracker](https://wheelgap.github.io/tracker/)'s notes for packages with gaps, opt-in with `--notes`, looked up only for names that are positively PyPI's (`may_send`), never with `--offline`, `--index-url` or a `WHEELGAP_INDEX_URL` mirror |
 | `github.py` | `--github-annotations`: GitHub Actions `::error`/`::warning` lines, and each package's line in its input file |
 | `scan.py` | `python -m wheelgap.scan`: the data behind the [coverage tracker](https://wheelgap.github.io/tracker/) |
 | `diff.py` | `python -m wheelgap.diff OLD NEW`: packages that got worse between two lockfiles, and new packages with gaps |
@@ -57,7 +57,7 @@ uv run --group dev pytest
 - **All network access goes through `pypi.fetch_json`.**
 - **Wheel tags:** use `packaging.tags` where it has an API, and mirror what pip accepts. The manylinux/musllinux platform lists in `targets.py` follow pip's rules; keep them that way.
 - **`--dockerfile` must match Docker exactly or raise `DockerfileError`.** When you port BuildKit behaviour, link the file and commit in a comment (see `_heredocs` in `dockerfile.py`).
-- **Output:** `--json` keys are a public interface. Add keys; don't rename or remove them. Notes go to stderr, never into `--json` or `--markdown` stdout.
+- **Output:** `--json` keys are a public interface. Add keys; don't rename or remove them. Diagnostic notes (`wheelgap: note: ...`) go to stderr, never into `--json` or `--markdown` stdout.
 - **Style:** match the surrounding code; ruff's line length is 120. Don't reformat or refactor code your change doesn't need.
 - **`CHANGELOG.md`:** if users would notice the change, add one bullet at the top of `## Unreleased`, written for users, ending with the **PR** number and your handle: `(#123, thanks [@you](https://github.com/you))`. Add it once the PR is open and you know the number. Docs-only changes get no entry, and released sections are never edited.
 - **Agent integrations:** when a flag, JSON key, status or exit code changes, update `integrations/claude-code/skills/check-wheels/SKILL.md` and `integrations/cursor/wheelgap.mdc` too, and only describe what's already released on PyPI.
