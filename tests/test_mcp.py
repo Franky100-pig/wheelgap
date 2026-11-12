@@ -113,6 +113,31 @@ def test_check_package(fake_pypi):
     assert fake_pypi == ["https://pypi.org/pypi/winonly/json"]
 
 
+def test_python_next(fake_pypi, fixtures):
+    (_, reply) = run(init(), call("check_package", name="purewheel", python="3.14,next-t", targets=["linux-x86_64"]))
+    assert reply["result"]["structuredContent"]["results"] == {
+        "3.14 linux-x86_64": "wheel",
+        "3.15t linux-x86_64": "wheel",
+    }
+    (_, reply) = run(
+        init(), call("check_lockfile", path=str(fixtures / "uvproj"), python="next", targets=["linux-x86_64"])
+    )
+    data = reply["result"]["structuredContent"]
+    assert data["targets"] == ["3.15 linux-x86_64"]
+    assert "next is Python 3.15, the newest CPython this wheelgap version knows" in data["notes"]
+    assert "blocking_newer_python" not in data  # one Python
+
+
+@pytest.mark.parametrize("python", ["3.14,Next", "3.14, NEXT-T"])
+def test_python_next_any_case_and_blocking(fake_pypi, tmp_path, python):
+    (tmp_path / "requirements.txt").write_text("newpylag==1.0\nnowheels==0.9\n", encoding="utf-8")
+    (_, reply) = run(init(), call("check_lockfile", path=str(tmp_path), python=python, targets=["linux-x86_64"]))
+    data = reply["result"]["structuredContent"]
+    assert data["blocking_newer_python"] == ["newpylag"]
+    (_, reply) = run(init(), call("check_package", name="purewheel", python=python, targets=["linux-x86_64"]))
+    assert reply["result"]["isError"] is False
+
+
 def test_check_package_pinned_version_and_glibc(fake_pypi):
     (_, reply) = run(
         init(),
