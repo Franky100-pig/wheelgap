@@ -2,6 +2,7 @@
 
 import gzip
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -10,6 +11,7 @@ import tarfile
 import threading
 import time
 import urllib.error
+import urllib.request
 from contextlib import contextmanager
 
 import pytest
@@ -37,10 +39,10 @@ def member(name, data=b"", kind=tarfile.REGTYPE, link="", pax=None):
     return info, data
 
 
-def sdist(tmp_path, *members, name="pkg-1.0.tar.gz", fmt=tarfile.PAX_FORMAT) -> bytes:
-    """A .tar.gz built in tmp_path from (TarInfo, data) pairs, in that order."""
+def sdist(tmp_path, *members, name="pkg-1.0.tar.gz", fmt=tarfile.PAX_FORMAT, pax=None) -> bytes:
+    """A .tar.gz built in tmp_path from (TarInfo, data) pairs, in that order (`pax`: global pax headers)."""
     path = tmp_path / name
-    with tarfile.open(path, "w:gz", format=fmt) as tar:
+    with tarfile.open(path, "w:gz", format=fmt, pax_headers=pax) as tar:
         for info, data in members:
             tar.addfile(info, io.BytesIO(data) if info.type == tarfile.REGTYPE else None)
     return path.read_bytes()
@@ -79,7 +81,7 @@ def test_no_pyproject_is_none(tmp_path, fake_files):
 
 
 def test_a_repeated_pyproject_with_the_same_content_is_fine(tmp_path, fake_files):
-    data = sdist(tmp_path, member("pkg-1.0/pyproject.toml", MATURIN), member("pkg-1.0/./pyproject.toml", MATURIN))
+    data = sdist(tmp_path, member("pkg-1.0/pyproject.toml", MATURIN), member("pkg-1.0/pyproject.toml", MATURIN))
     assert fetch(fake_files, data) is not None
 
 
@@ -220,8 +222,11 @@ def test_declared_size_cap(fake_files, monkeypatch):
 
     fake_files.files["pkg-1.0.tar.gz"] = lambda: Big(b"never read")
     with pytest.raises(pypi.SdistRefused, match="too big") as e:
-        pypi.fetch_sdist_pyproject("https://files.example/pkg-1.0.tar.gz")
+        pypi.fetch_sdist_pyproject("https://files.example/pkg-1.0.tar.gz", sha256="0" * 64)
     assert e.value.verified  # its size won't change
+    with pytest.raises(pypi.SdistRefused, match="too big") as e:
+        pypi.fetch_sdist_pyproject("https://files.example/pkg-1.0.tar.gz")
+    assert not e.value.verified  # with no sha256, nothing is kept
 
 
 def test_unpacked_cap(tmp_path, fake_files, monkeypatch):
@@ -365,6 +370,75 @@ def test_dripped_headers_stop_at_the_deadline():
     finally:
         server.shutdown()
         server.server_close()
+
+
+class Fast(socketserver.BaseRequestHandler):
+    """Answers any request at once with an empty JSON object."""
+
+    def handle(self):
+        self.request.recv(65536)
+        self.request.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}")
+
+
+class DripProxy(socketserver.BaseRequestHandler):
+    """A proxy that takes a CONNECT and answers it one byte every 0.3 s."""
+
+    def handle(self):
+        try:
+            self.request.recv(65536)
+            for byte in b"HTTP/1.1 200 Connection established\r\n" * 20:
+                self.request.sendall(bytes([byte]))
+                time.sleep(0.3)
+        except OSError:
+            pass  # the client hung up
+
+
+@contextmanager
+def local_server(handler):
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_dripping_proxy_stops_at_the_deadline(monkeypatch):
+    # The proxy's CONNECT answer is read before there's a TLS connection: the socket is watched from its creation.
+    with local_server(DripProxy) as port:
+        proxied = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"https": f"http://127.0.0.1:{port}"}),
+            pypi._HTTPSRedirectHandler,
+            pypi._HTTPHandler,
+            pypi._HTTPSHandler,
+        )
+        monkeypatch.setattr(pypi, "_OPENER", proxied)
+        start = time.monotonic()
+        with pytest.raises(pypi.DeadlineExceeded):
+            pypi.fetch_json("https://pypi.invalid/x", timeout=5, attempts=1, deadline=pypi._clock() + 1.0)
+        assert time.monotonic() - start < 4
+
+
+def test_a_connection_opened_after_the_deadline_is_shut(monkeypatch):
+    # As a redirect's would be: the watchdog has fired already, so the new socket is shut as it's registered.
+    class NeverFires:
+        def __init__(self, *args):
+            self.daemon = True
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(pypi.threading, "Timer", NeverFires)
+    with local_server(Fast) as port:
+        url = f"http://127.0.0.1:{port}/x"
+        assert pypi.fetch_json(url, timeout=5, attempts=1) == {}
+        with pytest.raises(pypi.DeadlineExceeded):
+            pypi.fetch_json(url, timeout=5, attempts=1, deadline=pypi._clock() - 1)
 
 
 def test_stream_mode_keeps_no_headers(tmp_path, fake_files, monkeypatch):
@@ -937,3 +1011,186 @@ def test_running_out_of_time_says_so(capsys, tmp_path, fake_files, clock):
     assert "build info: stopped after 35 s; 1 package not read" in err
     _, _, err = run(capsys, uv_lock(tmp_path), *TARGETS, "--explain", "--build-info", "--json", "-q")
     assert err == ""
+
+
+# Round 4: what pip would read differently, or fail on
+
+
+@pytest.mark.parametrize(
+    "members",
+    [
+        pytest.param([PLAIN, member("pkg-1.0/pyproject.toml‌", b"[x]\n")], id="hfs-ignorable"),
+        pytest.param([PLAIN, member("pkg-1.0/café", b"")], id="non-ascii-in-top"),
+        pytest.param([PLAIN, member("pkg-1.0/pyproj~1.tom", b"")], id="short-name"),
+        pytest.param(
+            [member("pkg-1.0/a~", b""), member("pkg-1.0/l", kind=tarfile.SYMTYPE, link="b"), PLAIN],
+            id="tilde-then-link",
+        ),
+        pytest.param(
+            [member("pkg-1.0/l", kind=tarfile.SYMTYPE, link="b"), member("pkg-1.0/sub/a~", b""), PLAIN],
+            id="link-then-tilde",
+        ),
+        pytest.param([member("pkg-1.0/l", kind=tarfile.SYMTYPE, link="b~"), PLAIN], id="tilde-in-link-target"),
+        pytest.param([member("pkg-1.0/pyproject.toml/.", MATURIN)], id="pyproject-dot"),
+        pytest.param([member("pkg-1.0/./pyproject.toml", MATURIN)], id="dot-pyproject"),
+        pytest.param([member("pkg-1.0//pyproject.toml", MATURIN)], id="double-slash"),
+        pytest.param([member("pkg-1.0/l", kind=tarfile.LNKTYPE, link="pkg-1.0/missing"), PLAIN], id="hardlink-missing"),
+        pytest.param(
+            [member("pkg-1.0/a", b""), member("pkg-1.0/l", kind=tarfile.LNKTYPE, link="pkg-1.0//a"), PLAIN],
+            id="hardlink-double-slash",
+        ),
+        pytest.param([member("pkg-1.0/l", kind=tarfile.LNKTYPE, link="pkg-1.0"), PLAIN], id="hardlink-to-top"),
+        pytest.param([member("pkg-1.0/x", kind=tarfile.SYMTYPE, link=".."), PLAIN], id="symlink-dotdot"),
+        pytest.param([member("pkg-1.0/l", kind=tarfile.SYMTYPE, link="café"), PLAIN], id="non-ascii-link-target"),
+        pytest.param(
+            [member("pkg-1.0/sub/café", b""), member("pkg-1.0/l", kind=tarfile.SYMTYPE, link="x"), PLAIN],
+            id="non-ascii-is-sticky",
+        ),
+    ],
+)
+def test_no_answer_round_4(tmp_path, fake_files, members):
+    with pytest.raises(pypi.SdistRefused):
+        fetch(fake_files, sdist(tmp_path, *members))
+
+
+@pytest.mark.parametrize(
+    "members",
+    [
+        pytest.param([PLAIN, member("pkg-1.0/setup.py~", b""), member("pkg-1.0/sub/PYPROJ~1.TOM", b"")], id="tilde"),
+        pytest.param([PLAIN, member("pkg-1.0/sub/café", b"")], id="non-ascii-deeper"),
+        pytest.param(
+            [member("pkg-1.0/a", b""), member("pkg-1.0/l", kind=tarfile.LNKTYPE, link="pkg-1.0/a"), PLAIN],
+            id="hardlink",
+        ),
+        pytest.param([member("pkg-1.0/l", kind=tarfile.SYMTYPE, link="sub/x"), PLAIN], id="symlink"),
+    ],
+)
+def test_still_an_answer(tmp_path, fake_files, members):
+    assert fetch(fake_files, sdist(tmp_path, *members)) is not None
+
+
+def test_a_regular_file_named_like_a_folder(tmp_path, fake_files):
+    info, data = member("pkg-1.0/pyproject.toml/", MATURIN)
+    raw = sdist(tmp_path, (info, data))
+    with tarfile.open(fileobj=io.BytesIO(gzip.decompress(raw))) as tar:
+        (read,) = tar.getmembers()
+    with pytest.raises(pypi.SdistRefused):
+        fetch(fake_files, raw)
+    assert read.type in (tarfile.REGTYPE, tarfile.DIRTYPE)  # either way, it isn't the file pip reads
+
+
+@pytest.mark.parametrize(
+    ("pax", "members", "fmt"),
+    [
+        pytest.param({"comment": "x" * 300}, [PLAIN], tarfile.PAX_FORMAT, id="global-pax"),
+        pytest.param(
+            None,
+            [member("pkg-1.0/l", kind=tarfile.SYMTYPE, link="x" * 300), PLAIN],
+            tarfile.GNU_FORMAT,
+            id="gnu-longlink",
+        ),
+    ],
+)
+def test_more_header_caps(tmp_path, fake_files, monkeypatch, pax, members, fmt):
+    monkeypatch.setattr(pypi, "SDIST_MAX_HEADER", 200)
+    with pytest.raises(pypi.SdistRefused, match="header"):
+        fetch(fake_files, sdist(tmp_path, *members, fmt=fmt, pax=pax))
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"GNU.sparse.size": "1", "GNU.sparse.offset": "0", "GNU.sparse.numbytes": "1"},  # 0.0
+        {"GNU.sparse.map": "0,1", "GNU.sparse.size": "1"},  # 0.1
+        {"GNU.sparse.major": "1", "GNU.sparse.minor": "0", "GNU.sparse.realsize": "1", "GNU.sparse.name": "x"},  # 1.0
+    ],
+    ids=["0.0", "0.1", "1.0"],
+)
+def test_pax_sparse_files_are_refused(tmp_path, fake_files, headers):
+    with pytest.raises(pypi.SdistRefused, match="sparse"):
+        fetch(fake_files, sdist(tmp_path, member("pkg-1.0/x", b"x", pax=headers), PLAIN))
+
+
+def test_too_many_names(tmp_path, fake_files, monkeypatch):
+    monkeypatch.setattr(pypi, "SDIST_MAX_NAMES", 100)
+    with pytest.raises(pypi.SdistRefused, match="too many"):
+        fetch(fake_files, sdist(tmp_path, *[member(f"pkg-1.0/{i}", b"") for i in range(20)], PLAIN))
+
+
+def test_sdist_names_this_release():
+    assert build.where(pkg(files=["x-2.0.tar.gz"], url=f"{FILES}/x-2.0.tar.gz"), LOCK) is None
+    assert build.where(pkg(files=["y-1.0.tar.gz"], url=f"{FILES}/y-1.0.tar.gz"), LOCK) is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [f"{FILES}/x 1.0/x-1.0.tar.gz", "https://files.pythonhosted.org:99999/x-1.0.tar.gz", f"{FILES}/\x7f/x-1.0.tar.gz"],
+)
+def test_malformed_lock_urls_are_no_answer(url):
+    assert build.where(pkg(url=url), LOCK) is None
+
+
+def test_a_bad_url_doesnt_stop_the_rest(tmp_path, fake_files, monkeypatch):
+    monkeypatch.setattr(build, "WORKERS", 1)
+    fake_files.files["a-1.0.tar.gz"] = http.client.InvalidURL("bad")
+    fake_files.files["b-1.0.tar.gz"] = sdist(tmp_path, member("b-1.0/pyproject.toml", MATURIN), name="b-1.0.tar.gz")
+    a = Package("a", "1.0", files=["a-1.0.tar.gz"], registry=PYPI, sdist_url=f"{FILES}/a-1.0.tar.gz")
+    b = Package("b", "1.0", files=["b-1.0.tar.gz"], registry=PYPI, sdist_url=f"{FILES}/b-1.0.tar.gz")
+    found, note = build.lookup_all([(a, LOCK), (b, LOCK)])
+    assert set(found) == {id(b)} and note is None
+
+
+def test_no_sha256_caches_nothing(fake_files):
+    class Big(io.BytesIO):
+        headers = {"Content-Length": str(pypi.SDIST_MAX_BYTES + 1)}
+
+    fake_files.files["x-1.0.tar.gz"] = lambda: Big(b"")
+    assert build.lookup(pkg(), LOCK, phase(), write_cache=True) is None
+    assert cache.load_build(PYPI, "x", "1.0", "") is None
+    assert build.lookup(pkg(sha256="ab" * 32), LOCK, phase(), write_cache=True) is None
+    assert cache.load_build(PYPI, "x", "1.0", "ab" * 32) == {"answer": None}
+
+
+def test_output_is_capped():
+    many = info([f"p{i}>=1" for i in range(60)])
+    assert describe(many, LINUX).endswith(", p49>=1, and 10 more")
+    long = info(["foo" + ",".join(f">=1.{i}" for i in range(100))])
+    text = describe(long, LINUX)
+    assert len(text) == len("at least ") + build.CLIP and text.endswith("…")
+    backend = "b" * 300
+    assert describe(info([], backend, True), LINUX) == f"at least in-tree backend {'b' * 199}…"
+    # A requirement past the 50 shown still counts: no "no compiler" with maturin in there.
+    hidden = info(["flit_core", *[f"p{i}" for i in range(60)], "maturin"], "flit_core.buildapi")
+    assert describe(hidden, LINUX).startswith("at least")
+
+
+def test_phase_timeout_clamp(clock):
+    assert build._Phase(deadline=3.0).timeout() == 3.0
+    assert build._Phase(deadline=100.0).timeout() == build.TIMEOUT
+    assert build._Phase(deadline=-5.0).timeout() == 0.1
+
+
+@pytest.mark.parametrize(
+    ("args", "env", "why"),
+    [
+        (("--index-url", "https://i.example/simple"), {}, "--index-url"),
+        ((), {"WHEELGAP_INDEX_URL": "https://mirror.example/pypi"}, "WHEELGAP_INDEX_URL"),
+        ((), {"PIP_INDEX_URL": "https://i.example/simple"}, "PIP_INDEX_URL"),
+        ((), {"UV_INDEX": "https://i.example/simple"}, "UV_INDEX"),
+    ],
+)
+def test_says_when_build_info_is_off(capsys, tmp_path, fake_files, monkeypatch, args, env, why):
+    fake_files.files["nowheels-0.9.tar.gz"] = nowheels_sdist(tmp_path)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    lock = uv_lock(tmp_path)
+    _, out, err = run(capsys, lock, *TARGETS, "--explain", "--build-info", *args)
+    assert f"wheelgap: note: --build-info is off: packages may come from another index ({why})" in err
+    assert "build needs" not in out and fake_files.calls == []
+    _, _, err = run(capsys, lock, *TARGETS, "--explain", "--build-info", "--json", "-q", *args)
+    assert "--build-info" not in err
+    _, _, err = run(capsys, lock, *TARGETS, "--explain", *args)
+    assert "--build-info" not in err  # not asked for
+    if not args:  # --offline turns it off without a word (it can't take --index-url's lookups anyway)
+        _, _, err = run(capsys, lock, *TARGETS, "--explain", "--build-info", "--offline")
+        assert "--build-info" not in err

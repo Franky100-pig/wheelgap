@@ -12,6 +12,7 @@ import math
 import os
 import posixpath
 import socket
+import ssl
 import tarfile
 import threading
 import time
@@ -99,15 +100,43 @@ def _shut(sock: socket.socket) -> None:
         socket.socket.shutdown(sock, socket.SHUT_RDWR)  # the plain socket's: SSLSocket.shutdown drops its state
 
 
+def _register(sock: socket.socket) -> None:
+    """Put a new socket under the current deadline watch, if any; shut it at once if the deadline has passed (a
+    connection a redirect opens late)."""
+    if (watch := _watched.get()) is not None:
+        deadline, socks = watch
+        socks.append(sock)
+        if _clock() >= deadline:
+            _shut(sock)
+
+
+class _WatchedSSLSocket(ssl.SSLSocket):
+    """Registered before its TLS handshake: wrapping detaches the plain socket registered at connect."""
+
+    def do_handshake(self, block: bool = False) -> None:
+        _register(self)
+        super().do_handshake(block)
+
+
 def _watching(cls):
+    """A connection class whose sockets _deadline_watch can shut down: from the moment they exist, so before a
+    proxy's CONNECT answer and the TLS handshake. Name resolution comes before there is a socket, so it's bound only
+    by the resolver's own timeouts."""
+
     class Watched(cls):
-        def connect(self):
-            super().connect()
-            if (watch := _watched.get()) is not None:
-                deadline, socks = watch
-                socks.append(self.sock)
-                if _clock() >= deadline:
-                    _shut(self.sock)
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            create = self._create_connection
+
+            def create_watched(*args, **kwargs):
+                sock = create(*args, **kwargs)
+                _register(sock)
+                return sock
+
+            self._create_connection = create_watched
+            context = getattr(self, "_context", None)
+            if isinstance(context, ssl.SSLContext):  # a context of this connection's own (http.client makes one)
+                context.sslsocket_class = _WatchedSSLSocket
 
     return Watched
 
@@ -308,16 +337,19 @@ def _escapes(member: tarfile.TarInfo, parts: list[str], top: str) -> bool:
         target = posixpath.normpath(posixpath.join(posixpath.dirname("/".join(parts)) or ".", member.linkname))
     else:  # a hard link names an archive member; pip strips the top folder from it as from names
         lead, _, rest = member.linkname.lstrip("/").partition("/")
-        if lead != top or not rest:
+        if lead != top:  # (one to the top folder itself names no earlier file: see _root_pyproject)
             return True
         target = posixpath.normpath(rest)
     return target == ".." or target.startswith("../")
 
 
 def _windows_alias(part: str) -> bool:
-    """A name Windows may read as another: a trailing dot or space is dropped, `:` opens a stream, and `~` is how
-    short (8.3) names are spelled. That covers `..` too, whose target pip may not even unpack into."""
-    return part.endswith((".", " ")) or ":" in part or "~" in part
+    """A name Windows may read as another: a trailing dot or space is dropped, and `:` opens a stream. That covers
+    `..` too, whose target pip may not even unpack into. (`~`, of short 8.3 names, is checked in _root_pyproject.)"""
+    return part.endswith((".", " ")) or ":" in part
+
+
+SDIST_MAX_NAMES = 16 * 1024 * 1024  # bytes of member names kept, to check hard links against
 
 
 def _root_pyproject(stream: _Limited) -> bytes | None:
@@ -327,15 +359,21 @@ def _root_pyproject(stream: _Limited) -> bytes | None:
     Wherever pip could end up with another file than this one, or would fail, this raises SdistRefused:
     - more than one top folder, a file in place of the top folder, or a member under pyproject.toml/;
     - a name with a backslash, or one Windows reads as another, `..` included (see _windows_alias);
-    - a link out of the sdist, a member written through a link, a device, or a member type pip doesn't know;
+    - a short (8.3) name that could be pyproject.toml's (`PYPROJ~1.TOM`), or a `~` anywhere in an sdist with links;
+    - a non-ASCII name right in the top folder: HFS+ ignores some code points (U+200C to U+200F and others), so
+      `pyproject.toml` with one of them added is pyproject.toml there;
+    - a link out of the sdist, a hard link to anything but an earlier file named exactly so, a member written
+      through a link, a device, or a member type pip doesn't know;
     - links together with non-ASCII names: macOS folds case and Unicode forms in ways a comparison here can't follow
       (ASCII lower-casing is exact, and no non-ASCII name folds to pyproject.toml);
-    - a pyproject.toml that isn't one plain file, spelled in lower case, with one content.
-    The whole tar is read, but only that file is kept.
+    - a pyproject.toml that isn't one plain file named exactly `<top>/pyproject.toml`, with one content.
+    The whole tar is read, but only that file is kept, and the names of earlier files (for hard links).
     """
     top: str | None = None
     links: set[str] = set()  # lower-cased paths of links seen so far
-    has_link = non_ascii = False
+    files: set[str] = set()  # names of the files so far, as written, for hard links (tarfile looks them up)
+    kept = 0
+    has_link = non_ascii = tilde = False
     found: bytes | None = None
     with tarfile.open(fileobj=stream, mode="r|", tarinfo=_TarInfo, encoding="utf-8") as tar:  # type: ignore[call-overload]
         while (member := tar.next()) is not None:
@@ -345,13 +383,19 @@ def _root_pyproject(stream: _Limited) -> bytes | None:
             if "\\" in member.name or "\\" in member.linkname:  # a separator on Windows only
                 raise SdistRefused("backslash in a name")
             non_ascii = non_ascii or not (member.name + member.linkname).isascii()
-            lead, _, rest = member.name.lstrip("/").partition("/")
+            tilde = tilde or "~" in member.name + member.linkname
+            name = member.name.lstrip("/")
+            lead, _, rest = name.partition("/")
             if not lead or top not in (None, lead):
                 raise SdistRefused("not one top folder")
             top = lead
             parts = [p for p in rest.split("/") if p not in ("", ".")]
             if any(_windows_alias(p) for p in (lead, *parts)):
                 raise SdistRefused("a name Windows reads as another")
+            if len(parts) == 1 and "~" in parts[0] and parts[0].lower().endswith(".tom"):
+                raise SdistRefused("a short name Windows may read as pyproject.toml")
+            if len(parts) == 1 and not parts[0].isascii():
+                raise SdistRefused("a non-ASCII name next to pyproject.toml")
             if not parts and not member.isdir():
                 raise SdistRefused("a file in place of the top folder")
             lowered = [p.lower() for p in parts]
@@ -363,16 +407,23 @@ def _root_pyproject(stream: _Limited) -> bytes | None:
             if member.issym() or member.islnk():
                 if _escapes(member, parts, lead):
                     raise SdistRefused("a link out of the sdist")
+                if member.islnk() and member.linkname.lstrip("/") not in files:
+                    raise SdistRefused("a hard link to no earlier file of that name")
                 has_link = True
                 links.add(path)
             elif member.isdev():
                 raise SdistRefused("a device")
-            if has_link and non_ascii:
-                raise SdistRefused("links and non-ASCII names")
+            elif member.isreg() and name not in files:
+                kept += len(name)
+                if kept > SDIST_MAX_NAMES:
+                    raise SdistRefused("too many members")
+                files.add(name)
+            if has_link and (non_ascii or tilde):
+                raise SdistRefused("links with non-ASCII names or a `~`")
             if path != "pyproject.toml":
                 continue
-            if member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE) or parts != ["pyproject.toml"]:
-                raise SdistRefused("pyproject.toml isn't a plain file")
+            if member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE) or rest != "pyproject.toml":
+                raise SdistRefused("pyproject.toml isn't a plain file named so")
             if member.size > PYPROJECT_MAX_BYTES:
                 raise SdistRefused("pyproject.toml too big")
             f = tar.extractfile(member)
@@ -405,7 +456,8 @@ def fetch_sdist_pyproject(
         headers = getattr(resp, "headers", None)
         declared = headers.get("Content-Length", "") if headers is not None else ""
         if declared.isdigit() and int(declared) > SDIST_MAX_BYTES:
-            raise SdistRefused("too big", verified=True)  # the server says so: no need to download it
+            # The server says so: no need to download it. Kept (cached) only for a download with a sha256 to check.
+            raise SdistRefused("too big", verified=sha256 is not None)
         digest = hashlib.sha256()
         packed = _Limited(resp, SDIST_MAX_BYTES, deadline, digest)
         refused: SdistRefused | None = None

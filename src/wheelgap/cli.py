@@ -1589,7 +1589,12 @@ def _main(argv: list[str]) -> int:
     source_allowed = not failing and any(Status.SOURCE in required_statuses(r, advisory) for r in gaps)
 
     build_info: dict[int, BuildInfo] | None = None  # None: not asked for
-    if args.explain and (args.build_info or config.get("build-info", False)) and not offline:
+    off_by = origin.other_index(index_url) or origin.index_env()  # no package counts as PyPI's for sure
+    if args.explain and (args.build_info or config.get("build-info", False)) and not offline and off_by:
+        if not quiet:
+            note = f"wheelgap: note: --build-info is off: packages may come from another index ({off_by})"
+            print(Style(use_color(args.color)).dim(note), file=sys.stderr)
+    elif args.explain and (args.build_info or config.get("build-info", False)) and not offline:
         # What each explained `source` release needs to build, from its sdist (only for packages positively from
         # PyPI: see build.where). Nothing here changes the exit code, and a release whose sdist gives no answer just
         # gets no line.

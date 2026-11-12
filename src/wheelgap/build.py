@@ -104,15 +104,24 @@ def _info(answer: dict | None) -> BuildInfo | None:
     return BuildInfo(requires, backend, answer["backend_path"], answer["build_script"])
 
 
+SHOWN = 50  # requirements shown at most, then "and N more"
+CLIP = 200  # characters of one requirement or backend name shown at most
+
+
+def _clip(text: str) -> str:
+    return text if len(text) <= CLIP else text[: CLIP - 1] + "…"
+
+
 def shown(req: Requirement) -> str:
-    """A requirement as wheelgap prints it: its normalized name, extras and specifiers, never the text as written."""
+    """A requirement as wheelgap prints it: its normalized name, extras and specifiers (never the text as written),
+    clipped to CLIP characters."""
     name: str = canonicalize_name(req.name)
     if req.extras:
         name += f"[{','.join(sorted(canonicalize_name(e) for e in req.extras))}]"
     if req.url:
-        return f"{name} (direct URL)"
+        return _clip(f"{name} (direct URL)")
     spec = str(req.specifier)
-    return name + spec if _SPECIFIER.fullmatch(spec) else name
+    return _clip(name + spec if _SPECIFIER.fullmatch(spec) else name)
 
 
 def requires_for(info: BuildInfo, targets: list[Target]) -> list[Requirement]:
@@ -133,7 +142,7 @@ def describe(info: BuildInfo, targets: list[Target]) -> str | None:
     requires = requires_for(info, targets)
     needs: dict[str, list[str]] = {}
     others: list[str] = []
-    for req in requires:
+    for req in requires[:SHOWN]:
         label = NEEDS.get(canonicalize_name(req.name))
         (needs.setdefault(label, []) if label else others).append(shown(req))
     items = [
@@ -142,9 +151,11 @@ def describe(info: BuildInfo, targets: list[Target]) -> str | None:
         if (names := needs.get(label))
     ]
     items += dict.fromkeys(others)
+    if len(requires) > SHOWN:
+        items.append(f"and {len(requires) - SHOWN} more")
     if info.backend_path and info.backend:
-        items.append(f"in-tree backend {info.backend}")
-    if not needs and _pure(info, requires):
+        items.append(f"in-tree backend {_clip(info.backend)}")
+    if not any(canonicalize_name(r.name) in NEEDS for r in requires) and _pure(info, requires):
         return f"no compiler ({', '.join(items)})"
     return f"at least {', '.join(items)}" if items else None
 
@@ -167,8 +178,13 @@ def _sdist(pkg: Package) -> str | None:
 def _on_pypi_files(url: str) -> bool:
     """A lock's sdist URL is fetched only from PyPI's file host: a lockfile doesn't get to choose where wheelgap
     connects to. PyPI never reuses a filename, so there the filename is the file."""
-    parts = urlsplit(url)
-    return parts.scheme == "https" and parts.hostname == PYPI_FILES and parts.port in (None, 443)
+    if not (url.isascii() and url.isprintable()) or " " in url:  # http.client would refuse it anyway
+        return False
+    try:
+        parts = urlsplit(url)
+        return parts.scheme == "https" and parts.hostname == PYPI_FILES and parts.port in (None, 443)
+    except ValueError:  # a malformed port or host
+        return False
 
 
 def where(pkg: Package, source: Source, simple_index: str | None = None) -> tuple[Release, str | None] | None:
@@ -254,6 +270,8 @@ def lookup(
         phase.stop("time")
         return None
     except urllib.error.HTTPError:  # the server answered: the others may still work
+        return None
+    except (http.client.InvalidURL, ValueError):  # this package's URL, not the network: the others may still work
         return None
     except (OSError, http.client.HTTPException):  # no connection, a timeout, a refused redirect: stop there
         phase.stop("connection")
