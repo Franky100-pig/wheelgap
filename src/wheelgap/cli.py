@@ -19,7 +19,7 @@ from packaging.markers import InvalidMarker, Marker
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
 
-from . import __version__, cache, condaforge
+from . import __version__, cache, condaforge, origin
 from .api import running_python
 from .check import CELL, EXPLAIN_LIMIT, Row, Status, check, explain, explain_lines, marker_holds, reachable
 from .dockerfile import DockerfileError, read_dockerfile
@@ -1060,7 +1060,7 @@ def conda_forge_hints(
 ) -> dict[int, condaforge.Hint]:
     """--conda-forge: look the gap packages up on anaconda.org and return their hints, by id() of the package. Only
     names that are positively PyPI's are sent; notes on stderr say which packages weren't looked up, and why."""
-    if not condaforge.index_allows(index_url):
+    if origin.other_index(index_url) is not None:
         if not quiet:
             print(
                 "wheelgap: note: --conda-forge looks nothing up when packages come from another index "
@@ -1072,7 +1072,7 @@ def conda_forge_hints(
     asked, private = [], []
     for r in gaps:
         if r.package.version and condaforge.wanted(gap_targets(r, targets)):
-            if condaforge.may_send(r.package, source_of[id(r.package)]):
+            if origin.known_pypi(r.package, source_of[id(r.package)], simple_index=index_url):
                 asked.append(r)
             else:
                 private.append(r.package.name)

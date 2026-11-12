@@ -80,8 +80,31 @@ def save_files(index: str, name: str, version: str, files: list[dict]) -> None:
 
 
 # --conda-forge entries: keyed apart from PyPI's, and versioned, since what's kept may change.
-CONDA_FORGE_KEY = "condaforge-v1 https://api.anaconda.org/package/conda-forge"
+CONDA_FORGE_KEY = "condaforge-v2 https://api.anaconda.org/package/conda-forge"
 TOO_LARGE = "too large"  # the answer was over condaforge.MAX_BYTES
+
+
+def _str_or_none(value: object) -> bool:
+    return value is None or isinstance(value, str)
+
+
+def _strings(value: object) -> bool:
+    return isinstance(value, list) and all(isinstance(x, str) for x in value)
+
+
+def _is_build(b: object) -> bool:
+    """A condaforge.Build, as condaforge._build makes it."""
+    return (
+        isinstance(b, dict)
+        and set(b) == {"subdir", "abi", "python", "os", "glibc", "osx", "other_virtual"}
+        and isinstance(b["subdir"], str)
+        and _str_or_none(b["abi"])
+        and (b["python"] is None or _strings(b["python"]))
+        and _strings(b["os"])
+        and _str_or_none(b["glibc"])
+        and _str_or_none(b["osx"])
+        and isinstance(b["other_virtual"], bool)
+    )
 
 
 def load_builds(name: str, version: str) -> list[dict] | str | None:
@@ -90,22 +113,9 @@ def load_builds(name: str, version: str) -> list[dict] | str | None:
     builds = _load(CONDA_FORGE_KEY, name, version, "builds")
     if builds == TOO_LARGE:
         return TOO_LARGE
-    if not isinstance(builds, list):
-        return None
-    for b in builds:
-        if not (
-            isinstance(b, dict)
-            and set(b) == {"subdir", "abi", "python", "os"}
-            and isinstance(b["subdir"], str)
-            and (b["abi"] is None or isinstance(b["abi"], str))
-            and (
-                b["python"] is None or (isinstance(b["python"], list) and all(isinstance(x, str) for x in b["python"]))
-            )
-            and isinstance(b["os"], list)
-            and all(isinstance(x, str) for x in b["os"])
-        ):
-            return None
-    return builds
+    if isinstance(builds, list) and all(_is_build(b) for b in builds):
+        return builds
+    return None
 
 
 def save_builds(name: str, version: str, builds: list[dict] | str) -> None:

@@ -733,19 +733,37 @@ def _pinned_version(req: Requirement) -> str | None:
     return None
 
 
+# uv settings (in [tool.uv], [tool.uv.pip] or uv.toml) that point it at an index or a folder of distributions.
+_UV_INDEX_KEYS = ("index", "sources", "index-url", "extra-index-url", "find-links", "no-index", "default-index")
+
+
+def _table(data: object, name: str) -> dict:
+    value = data.get(name) if isinstance(data, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+def _uv_names_an_index(uv: dict) -> bool:
+    return any(k in uv for k in _UV_INDEX_KEYS) or any(k in _table(uv, "pip") for k in _UV_INDEX_KEYS)
+
+
+def _sibling_uv_toml_names_an_index(path: Path) -> bool:
+    """A uv.toml next to the input that configures an index. One that can't be read counts as naming one."""
+    uv_toml = path.parent / "uv.toml"
+    if not uv_toml.exists():
+        return False
+    try:
+        return _uv_names_an_index(tomllib.loads(uv_toml.read_text(encoding="utf-8")))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return True
+
+
 def _names_an_index(pyproject: dict) -> bool:
     """Whether a pyproject.toml configures an index or source for an installer (uv, Poetry, PDM), so its
     dependencies may come from somewhere other than PyPI."""
-    tool = pyproject.get("tool")
-    if not isinstance(tool, dict):
-        return False
-
-    def table(name: str) -> dict:
-        value = tool.get(name)
-        return value if isinstance(value, dict) else {}
-
-    uv_keys = ("index", "sources", "index-url", "extra-index-url", "find-links", "no-index")
-    return any(k in table("uv") for k in uv_keys) or "source" in table("poetry") or "source" in table("pdm")
+    tool = _table(pyproject, "tool")
+    return (
+        _uv_names_an_index(_table(tool, "uv")) or "source" in _table(tool, "poetry") or "source" in _table(tool, "pdm")
+    )
 
 
 def parse_pyproject(path: Path) -> Source:
@@ -798,7 +816,7 @@ def parse_pyproject(path: Path) -> Source:
         path.name,
         pyproject_extras=extras,
         pyproject_dynamic_extras="optional-dependencies" in dynamic,
-        pypi_only=not _names_an_index(data),
+        pypi_only=not (_names_an_index(data) or _sibling_uv_toml_names_an_index(path)),
     )
     if isinstance(requires_python := project.get("requires-python"), str):
         source.requires_python = requires_python
@@ -897,7 +915,20 @@ _CONSTRAINT_RE = re.compile(r"^(?:-c(?:\s+|=)?|--constraint(?:\s+|=))(\S.*)$")
 
 
 # pip options that point at an index or a folder of distributions other than PyPI's (or turn PyPI off).
-_INDEX_OPTION_RE = re.compile(r"(-i|--index-url|--extra-index-url|-f|--find-links|--no-index)(?![A-Za-z-])")
+_INDEX_OPTIONS = ("--index-url", "--extra-index-url", "--find-links", "--no-index")
+
+
+def _names_index_option(line: str) -> bool:
+    """Whether a requirements line has an index option anywhere on it, as pip reads them: `-i URL`, `-iURL`,
+    `--index-url=URL`, `-f`, `--find-links`, `--extra-index-url`, `--no-index`, or an abbreviation of a long one
+    (optparse accepts unambiguous prefixes)."""
+    for token in line.split():
+        if token.startswith(("-i", "-f")) and not token.startswith("--"):
+            return True
+        option = token.split("=", 1)[0]
+        if len(option) > 2 and option.startswith("--") and any(name.startswith(option) for name in _INDEX_OPTIONS):
+            return True
+    return False
 
 
 def parse_requirements(path: Path) -> Source:
@@ -925,7 +956,9 @@ def parse_requirements(path: Path) -> Source:
             for entry in entries:
                 spec &= SpecifierSet(entry.spec or "")
             pkg.spec = str(spec) or None
-    return Source(path.name, pkgs, requirements=True, pypi_only=not index_options)
+    return Source(
+        path.name, pkgs, requirements=True, pypi_only=not index_options and not _sibling_uv_toml_names_an_index(path)
+    )
 
 
 def _read_requirements(
@@ -947,6 +980,8 @@ def _read_requirements(
         line = _COMMENT_RE.split(raw, 1)[0].strip()  # " # note" or "<TAB># note"
         if not line or line.startswith("#"):
             continue
+        if index_options is not None and _names_index_option(line):
+            index_options.append(line)
         if m := _CONSTRAINT_RE.match(line):
             target = m.group(1).strip()
             # A URL (-c https://releases.openstack.org/...) or ${VAR} is left to pip: it's skipped, as before.
@@ -963,8 +998,6 @@ def _read_requirements(
             append(Package(name, None, skip="editable", origin=path.name))
             continue
         if line.startswith("-"):
-            if index_options is not None and _INDEX_OPTION_RE.match(line):
-                index_options.append(line)
             continue  # pip options: --index-url, --hash continuation, ...
         tokens = line.split()
         # Drop --hash=sha256:... and "--hash sha256:..." (option and value as two tokens).

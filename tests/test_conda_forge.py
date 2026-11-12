@@ -10,7 +10,7 @@ import pytest
 from conftest import FAKE_CONDA_FORGE, conda_file, cp
 from test_cli import _assert_matches_output_schema, run
 
-from wheelgap import cache, condaforge, pypi
+from wheelgap import cache, condaforge, origin, pypi
 from wheelgap.targets import Target
 
 API = "https://api.anaconda.org/package/conda-forge/"
@@ -159,8 +159,22 @@ def T(python, platform="linux-x86_64"):
     return Target(int(python[0]), int(python.rstrip("t").split(".")[1]), python.endswith("t"), platform)
 
 
-def B(subdir="linux-64", abi=None, python=None, os=()):
-    return {"subdir": subdir, "abi": abi, "python": python, "os": list(os)}
+def B(subdir="linux-64", abi=None, python=None, os=(), glibc=None, osx=None, other_virtual=False):
+    return {
+        "subdir": subdir,
+        "abi": abi,
+        "python": python,
+        "os": list(os),
+        "glibc": glibc,
+        "osx": osx,
+        "other_virtual": other_virtual,
+    }
+
+
+def TG(python, platform="linux-x86_64", glibc=(2, 36), macos=(14, 0)):
+    return Target(
+        int(python[0]), int(python.rstrip("t").split(".")[1]), python.endswith("t"), platform, glibc, macos=macos
+    )
 
 
 @pytest.mark.parametrize(
@@ -185,7 +199,23 @@ def B(subdir="linux-64", abi=None, python=None, os=()):
         (B(python=[">=3.8,<3.9.0a0"]), T("3.9"), False),
         (B(python=[]), T("3.13"), False),  # compiled, with no way to tell its Python
         (B(python=["2.7*"]), T("3.13"), False),
-        (B(python=["~=3.13"]), T("3.13"), False),  # can't be told: never counts
+        (B(python=["~=3"]), T("3.13"), False),  # can't be told: never counts
+        (B(python=["~=3.13.0"]), T("3.13"), True),
+        (B(abi="cp313", python=[], other_virtual=True), T("3.13"), False),  # __cuda and the like
+        (B("noarch", python=[], os=["__linux"]), T("3.13", "macos-arm64"), False),
+        (B("noarch", python=[], os=["__linux"]), T("3.13", "linux-aarch64"), True),
+        (B("noarch", python=[], os=["__glibc"], glibc=">=2.17"), T("3.13", "macos-arm64"), False),
+        (B("noarch", python=[], os=["__glibc"], glibc=">=2.17"), T("3.13", "linux-aarch64"), True),
+        (B("linux-riscv64", "cp313", [], ["__glibc"], ">=2.39,<3.0.a0"), TG("3.13", "linux-riscv64"), False),
+        (B("linux-riscv64", "cp313", [], ["__glibc"], ">=2.39,<3.0.a0"), TG("3.13", "linux-riscv64", (2, 39)), True),
+        (B("linux-64", "cp313", [], ["__glibc"], ""), TG("3.13", glibc=(2, 17)), True),  # a bare __glibc
+        (B("linux-64", "cp313", [], ["__glibc"], ">=x"), TG("3.13"), False),  # can't be told
+        (B("osx-arm64", "cp313", [], ["__osx"], osx=">=11.0"), TG("3.13", "macos-arm64", macos=(10, 15)), False),
+        (B("osx-arm64", "cp313", [], ["__osx"], osx=">=11.0"), TG("3.13", "macos-arm64", macos=(11, 0)), True),
+        (B(abi="abi3", python=[">=3.11"]), T("3.13"), True),
+        (B(abi="abi3", python=[">=3.11"]), T("3.13t"), False),  # the stable ABI isn't free-threaded's
+        (B(abi="abi3", python=[">=3.11"]), T("3.10"), False),
+        (B(abi="abi3", python=[]), T("3.13"), False),  # no cpython constraint: can't be told
         (B("osx-64", abi="cp313", python=[]), T("3.13"), False),  # another subdir
         (B("win-32", abi="cp313", python=[]), T("3.13", "win32"), False),  # a dead subdir
     ],
@@ -211,8 +241,20 @@ def test_fits(build, target, fits):
         ("3.13.*", (3, 1), False),
         ("3", (3, 13), True),
         (">=3.8,<3.9.0a0", (3, 8), True),
-        ("3.9.1", (3, 9), None),  # one patch release
-        ("~=3.9", (3, 9), None),
+        ("3.9.1", (3, 9), True),  # one patch release: some 3.9 meets it
+        ("3.13.2", (3, 13), True),
+        ("3.13.2", (3, 12), False),
+        ("=3.9", (3, 9), True),  # conda's fuzzy =3.9 is 3.9.*
+        ("=3.9", (3, 10), False),
+        ("~=3.9", (3, 9), True),
+        ("~=3.9.0", (3, 9), True),
+        ("~=3.9.0", (3, 10), False),
+        (">=3.8,!=3.9.*", (3, 9), False),
+        (">=3.8,!=3.9.*", (3, 10), True),
+        (">=3.9.5,<3.9.6", (3, 9), True),  # only 3.9.5
+        ("<3.9.0", (3, 9), False),
+        ("*", (3, 9), True),
+        ("~=3", (3, 9), None),
         (">=3.9.*", (3, 9), None),
         (">=x", (3, 9), None),
     ],
@@ -234,9 +276,35 @@ def test_parse_builds_keeps_the_version_s_main_unbroken_builds():
         "junk",
     ]
     assert condaforge.parse_builds({"files": files}, "0.9") == [
-        {"subdir": "linux-64", "abi": "cp313", "python": [], "os": []},
-        {"subdir": "noarch", "abi": None, "python": [">=3.8"], "os": ["__unix"]},
+        B(abi="cp313", python=[]),
+        B("noarch", python=[">=3.8"], os=["__unix"]),
     ]
+
+
+def test_parse_builds_reads_real_shaped_depends():
+    files = [
+        # linux-aarch64 numpy builds name the interpreter as `python 3.12.* *_cpython`: the build string isn't a
+        # version constraint.
+        conda_file(
+            "0.9",
+            "linux-aarch64",
+            "python",
+            "python 3.12.* *_cpython",
+            "python_abi 3.12.* *_cp312",
+            "__glibc >=2.17,<3.0.a0",
+        ),
+        conda_file("0.9", "osx-64", "python", "__osx >=11.0", "_python_abi3_support 1.*", "cpython >=3.11"),
+        conda_file("0.9", "linux-64", "python", "python_abi 3.12.* *_cp312", "__cuda >=12"),
+    ]
+    builds = condaforge.parse_builds({"files": files}, "0.9")
+    assert builds == [
+        B("linux-aarch64", "cp312", ["3.12.*"], ["__glibc"], ">=2.17,<3.0.a0"),
+        B("osx-64", "abi3", [">=3.11"], ["__osx"], osx=">=11.0"),
+        B("linux-64", "cp312", [], other_virtual=True),
+    ]
+    assert condaforge.fits(builds[0], T("3.12", "linux-aarch64"))
+    assert condaforge.fits(builds[1], T("3.13", "macos-x86_64"))
+    assert not condaforge.fits(builds[2], T("3.12"))
 
 
 @pytest.mark.parametrize("data", [[], {}, {"files": None}, {"files": "x"}])
@@ -276,6 +344,8 @@ def pipfile(sources, index=None):
 
 PYPI_SOURCE = {"name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": True}
 CORP_SOURCE = {"name": "corp", "url": "https://pypi.corp.example/simple", "verify_ssl": True}
+PIPFILE_PYPI = pipfile([PYPI_SOURCE])
+PIPFILE_CORP = pipfile([CORP_SOURCE, PYPI_SOURCE])
 PYPROJECT = "[project]\nname = 'app'\nversion = '0'\ndependencies = ['nowheels==0.9']\n"
 PDM_LOCK = (
     '[metadata]\ngroups = ["default"]\nstrategy = ["inherit_metadata"]\n\n[[package]]\nname = "nowheels"\n'
@@ -301,7 +371,51 @@ POETRY_LOCK = (
             },
             False,
         ),
+        ({"requirements.txt": "-ihttps://pypi.corp.example/simple\nnowheels==0.9\n"}, False),
+        ({"requirements.txt": "-f ./wheels\nnowheels==0.9\n"}, False),
+        ({"requirements.txt": "-f./wheels\nnowheels==0.9\n"}, False),
+        ({"requirements.txt": "--find-links=./wheels\nnowheels==0.9\n"}, False),
+        ({"requirements.txt": "--no-index\nnowheels==0.9\n"}, False),
+        ({"requirements.txt": "--extra-index=https://x.example/simple\nnowheels==0.9\n"}, False),  # abbreviated
+        ({"requirements.txt": "--trusted-host h.example --index-url https://h.example/simple\nnowheels==0.9\n"}, False),
+        (
+            {
+                "requirements.txt": "--trusted-host h.example \\\n  --index-url https://h.example/simple\nnowheels==0.9\n"
+            },
+            False,
+        ),
+        (
+            {"requirements.txt": "-c cons.txt\nnowheels==0.9\n", "cons.txt": "--index-url https://x.example/simple\n"},
+            False,
+        ),
+        ({"requirements.txt": "--pre\n--trusted-host h.example\nnowheels==0.9 --hash=sha256:00\n"}, True),  # no index
+        ({"requirements.txt": "nowheels==0.9\n", "uv.toml": "index-url = 'https://x.example/simple'\n"}, False),
+        (
+            {
+                "requirements.txt": "nowheels==0.9\n",
+                "uv.toml": "[pip]\nextra-index-url = ['https://x.example/simple']\n",
+            },
+            False,
+        ),
+        ({"requirements.txt": "nowheels==0.9\n", "uv.toml": "not toml ["}, False),  # can't be read: maybe an index
+        ({"requirements.txt": "nowheels==0.9\n", "uv.toml": "native-tls = true\n"}, True),
         ({"pyproject.toml": PYPROJECT}, True),
+        ({"pyproject.toml": PYPROJECT + "\n[tool.uv]\nindex-url = 'https://pypi.corp.example/simple'\n"}, False),
+        ({"pyproject.toml": PYPROJECT + "\n[tool.uv.sources]\nnowheels = { index = 'corp' }\n"}, False),
+        ({"pyproject.toml": PYPROJECT + "\n[tool.uv.pip]\nindex-url = 'https://pypi.corp.example/simple'\n"}, False),
+        (
+            {
+                "pyproject.toml": PYPROJECT
+                + "\n[[tool.poetry.source]]\nname = 'corp'\nurl = 'https://x.example/simple'\n"
+            },
+            False,
+        ),
+        (
+            {"pyproject.toml": PYPROJECT + "\n[[tool.pdm.source]]\nname = 'corp'\nurl = 'https://x.example/simple'\n"},
+            False,
+        ),
+        ({"pyproject.toml": PYPROJECT + "\n[tool.uv]\npackage = false\n"}, True),
+        ({"pyproject.toml": PYPROJECT, "uv.toml": "[[index]]\nurl = 'https://x.example/simple'\n"}, False),
         ({"pyproject.toml": PYPROJECT + "\n[[tool.uv.index]]\nurl = 'https://pypi.corp.example/simple'\n"}, False),
         ({"Pipfile.lock": pipfile([PYPI_SOURCE], "pypi")}, True),
         ({"Pipfile.lock": pipfile([PYPI_SOURCE])}, True),  # the only source is PyPI
@@ -323,6 +437,46 @@ def test_only_names_known_to_be_on_pypi_are_sent(capsys, fake_pypi, tmp_path, fi
     assert conda_calls(fake_pypi) == [API + "nowheels"] * sent
     assert ("conda-forge has a package named nowheels" in out) is sent
     assert ("didn't look up 1 package whose index isn't known to be PyPI (nowheels)" in err) is not sent
+
+
+@pytest.mark.parametrize("variable", origin.INDEX_ENV)
+def test_an_index_in_the_environment_keeps_found_names_private(capsys, fake_pypi, monkeypatch, tmp_path, variable):
+    monkeypatch.setenv(variable, "https://pypi.corp.example/simple")
+    _, out, err = run(capsys, "nowheels==0.9", "-t", "linux-aarch64", *FLAGS)
+    assert not conda_calls(fake_pypi) and "didn't look up 1 package" in err
+    # A lock that says the package came from pypi.org still counts.
+    (tmp_path / "uv.lock").write_text(uv_lock("https://pypi.org/simple"), encoding="utf-8")
+    _, out, _ = run(capsys, str(tmp_path / "uv.lock"), "-t", "linux-aarch64", *FLAGS)
+    assert conda_calls(fake_pypi) == [API + "nowheels"]
+
+
+def test_index_env_is_the_agreed_list():
+    assert origin.INDEX_ENV == (
+        "PIP_INDEX_URL",
+        "PIP_EXTRA_INDEX_URL",
+        "PIP_FIND_LINKS",
+        "UV_INDEX_URL",
+        "UV_DEFAULT_INDEX",
+        "UV_INDEX",
+        "UV_EXTRA_INDEX_URL",
+    )
+
+
+def test_glibc_and_macos_minimums(capsys, fake_pypi, monkeypatch):
+    # Real-shaped: conda-forge's linux-riscv64 builds need glibc 2.39, its osx-arm64 builds macOS 11.
+    monkeypatch.setitem(
+        FAKE_CONDA_FORGE,
+        "nowheels",
+        [
+            conda_file("0.9", "linux-riscv64", "python", "python_abi 3.13.* *_cp313", "__glibc >=2.39,<3.0.a0"),
+            conda_file("0.9", "osx-arm64", "python", "python_abi 3.13.* *_cp313", "__osx >=11.0"),
+        ],
+    )
+    args = ["nowheels==0.9", "-t", "linux-riscv64", "-t", "macos-arm64", *FLAGS, "--no-cache"]
+    hints, _ = json_hints(capsys, *args)
+    assert hints["nowheels"]["builds"] == {"macos-arm64": ["osx-arm64"]}  # the default glibc is 2.36
+    hints, _ = json_hints(capsys, *args, "--glibc", "2.39", "--macos", "10.15")
+    assert hints["nowheels"]["builds"] == {"linux-riscv64": ["linux-riscv64"]}
 
 
 def test_command_line_names_and_gaps_only(capsys, fake_pypi):
@@ -410,9 +564,9 @@ def test_answers_are_cached_but_not_with_no_cache(capsys, fake_pypi, monkeypatch
     # A match and a 404 are answers, kept for a day.
     assert not conda_calls(fake_pypi) and "named nowheels with 0.9 builds" in out
     assert cache.load_builds("nowheels", "0.9") == [
-        {"subdir": "linux-64", "abi": "cp313", "python": [], "os": []},
-        {"subdir": "linux-aarch64", "abi": "cp313", "python": [], "os": []},
-        {"subdir": "win-64", "abi": "cp312", "python": [], "os": []},  # kept: matching happens per target
+        B(abi="cp313", python=[]),
+        B("linux-aarch64", abi="cp313", python=[]),
+        B("win-64", abi="cp312", python=[]),  # kept: matching happens per target
     ]
     assert cache.load_builds("forked", "1.0") == []
     run(capsys, *args, "--no-cache")
@@ -442,6 +596,10 @@ def test_too_large_is_cached(capsys, fake_pypi, monkeypatch):
         [{"subdir": "linux-64", "abi": None, "python": [3], "os": []}],
         [{"subdir": "linux-64", "abi": None, "python": None, "os": "__win"}],
         [{"subdir": "linux-64", "abi": None, "python": None, "os": [1]}],
+        [B() | {"glibc": 2.17}],
+        [B() | {"osx": [">=11.0"]}],
+        [B() | {"other_virtual": "no"}],
+        [B() | {"other_virtual": None}],
         ["linux-64"],
     ],
 )
@@ -451,11 +609,14 @@ def test_load_builds_refuses_odd_entries(value):
 
 
 def test_conda_forge_entries_are_keyed_apart_from_pypi_ones():
-    good = [{"subdir": "linux-64", "abi": "cp313", "python": ["3.13.*"], "os": []}]
+    good = [
+        B(abi="cp313", python=["3.13.*"], os=["__glibc"], glibc=">=2.17"),
+        B("noarch", python=[], other_virtual=True),
+    ]
     cache.save_builds("nowheels", "0.9", good)
     assert cache.load_builds("nowheels", "0.9") == good
     assert cache.load_files(cache.CONDA_FORGE_KEY, "nowheels", "0.9") is None
-    assert cache.CONDA_FORGE_KEY.startswith("condaforge-v1 ")
+    assert cache.CONDA_FORGE_KEY.startswith("condaforge-v2 ")  # v2: builds keep __glibc, __osx and other virtuals
 
 
 def test_names_are_quoted(monkeypatch):
@@ -481,6 +642,30 @@ def test_a_slow_answer_doesn_t_stop_the_rest(monkeypatch):
     monkeypatch.setattr(pypi, "fetch_json", fetch_json)
     lookups = condaforge.look_up_all([("a", "1"), ("b", "1")])
     assert len(calls) == 2 and lookups.unchecked == ["a"] and not lookups.stopped
+
+
+def test_memory_bounds_are_pinned():
+    # README: at most about 250 MB in use (3 workers x a 16 MB answer x about 4.5 when parsed).
+    assert condaforge.MAX_BYTES == 16 * 1024 * 1024 and condaforge.WORKERS == 3
+
+
+def test_workers_are_daemon_threads(monkeypatch):
+    started = []
+    real = threading.Thread
+
+    def thread(*args, **kwargs):
+        t = real(*args, **kwargs)
+        started.append(t)
+        return t
+
+    release = threading.Event()
+    monkeypatch.setattr(condaforge.threading, "Thread", thread)
+    monkeypatch.setattr(pypi, "fetch_json", lambda url, **kw: release.wait(10) and {"files": []})
+    try:
+        condaforge.look_up_all([("a", "1")], deadline=0.1)
+        assert started and all(t.daemon for t in started)  # a stalled request can't hold up the exit
+    finally:
+        release.set()
 
 
 def test_first_connection_failure_stops_the_rest(monkeypatch):

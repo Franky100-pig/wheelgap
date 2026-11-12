@@ -36,7 +36,8 @@ uv run --group dev pytest
 | `dockerfile.py` | `--dockerfile`: reads the final stage's image and platform the way Docker/BuildKit does |
 | `offline.py` | `--offline`, `offline = true` and `check_lockfile(..., offline=True)`: refuse inputs that would need an index lookup |
 | `pyodide.py` | `--pyodide-lock`: packages Pyodide ships itself |
-| `condaforge.py` | `--conda-forge`: under `--explain`, whether conda-forge has a package of the same name with builds for a gap's platform (anaconda.org, through `pypi.fetch_json`) |
+| `condaforge.py` | `--conda-forge`: under `--explain`, whether conda-forge has a build of the same package and version that fits a gap's target (anaconda.org, through `pypi.fetch_json`) |
+| `origin.py` | `known_pypi`: whether a package is positively PyPI's, so its name may go to another service (`--conda-forge`); never for private-index names |
 | `github.py` | `--github-annotations`: GitHub Actions `::error`/`::warning` lines, and each package's line in its input file |
 | `scan.py` | `python -m wheelgap.scan`: the data behind the [coverage tracker](https://wheelgap.github.io/tracker/) |
 | `diff.py` | `python -m wheelgap.diff OLD NEW`: packages that got worse between two lockfiles, and new packages with gaps |

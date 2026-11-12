@@ -67,7 +67,9 @@ def pytest_configure(config):
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     """Tests shouldn't depend on the developer's colour or index settings, or on running in GitHub Actions."""
-    for name in ("NO_COLOR", "FORCE_COLOR", "WHEELGAP_INDEX_URL", "GITHUB_WORKSPACE"):
+    from wheelgap.origin import INDEX_ENV
+
+    for name in ("NO_COLOR", "FORCE_COLOR", "WHEELGAP_INDEX_URL", "GITHUB_WORKSPACE", *INDEX_ENV):
         monkeypatch.delenv(name, raising=False)
 
 

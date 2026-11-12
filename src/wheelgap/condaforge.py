@@ -3,16 +3,21 @@
 Only a hint under --explain: a conda-forge build doesn't make `pip install` work, and a conda package of the same name
 may be another project. So it never changes a status, the summary or the exit code.
 
-A build counts for a target when it's of the checked version, on conda-forge's main label and not marked broken, for
-the target's conda subdir (or noarch), and for the target's Python: the same CPython minor version and ABI
-(free-threaded or not) by its python_abi dependency, or a noarch build whose python constraints admit that Python.
+A build counts for a target when all of these hold (see fits()):
+- it's of the checked version, on conda-forge's main label and not marked broken;
+- it's for the target's conda subdir, or noarch;
+- its virtual-package dependencies hold there: __glibc and __osx minimums against the target's glibc and macOS
+  versions, and a noarch build's __win, __unix, __linux, __osx or __glibc limit it to those OSes (any other virtual
+  package, such as __cuda, can't be told, so the build doesn't count);
+- it's for the target's Python: the same CPython minor version and ABI (free-threaded or not) by its python_abi
+  dependency; an abi3 build (_python_abi3_support) for any non-free-threaded CPython its cpython constraint admits;
+  a noarch build whose python constraints admit that Python.
 A build whose Python can't be told never counts.
 """
 
 from __future__ import annotations
 
 import json
-import operator
 import re
 import threading
 import time
@@ -22,10 +27,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from urllib.parse import quote
 
+from packaging.specifiers import InvalidSpecifier, Specifier
 from packaging.version import InvalidVersion, Version
 
 from . import cache, pypi
-from .sources import Package, Source
+from .sources import Package
 from .targets import PLATFORMS, Target
 
 # One package's files on anaconda.org, each with its version, labels and attrs (subdir, depends).
@@ -54,32 +60,28 @@ SUBDIRS = {
     "win-amd64": "win-64",
     "win-arm64": "win-arm64",
 }
-# A noarch build that depends on one of these virtual packages installs only on those OSes (wheelgap's families).
-NOARCH_OS = {"__win": {"windows"}, "__unix": {"manylinux", "macos"}, "__linux": {"manylinux"}, "__osx": {"macos"}}
+# A build that depends on one of these virtual packages installs only on those OSes (wheelgap's families).
+VIRTUAL_OS = {
+    "__win": {"windows"},
+    "__unix": {"manylinux", "macos"},
+    "__linux": {"manylinux"},
+    "__glibc": {"manylinux"},
+    "__osx": {"macos"},
+}
 
-# A build, cut down to what matching needs: {"subdir", "abi" (python_abi's build string, e.g. cp314t, or None),
-# "python" (the version constraints of its python dependencies, or None when it has none), "os" (NOARCH_OS keys)}.
+# A build, cut down to what matching needs:
+# - subdir;
+# - abi: python_abi's build string (cp314, cp314t), "abi3" for an abi3 build, or None;
+# - python: the version constraints of its python (and, for abi3, cpython) dependencies, or None when it has none;
+# - os: the VIRTUAL_OS names it depends on;
+# - glibc, osx: the version constraint of its __glibc / __osx dependency ("" for none), or None without one;
+# - other_virtual: it depends on a virtual package wheelgap can't check (__cuda, __archspec...).
 Build = dict
+BUILD_KEYS = {"subdir", "abi", "python", "os", "glibc", "osx", "other_virtual"}
 
 
 class Unreachable(Exception):
     """anaconda.org couldn't be reached (DNS, a refused or timed-out connection): the other lookups would fail too."""
-
-
-def index_allows(simple_index: str | None) -> bool:
-    """Whether this run may look anything up: not when packages come from another index (--index-url, or
-    WHEELGAP_INDEX_URL set to a mirror), which may hold private names alongside PyPI's."""
-    return simple_index is None and pypi.index_url() == pypi.DEFAULT_INDEX
-
-
-def may_send(pkg: Package, source: Source) -> bool:
-    """Whether the package's name may go to anaconda.org: it's positively on PyPI. Either its lock says it came from
-    PyPI (uv.lock's registry, pylock.toml's index), or this run found it on pypi.org and its input names no other
-    index (Source.pypi_only). Anything else, such as a pdm.lock, a pylock.toml entry with no index, or a requirements
-    file with an --index-url line, may hold private names, so it's never sent."""
-    if pkg.skip:
-        return False
-    return (pkg.registry is not None and pypi.is_pypi(pkg.registry)) or (pkg.found_on_pypi and source.pypi_only)
 
 
 def wanted(targets: Iterable[Target]) -> bool:
@@ -99,28 +101,46 @@ def _build(f: object, version: str) -> Build | None:
     if not isinstance(f, dict):
         return None
     attrs, labels, v = f.get("attrs"), f.get("labels"), f.get("version")
-    if not (
-        isinstance(attrs, dict)
-        and isinstance(labels, list)
-        and isinstance(v, str)
-        and isinstance(attrs.get("subdir"), str)
-    ):
+    if not (isinstance(attrs, dict) and isinstance(labels, list) and isinstance(v, str)):
         return None
-    if "main" not in labels or "broken" in labels or not _same_version(v, version):
+    if not isinstance(attrs.get("subdir"), str) or "main" not in labels or "broken" in labels:
+        return None
+    if not _same_version(v, version):
         return None
     depends = attrs.get("depends")
-    abi, python, os = None, None, []
+    build: Build = {
+        "subdir": attrs["subdir"],
+        "abi": None,
+        "python": None,
+        "os": [],
+        "glibc": None,
+        "osx": None,
+        "other_virtual": False,
+    }
+    abi3, cpython = False, []
     for dep in depends if isinstance(depends, list) else []:
         parts = dep.split() if isinstance(dep, str) else []
         if not parts:
             continue
-        if parts[0] == "python_abi" and len(parts) >= 3:
-            abi = parts[2].removeprefix("*_")
-        elif parts[0] == "python":
-            python = (python or []) + parts[1:2]  # a bare `python` adds no constraint, but says it's a Python build
-        elif parts[0] in NOARCH_OS:
-            os.append(parts[0])
-    return {"subdir": attrs["subdir"], "abi": abi, "python": python, "os": sorted(set(os))}
+        name, spec = parts[0], parts[1:2]  # [name, version, build]: the build string isn't a version constraint
+        if name == "python_abi" and len(parts) >= 3:
+            build["abi"] = parts[2].removeprefix("*_")
+        elif name == "python":
+            build["python"] = (build["python"] or []) + spec  # a bare `python` adds no constraint
+        elif name == "cpython":
+            cpython += spec
+        elif name == "_python_abi3_support":
+            abi3 = True
+        elif name in VIRTUAL_OS:
+            build["os"] = sorted({*build["os"], name})
+            if name in ("__glibc", "__osx"):
+                build[name[2:]] = ",".join(filter(None, [build[name[2:]], *spec]))
+        elif name.startswith("__"):
+            build["other_virtual"] = True
+    if abi3 and build["abi"] is None:
+        build["abi"] = "abi3"
+        build["python"] = (build["python"] or []) + cpython
+    return build
 
 
 def parse_builds(data: object, version: str) -> list[Build]:
@@ -132,54 +152,91 @@ def parse_builds(data: object, version: str) -> list[Build]:
     return list({json.dumps(b, sort_keys=True): b for b in builds}.values())  # one per kind of build
 
 
-_OPS = {">=": operator.ge, "<=": operator.le, ">": operator.gt, "<": operator.lt, "==": operator.eq, "!=": operator.ne}
-_PART = re.compile(r"(>=|<=|==|!=|>|<)?([0-9][0-9A-Za-z.]*?)(\.?\*)?")
+_PART = re.compile(r"(>=|<=|==|!=|~=|>|<|=)?\s*([0-9][0-9A-Za-z.]*?)?(\.?\*)?")
+
+
+def _part(text: str):
+    """One conda version constraint (no `,` or `|`) as a test of a Version, and the version it names; None when it
+    can't be told. Globs and bare versions are prefix matches (conda reads `3.9` and `=3.9` as `3.9.*`); the rest
+    are packaging specifiers."""
+    m = _PART.fullmatch(text.strip())
+    if not m or not (m.group(2) or m.group(3)):
+        return None
+    op, ver, star = m.groups()
+    if ver is None:  # `*`: any version
+        return (lambda v: True), None
+    try:
+        named = Version(ver)
+    except InvalidVersion:
+        return None
+    if star or op in (None, "="):
+        if op not in (None, "=", "==", "!="):
+            return None  # `>=3.9.*` and the like
+        comps = ver.split(".")
+        if not all(c.isdigit() for c in comps):
+            return None
+        prefix = [int(c) for c in comps]
+
+        def glob(v: Version) -> bool:
+            return list(v.release[: len(prefix)]) + [0] * (len(prefix) - len(v.release)) == prefix
+
+        return ((lambda v: not glob(v)) if op == "!=" else glob), named
+    try:
+        spec = Specifier(f"{op}{ver}")
+    except InvalidSpecifier:
+        return None
+    return (lambda v: spec.contains(v, prereleases=True)), named
+
+
+def _holds_for(spec: str, candidates) -> bool | None:
+    """Whether some candidate Version meets a conda constraint (`,` is and, `|` is or); None when it can't be told."""
+    found = False
+    for alt in spec.split("|"):
+        parts = [_part(p) for p in alt.split(",")]
+        if any(p is None for p in parts):
+            return None
+        tests = [p[0] for p in parts if p is not None]
+        named = [p[1] for p in parts if p is not None and p[1] is not None]
+        found = found or any(all(t(c) for t in tests) for c in candidates(named))
+    return found
 
 
 def _holds(spec: str, major: int, minor: int) -> bool | None:
-    """Whether a conda version constraint (`>=3.10`, `3.13.*`, `>=2.7,<2.8.0a0`, `3.6|3.7`) admits some X.Y.z
-    release of Python X.Y. None when it can't be told."""
-    results = []
-    for alt in spec.split("|"):
-        ok_low = ok_high = True  # holds for X.Y.0 / for a late X.Y patch
-        for part in alt.split(","):
-            m = _PART.fullmatch(part.strip())
-            if not m:
-                return None
-            op, ver, star = m.groups()
-            if star or not op:  # a glob, or a bare version (conda reads `3.9` as `3.9.*`)
-                if op not in (None, "=="):
-                    return None
-                comps = ver.split(".")
-                if len(comps) > 2 or not all(c.isdigit() for c in comps):
-                    return None
-                ok = [int(c) for c in comps] == [major, minor][: len(comps)]
-                ok_low, ok_high = ok_low and ok, ok_high and ok
-                continue
-            try:
-                bound = Version(ver)
-            except InvalidVersion:
-                return None
-            compare = _OPS[op]
-            ok_low = ok_low and compare(Version(f"{major}.{minor}.0"), bound)
-            ok_high = ok_high and compare(Version(f"{major}.{minor}.99"), bound)
-        results.append(ok_low or ok_high)
-    return any(results)
+    """Whether a conda version constraint (`>=3.10`, `3.13.*`, `>=2.7,<2.8.0a0`, `3.6|3.7`, `~=3.9.0`) admits some
+    X.Y.z release of Python X.Y. None when it can't be told."""
+
+    def candidates(named: list[Version]) -> list[Version]:
+        # The constraints can only change at the patch releases they name, so these cover every case.
+        patches = {0, 99} | {n.micro + d for n in named if n.release[:2] == (major, minor) for d in (-1, 0, 1)}
+        return [Version(f"{major}.{minor}.{p}") for p in sorted(patches) if p >= 0]
+
+    return _holds_for(spec, candidates)
+
+
+def _admits(spec: str, version: tuple[int, int]) -> bool:
+    """Whether a __glibc / __osx constraint holds for exactly this version ("" holds for any)."""
+    return not spec or _holds_for(spec, lambda named: [Version(f"{version[0]}.{version[1]}")]) is True
 
 
 def fits(build: Build, target: Target) -> bool:
     """Whether a build installs on the target's conda subdir and Python (see the module docstring)."""
     own = SUBDIRS.get(target.platform)
-    if own is None or build["subdir"] not in (own, NOARCH):
+    if own is None or build["subdir"] not in (own, NOARCH) or build["other_virtual"]:
         return False
     family = PLATFORMS[target.platform][0]
-    if build["subdir"] == NOARCH and not all(family in NOARCH_OS[os] for os in build["os"]):
+    if not all(family in VIRTUAL_OS[name] for name in build["os"]):
+        return False
+    if build["glibc"] is not None and not _admits(build["glibc"], target.glibc):
+        return False
+    if build["osx"] is not None and not _admits(build["osx"], target.macos):
         return False
     python, abi = build["python"], build["abi"]
     if python is None and abi is None:
         return False  # not a Python build, or one we can't place
     if any(_holds(spec, target.major, target.minor) is not True for spec in python or []):
         return False
+    if abi == "abi3":
+        return bool(python) and not target.freethreaded  # the stable ABI isn't free-threaded's
     if abi is not None:
         return abi == f"cp{target.major}{target.minor}{'t' if target.freethreaded else ''}"
     if build["subdir"] == NOARCH:
@@ -274,7 +331,8 @@ class Hint:
 
 
 def hint(pkg: Package, targets: Iterable[Target], found: dict[tuple[str, str], list[Build]]) -> Hint | None:
-    """The hint for a package's gap targets, or None when no build fits any of them. The caller checks may_send."""
+    """The hint for a package's gap targets, or None when no build fits any of them. The caller checks that the
+    package is PyPI's (origin.known_pypi)."""
     if not pkg.version or not (builds := found.get((pkg.key, pkg.version))):
         return None
     matched = {}
