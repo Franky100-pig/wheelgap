@@ -14,7 +14,7 @@ wheelgap reads a lockfile and reports, per package and target platform, whether 
 uvx wheelgap@latest -p 3.13 -t linux-aarch64,musl-aarch64 --json
 ```
 
-- **Input:** in the project directory, wheelgap finds `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `requirements.txt` or `requirements.lock` (the first one present). Pass any other file by path, e.g. `uvx wheelgap@latest requirements-prod.txt …`.
+- **Input:** in the project directory, wheelgap finds `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `requirements.txt` or `requirements.lock` (the first one present). Pass any other file by path, e.g. `uvx wheelgap@latest requirements-prod.txt …`. A library with no lockfile: pass its `pyproject.toml` (direct dependencies only; add `--extra NAME` or `--all-extras`).
 - **Python (`-p`):** always pass the project's Python, from `.python-version`, `requires-python`, the CI matrix or the Dockerfile. Without `-p`, wheelgap uses `.python-version`, else the Python it runs on, which may be free-threaded (3.14t) and would report gaps an ordinary project doesn't have. Use `-p 3.14t` only to check free-threading readiness.
 - **Platforms (`-t`):** use what the project ships to.
   - A Dockerfile: `uvx wheelgap@latest --dockerfile Dockerfile --json` takes both Python and platform from the final stage.
@@ -29,7 +29,7 @@ uvx wheelgap@latest -p 3.13 -t linux-aarch64,musl-aarch64 --json
 - **`results`** maps a target label to `wheel`, `source`, `missing`, `unknown`, `n/a` (the package isn't installed on that target, per its markers) or `bundled` (shipped by Pyodide, with `--pyodide-lock`). Labels come from `targets[].label`: the platform alone with one Python, `"3.13 linux-x86_64"` with several.
 - **`unknown`** means a lookup failed; the package's `error` field says why. Never report it as fine.
 - **`skipped`** lists packages that weren't checked (editable, git, path), so don't claim every dependency was covered.
-- **Installation scope:** by default, `uv.lock` checks conservatively include extras and development groups. Compare a reported gap with the deployment's actual `uv sync` options before treating it as a deployment failure.
+- **Installation scope:** with no selection, `uv.lock`, `poetry.lock` and `pdm.lock` checks conservatively include extras and development groups. To match a deployment, pass its selection: `--no-dev`, `--group NAME`, `--only-group NAME` (uv.lock, Poetry 2.x poetry.lock, pdm.lock) and `--extra NAME` (uv.lock). Otherwise compare a reported gap with how the project is really installed before treating it as a deployment failure.
 - **Why:** `--explain` adds each rejected wheel and the reason (`rejected`), and for `uv.lock` the dependency path that pulls the package in (`via`).
 
 ## What to tell the user
@@ -40,7 +40,11 @@ uvx wheelgap@latest -p 3.13 -t linux-aarch64,musl-aarch64 --json
    - use a `-slim` Debian base instead of Alpine;
    - add build dependencies to the Dockerfile on purpose;
    - `--fail-on missing` to accept source builds in CI.
-3. To accept a known gap without hiding it, use `--ignore NAME` or `ignore = ["NAME"]` in `[tool.wheelgap]`.
+3. To accept a known gap without hiding it, use `--ignore NAME` or `ignore = ["NAME"]` in `[tool.wheelgap]`, or `--ignore NAME:TARGET` to accept it on one platform only.
+
+## After a dependency upgrade
+
+`uvx wheelgap@latest diff OLD NEW -p 3.13 -t linux-aarch64 --json` lists the packages that got worse on a target and the new packages with gaps (exit 1 if any). `OLD` can be a git ref such as `origin/main:uv.lock` or `HEAD:uv.lock` (the path is relative to the repository root; fetch the base ref first in a shallow CI checkout); a package that can no longer be checked counts as worse. `[tool.wheelgap]` settings don't apply to `diff`, so always pass `-p` and `-t`.
 
 wheelgap checks wheel availability only, not whether a package works without the GIL.
 

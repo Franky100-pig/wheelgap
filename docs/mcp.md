@@ -9,22 +9,9 @@ client below starts it with the same command:
 uvx --from wheelgap wheelgap-mcp
 ```
 
-That needs [uv](https://docs.astral.sh/uv/getting-started/installation/). Pick
+That needs [uv](https://docs.astral.sh/uv/getting-started/installation/). If you ran wheelgap with `uvx` before 0.9.0 and get "An executable named `wheelgap-mcp` is not provided", uvx is reusing its cached copy: run `uvx --refresh --from wheelgap wheelgap-mcp --version` once. Pick
 your client, paste the snippet, restart the client (or reload its MCP servers)
 and try the prompt at the end.
-
-## Before the next release
-
-The server isn't in a release yet: wheelgap 0.8.0 on PyPI has no `wheelgap-mcp`
-command, so `uvx --from wheelgap wheelgap-mcp` fails with "An executable named
-`wheelgap-mcp` is not provided by package `wheelgap`". Until the next release,
-run it from GitHub. In each snippet, replace the arguments:
-
-| Snippet type | Released | Before the release |
-|---|---|---|
-| Command line | `uvx --from wheelgap wheelgap-mcp` | `uvx --from git+https://github.com/wheelgap/wheelgap wheelgap-mcp` |
-| JSON `args` | `["--from", "wheelgap", "wheelgap-mcp"]` | `["--from", "git+https://github.com/wheelgap/wheelgap", "wheelgap-mcp"]` |
-| TOML `args` | `["--from", "wheelgap", "wheelgap-mcp"]` | `["--from", "git+https://github.com/wheelgap/wheelgap", "wheelgap-mcp"]` |
 
 ## Claude Code
 

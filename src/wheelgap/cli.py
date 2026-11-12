@@ -175,10 +175,17 @@ def make_parser() -> argparse.ArgumentParser:
         help="include a uv project extra, or a pyproject.toml optional-dependencies group (repeatable)",
     )
     p.add_argument("--all-extras", action="store_true", help="include every uv project extra (or pyproject.toml extra)")
-    p.add_argument("--group", action="append", metavar="NAME", help="include a uv dependency group (repeatable)")
-    p.add_argument("--no-dev", action="store_true", help="exclude the default uv dev group")
     p.add_argument(
-        "--only-group", action="append", metavar="NAME", help="check only a uv dependency group (repeatable)"
+        "--group",
+        action="append",
+        metavar="NAME",
+        help="include a dependency group (uv.lock, Poetry 2.x poetry.lock, pdm.lock; repeatable)",
+    )
+    p.add_argument(
+        "--no-dev", action="store_true", help="exclude the dev group (uv.lock, Poetry 2.x poetry.lock, pdm.lock)"
+    )
+    p.add_argument(
+        "--only-group", action="append", metavar="NAME", help="check only the named dependency groups (repeatable)"
     )
     p.add_argument(
         "--online", action="store_true", help="re-check lockfile packages against PyPI instead of trusting the lockfile"

@@ -157,7 +157,7 @@ To accept a gap on one target only, add the target after a colon: `--ignore psyc
 
 Use `-q` / `--quiet` (or `quiet = true` in `[tool.wheelgap]`) to show only the gap summary and package names. Clean runs without ignored packages are silent, JSON and Markdown output are unchanged, and quiet text output cannot be combined with `--explain` (`--json --explain` and `--markdown --explain` work).
 
-### Check the uv dependencies you actually install
+### Check the dependencies you actually install
 
 With no selection options, wheelgap keeps its conservative behavior: all project/workspace extras
 and dependency groups count. For `uv.lock` inputs, select a deployment's dependencies explicitly:
@@ -217,8 +217,8 @@ including local workspace dependencies, rather than enabling every extra of ever
 Unresolved marker conditions (including uv's synthetic conflict markers and unknown OS releases)
 remain conservative: wheelgap can still report a possible gap rather than silently hide one.
 Selection itself needs no network. Index refreshes (`--online`, or a target outside the lockfile's
-`requires-python`) only look up packages in the selected graph. Configured `extras` only apply to `uv.lock` inputs, and configured `groups` to `uv.lock` and Poetry 2.x
-`poetry.lock` inputs; other inputs are checked as usual.
+`requires-python`) only look up packages in the selected graph. Configured `extras` only apply to `uv.lock` inputs, and configured `groups` to `uv.lock`, Poetry 2.x
+`poetry.lock` and `pdm.lock` inputs; other inputs are checked as usual.
 
 ### Check a library's direct dependencies
 
@@ -307,7 +307,7 @@ Docker platform names also work with `-t`, for example `-t linux/amd64,linux/arm
 
 ```yaml
 - uses: actions/checkout@v7
-- uses: wheelgap/wheelgap@v0.8.0
+- uses: wheelgap/wheelgap@v0.9.0
   with:
     args: uv.lock -p 3.13 -t linux-x86_64,linux-aarch64
 ```
@@ -321,7 +321,7 @@ Outside the Action, `--markdown` prints the same report as Markdown, for a job s
 ```yaml
 repos:
   - repo: https://github.com/wheelgap/wheelgap
-    rev: v0.8.0
+    rev: v0.9.0
     hooks:
       - id: wheelgap
 ```
@@ -386,10 +386,10 @@ On Claude Code 2.1.275 or later, `/plugin install wheelgap --marketplace wheelga
 
 **Codex, Cursor, GitHub Copilot and others:** copy [`integrations/claude-code/skills/check-wheels/`](integrations/claude-code/skills/check-wheels/) into your project's `.agents/skills/` folder. For a Cursor project rule instead, copy [`integrations/cursor/wheelgap.mdc`](integrations/cursor/wheelgap.mdc) to `.cursor/rules/`.
 
-**As an MCP server** (new, not yet released): `wheelgap-mcp` lets any agent that speaks the [Model Context Protocol](https://modelcontextprotocol.io/) call wheelgap as a tool, with no shell access needed. It runs over stdio and has five read-only tools: `check_package` (one package, latest or a given version), `check_lockfile`, `check_dockerfile`, `diff_lockfiles` and `list_targets`. `check_lockfile` gives the same answer as `wheelgap PATH --json`, `[tool.wheelgap]` settings included: it returns the packages with gaps, the ones it skipped (git, path and private-index packages, which aren't checked) and any notes. `check_dockerfile` gives the answer of `wheelgap PATH --dockerfile DOCKERFILE --json` (`PATH` defaults to the Dockerfile's folder), plus the `image` it read (`python`, `platform`, `glibc`, `musl`), so an agent can ask before switching `python:3.13-slim` to `-alpine` or adding `--platform=linux/arm64`; a Dockerfile wheelgap can't read is a tool error. `diff_lockfiles` takes an `old` and a `new` lockfile (plus `python` and `targets`) and answers as `wheelgap diff OLD NEW --json` does, with `ok` added: the packages that got worse on a target and the new ones with gaps, so an agent that bumps dependencies can save the old lockfile under its own name (`mkdir -p /tmp/old && git show HEAD:uv.lock > /tmp/old/uv.lock`) and ask whether the upgrade lost a wheel. On `pyodide` targets, `check_package` and `check_lockfile` take an optional `pyodide_lock` (a path or https URL of a `pyodide-lock.json`, as `--pyodide-lock` does), so packages Pyodide ships itself show as `bundled`. Tool calls send progress notifications when the client asks for them and don't stop the server answering `ping`. A cancelled call sends no more progress and no result, but its index lookups still finish before the next call starts. Like wheelgap, it needs nothing beyond `packaging`. Until the next release, run it from GitHub; for Claude Code:
+**As an MCP server:** `wheelgap-mcp` lets any agent that speaks the [Model Context Protocol](https://modelcontextprotocol.io/) call wheelgap as a tool, with no shell access needed. It runs over stdio and has five read-only tools: `check_package` (one package, latest or a given version), `check_lockfile`, `check_dockerfile`, `diff_lockfiles` and `list_targets`. `check_lockfile` gives the same answer as `wheelgap PATH --json`, `[tool.wheelgap]` settings included: it returns the packages with gaps, the ones it skipped (git, path and private-index packages, which aren't checked) and any notes. `check_dockerfile` gives the answer of `wheelgap PATH --dockerfile DOCKERFILE --json` (`PATH` defaults to the Dockerfile's folder), plus the `image` it read (`python`, `platform`, `glibc`, `musl`), so an agent can ask before switching `python:3.13-slim` to `-alpine` or adding `--platform=linux/arm64`; a Dockerfile wheelgap can't read is a tool error. `diff_lockfiles` takes an `old` and a `new` lockfile (plus `python` and `targets`) and answers as `wheelgap diff OLD NEW --json` does, with `ok` added: the packages that got worse on a target and the new ones with gaps, so an agent that bumps dependencies can save the old lockfile under its own name (`mkdir -p /tmp/old && git show HEAD:uv.lock > /tmp/old/uv.lock`) and ask whether the upgrade lost a wheel. On `pyodide` targets, `check_package` and `check_lockfile` take an optional `pyodide_lock` (a path or https URL of a `pyodide-lock.json`, as `--pyodide-lock` does), so packages Pyodide ships itself show as `bundled`. Tool calls send progress notifications when the client asks for them and don't stop the server answering `ping`. A cancelled call sends no more progress and no result, but its index lookups still finish before the next call starts. Like wheelgap, it needs nothing beyond `packaging`. For Claude Code:
 
 ```bash
-claude mcp add wheelgap -- uvx --from git+https://github.com/wheelgap/wheelgap wheelgap-mcp
+claude mcp add wheelgap -- uvx --from wheelgap wheelgap-mcp
 ```
 
 Other clients take the same command (`uvx`) and arguments in their MCP settings; the [MCP setup guide](https://github.com/wheelgap/wheelgap/blob/main/docs/mcp.md) has a copy-paste snippet for Claude Code, Cursor, VS Code, Codex and Claude Desktop. Pass `check_lockfile`, `check_dockerfile` and `diff_lockfiles` an absolute path or a `file://` URI, since the server's working directory may not be your project. If the client shares its [roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots), a relative path such as `uv.lock` is resolved against the first root that contains it.
