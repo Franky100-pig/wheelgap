@@ -48,6 +48,15 @@ uv run --group dev pytest
 - **Every behaviour change gets a test that fails without the change.** Check this by reverting your source change and running the test.
 - **Write test files that contain non-ASCII text with `encoding="utf-8"`** (or use `write_bytes`). Windows CI otherwise writes cp1252.
 - Put new cases in the existing parametrized tables where one fits, e.g. `test_dockerfiles_docker_rejects` and `test_parse_from` in `tests/test_dockerfile.py`.
+- **Real lockfiles:** `tests/fixtures/real/` holds unchanged copies of open-source projects' lockfiles, and `sources.toml` there records each one's repo, path, commit and licence (MIT, BSD or Apache only). `tests/test_real_lockfiles.py` reads them offline, and the weekly [Lockfile corpus](.github/workflows/lockfile-corpus.yml) workflow runs the same checks (`scripts/check_real_lockfiles.py`) on each project's current file. When it fails, or to refresh a copy, download the file at a pinned commit, then update its `commit` in `sources.toml` and its counts and versions in `EXPECTED` in the test:
+
+  ```bash
+  sha=$(gh api repos/pytest-dev/pluggy/commits/HEAD --jq .sha)
+  gh api -H "Accept: application/vnd.github.raw" "repos/pytest-dev/pluggy/contents/uv.lock?ref=$sha" > tests/fixtures/real/pluggy/uv.lock
+  uv run python scripts/check_real_lockfiles.py --pinned pluggy
+  ```
+
+  If wheelgap can't read the new file, that's a bug to fix in `sources.py` first. Keep each copy under 100 KB, and leave the Poetry 1.x one (`cleo`) at its old commit.
 
 ## House rules
 
