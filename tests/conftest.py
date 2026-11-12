@@ -36,6 +36,10 @@ FAKE_INDEX = {
 }
 
 
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: a timing test (skip it locally with -m 'not slow')")
+
+
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     """Tests shouldn't depend on the developer's colour or index settings."""
