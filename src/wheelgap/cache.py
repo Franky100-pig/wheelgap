@@ -1,6 +1,7 @@
 """A small on-disk cache of pinned index lookups (/<name>/<version>/json), so a repeat run needn't ask again,
-of --conda-forge lookups (a version's conda-forge builds, cut down to what matching needs), and of --notes lookups
-(the coverage tracker's notes for a package).
+of --conda-forge lookups (a version's conda-forge builds, cut down to what matching needs), of --notes lookups
+(the coverage tracker's notes for a package), and of --build-info answers (what a release's sdist says about its
+build).
 
 A cache that can't be read or written is only ever a miss: it never fails a run.
 """
@@ -121,6 +122,44 @@ def load_builds(name: str, version: str) -> list[dict] | str | None:
 
 def save_builds(name: str, version: str, builds: list[dict] | str) -> None:
     _save(CONDA_FORGE_KEY, name, version, "builds", builds)
+
+
+# --build-info entries: keyed apart from the file lists of the same release, and by the sdist's sha256 as a lock gives
+# it ("" when the index gives the URL), so one lockfile can't answer for another's copy of a release.
+_BUILD_FIELDS: dict[str, type | tuple[type, ...]] = {
+    "requires": list,
+    "backend": (str, type(None)),
+    "backend_path": bool,
+    "build_script": bool,
+}
+
+
+def _build_key(index: str, sha256: str) -> str:
+    return f"build-v1 {sha256} {index}"
+
+
+def load_build(index: str, name: str, version: str, sha256: str) -> dict | None:
+    """A release's cached build info: {"answer": None} when its sdist gives no answer, else {"answer": {"requires",
+    "backend", "backend_path", "build_script"}} (see build.py). None for a miss."""
+    entry = _load(_build_key(index, sha256), name, version, "build")
+    if not isinstance(entry, dict) or set(entry) != {"answer"}:
+        return None
+    answer = entry["answer"]
+    if answer is None:
+        return {"answer": None}
+    if (
+        isinstance(answer, dict)
+        and set(answer) == set(_BUILD_FIELDS)
+        and all(isinstance(answer[k], t) for k, t in _BUILD_FIELDS.items())
+        and all(isinstance(r, str) for r in answer["requires"])
+    ):
+        return {"answer": answer}
+    return None
+
+
+def save_build(index: str, name: str, version: str, sha256: str, answer: dict | None) -> None:
+    """Store what a release's sdist says about its build, or None when it gives no answer for good."""
+    _save(_build_key(index, sha256), name, version, "build", {"answer": answer})
 
 
 def load_notes(source: str, name: str) -> list | None:

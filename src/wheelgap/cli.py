@@ -22,6 +22,7 @@ from packaging.utils import canonicalize_name
 from . import __version__, cache, condaforge, origin
 from . import notes as tracker
 from .api import running_python
+from .build import BuildInfo, describe, lookup_all, requires_for, shown
 from .check import CELL, EXPLAIN_LIMIT, Row, Status, check, explain, explain_lines, marker_holds, reachable
 from .dockerfile import DockerfileError, read_dockerfile
 from .github import github_annotations
@@ -218,6 +219,12 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--all", action="store_true", help="show every package, not just the ones with gaps")
     p.add_argument("--explain", action="store_true", help="for each gap, list the wheels that were rejected and why")
     p.add_argument(
+        "--build-info",
+        action="store_true",
+        help="with --explain, read the sdist of each package that builds from source to say what the build needs "
+        "(downloads them from PyPI; also build-info = true)",
+    )
+    p.add_argument(
         "--conda-forge",
         action="store_true",
         help="with --explain, also say when conda-forge has a package of the same name with builds for a gap's "
@@ -360,7 +367,7 @@ def load_config(path: Path) -> dict:
                 raise SourceError(f"{path}: [tool.wheelgap] {key} must be {example}")
             if key == "fail-on" and value not in FAIL_ON:
                 raise SourceError(f"{path}: [tool.wheelgap] fail-on must be one of: {', '.join(FAIL_ON)}")
-        elif key in ("quiet", "offline", "notes"):
+        elif key in ("quiet", "offline", "notes", "build-info"):
             if not isinstance(value, bool):
                 raise SourceError(f"{path}: [tool.wheelgap] {key} must be a boolean")
         else:
@@ -595,18 +602,28 @@ def tracker_notes(
     return out, cut
 
 
+def source_targets(row: Row, targets: list[Target]) -> list[Target]:
+    """The targets where --explain explains a `source` cell of this row (a gap that isn't ignored)."""
+    return [t for t in gap_targets(row, targets) if row.results[t] == Status.SOURCE]
+
+
 def render_explain(
     rows: list[Row],
     targets: list[Target],
     style: Style,
     conda_forge: dict[int, condaforge.Hint] | None = None,
     notes: RowNotes | None = None,
+    build_info: dict[int, BuildInfo] | None = None,
 ) -> list[str]:
-    """`conda_forge`: --conda-forge hints, by id() of the row's package. `notes`: --notes, by id() of the row."""
+    """`conda_forge`: --conda-forge hints and `build_info`: --build-info answers, by id() of the row's package.
+    `notes`: --notes, by id() of the row."""
     multi_py = len({t.python for t in targets}) > 1
     out = []
     for r in rows:
         files = r.package.files or []
+        info = (build_info or {}).get(id(r.package))
+        sources = source_targets(r, targets)
+        needs = describe(info, sources) if info and sources else None
         for t in gap_targets(r, targets):
             cell, color = CELL[r.results[t]]
             head = f"{r.package.name} {r.package.version or '?'} on {t.label(multi_py)}:"
@@ -614,6 +631,9 @@ def render_explain(
             path = r.via.get(t, [])
             if len(path) >= 2:  # a lone name says nothing about why the package is there
                 out.append(f"  via: {' → '.join(path)}")
+            if needs and r.results[t] == Status.SOURCE:  # once per release, under its first source cell
+                out.append(f"  build needs: {needs}")
+                needs = None
             lines = explain_lines(files, t, yanked=r.package.yanked, limit=EXPLAIN_LIMIT, dim=style.dim, align=True)
             out += [f"  {line}" for line in lines]
             out.append("")
@@ -716,6 +736,7 @@ def report_json(
     advisory: frozenset[Target] = frozenset(),
     conda_forge: dict[int, condaforge.Hint] | None = None,
     notes: RowNotes | None = None,
+    build_info: dict[int, BuildInfo] | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     gaps = [r for r in rows if not r.ok]
@@ -751,6 +772,9 @@ def report_json(
                 {**note.as_json(), "targets": [t.label(multi_py) for t in ts]}
                 for note, ts in (notes or {}).get(id(r), [])
             ]
+            if build_info is not None:  # --build-info: what the sdist requires, on the targets that build it
+                info, sources = build_info.get(id(r.package)), source_targets(r, targets)
+                out["build_requires"] = [shown(q) for q in requires_for(info, sources)] if info and sources else None
         return out
 
     report: dict[str, object] = {
@@ -946,6 +970,7 @@ def render_markdown(
     advisory: frozenset[Target] = frozenset(),
     conda_forge: dict[int, condaforge.Hint] | None = None,
     notes: RowNotes | None = None,
+    build_info: dict[int, BuildInfo] | None = None,
 ) -> list[str]:
     """The same report as the text output, as GitHub-flavoured Markdown (for a job summary or a PR comment)."""
     plain = Style(False)
@@ -1004,7 +1029,7 @@ def render_markdown(
     if args.explain and gaps:
         # Fenced, so wheel filenames, reasons and the tracker's notes need no escaping: inside a code block, Markdown
         # and HTML are shown as text. The fence is longer than any run of backticks in it, so nothing can close it.
-        lines = render_explain(gaps, targets, plain, conda_forge, notes)
+        lines = render_explain(gaps, targets, plain, conda_forge, notes, build_info)
         fence = "`" * max([3, *(len(run) + 1 for line in lines for run in re.findall(r"`+", line))])
         out += ["<details><summary>Why (rejected wheels)</summary>", "", fence, *lines, fence, "", "</details>", ""]
     return out
@@ -1563,6 +1588,22 @@ def _main(argv: list[str]) -> int:
     # The run passes only because --fail-on missing accepts a source build on a required target.
     source_allowed = not failing and any(Status.SOURCE in required_statuses(r, advisory) for r in gaps)
 
+    build_info: dict[int, BuildInfo] | None = None  # None: not asked for
+    off_by = origin.other_index(index_url) or origin.index_env()  # no package counts as PyPI's for sure
+    if args.explain and (args.build_info or config.get("build-info", False)) and not offline and off_by:
+        if not quiet:
+            note = f"wheelgap: note: --build-info is off: packages may come from another index ({off_by})"
+            print(Style(use_color(args.color)).dim(note), file=sys.stderr)
+    elif args.explain and (args.build_info or config.get("build-info", False)) and not offline:
+        # What each explained `source` release needs to build, from its sdist (only for packages positively from
+        # PyPI: see build.where). Nothing here changes the exit code, and a release whose sdist gives no answer just
+        # gets no line.
+        source_of = {id(p): s for s in sources for p in s.packages}
+        wanted = [(r.package, source_of[id(r.package)]) for r in gaps if source_targets(r, targets)]
+        build_info, stopped = lookup_all(wanted, simple_index=index_url, **cached)
+        if stopped is not None and not quiet:
+            print(Style(use_color(args.color)).dim(f"wheelgap: note: {stopped}"), file=sys.stderr)
+
     if args.junit is not None:  # an empty PATH (an unset CI variable) is an error, not "no report"
         try:
             write_junit(args.junit, rows, targets, fail_on, advisory)
@@ -1589,6 +1630,7 @@ def _main(argv: list[str]) -> int:
                 advisory,
                 conda_forge,
                 row_notes,
+                build_info,
             )
         )
         return code
@@ -1608,6 +1650,7 @@ def _main(argv: list[str]) -> int:
                     advisory,
                     conda_forge,
                     row_notes,
+                    build_info,
                 )
             )
         )
@@ -1653,7 +1696,7 @@ def _main(argv: list[str]) -> int:
         if args.explain and gaps:
             if hidden:
                 print()
-            for ln in render_explain(gaps, targets, style, conda_forge, row_notes):
+            for ln in render_explain(gaps, targets, style, conda_forge, row_notes, build_info):
                 print(ln)
 
     bundled = [r for r in rows if Status.BUNDLED in r.results.values()]

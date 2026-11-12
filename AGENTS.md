@@ -31,8 +31,9 @@ uv run --group dev pytest
 | `sources.py` | Reads inputs: `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `pixi.lock` (with a strict reader for the YAML subset pixi writes), requirements files |
 | `targets.py` | Targets (Python × platform) and the wheel tags each accepts |
 | `check.py` | The status per package and target (`wheel`, `source`, `missing`, `unknown`, `n/a`, `bundled`) and `--explain` reasons |
-| `pypi.py` | The only HTTP client (`fetch_json`: retries, https-only redirects) and the PyPI lookups (`fill`, `fill_all`, `recheck_lock`) |
-| `cache.py` | The 24-hour on-disk cache of pinned PyPI lookups, `--conda-forge` lookups and the tracker's notes (`--no-cache` and `--online` skip it) |
+| `pypi.py` | The only HTTP client (`fetch_json`: retries, https-only redirects; `fetch_sdist_pyproject` reads an sdist's `pyproject.toml` as pip would) and the PyPI lookups (`fill`, `fill_all`, `recheck_lock`) |
+| `cache.py` | The 24-hour on-disk cache of pinned PyPI lookups, `--conda-forge` lookups, the tracker's notes and `--build-info` answers (`--no-cache` and `--online` skip it) |
+| `build.py` | `--explain --build-info`: what a `source` build needs, from the `[build-system]` table of the sdist's `pyproject.toml` (read with `pypi.fetch_sdist_pyproject`) |
 | `dockerfile.py` | `--dockerfile`: reads the final stage's image and platform the way Docker/BuildKit does |
 | `offline.py` | `--offline`, `offline = true` and `check_lockfile(..., offline=True)`: refuse inputs that would need an index lookup |
 | `pyodide.py` | `--pyodide-lock`: packages Pyodide ships itself |
@@ -50,6 +51,7 @@ uv run --group dev pytest
 - **No network, ever.** Use the `fake_pypi` fixture in `tests/conftest.py`. To add a package, add it to `FAKE_INDEX`. The fixture returns the list of URLs fetched, so tests can assert what was (or wasn't) looked up. Lockfile fixtures live in `tests/fixtures/`; small one-off lockfiles go in `tmp_path`.
 - `--explain --notes` asks the coverage tracker for notes; the autouse `tracker` fixture answers instead (a 404 for every name, unless a test adds a file with `tracker.add(name, note)`), and `tracker.calls` lists what was asked.
 - `fake_pypi` patches `wheelgap.pypi.fetch_json`. New code that fetches should call `pypi.fetch_json` at call time (as `pyodide.py` does), not import the name, so the fixture catches it.
+- `fake_files` serves sdists (for `--build-info`) at `https://files.example/<filename>`, the URL `fake_pypi` gives every file. Any other real request fails at once (the autouse `no_network` fixture), except to a test's own localhost server.
 - **Every behaviour change gets a test that fails without the change.** Check this by reverting your source change and running the test.
 - **Write test files that contain non-ASCII text with `encoding="utf-8"`** (or use `write_bytes`). Windows CI otherwise writes cp1252.
 - Put new cases in the existing parametrized tables where one fits, e.g. `test_dockerfiles_docker_rejects` and `test_parse_from` in `tests/test_dockerfile.py`.
@@ -67,7 +69,7 @@ uv run --group dev pytest
 ## House rules
 
 - **Dependencies:** standard library and `packaging` only.
-- **All network access goes through `pypi.fetch_json`.**
+- **All network access goes through `pypi.py`:** `fetch_json` (or `fetch_simple` for `--index-url`), and `fetch_sdist_pyproject` for `--build-info`. A new kind of request goes there too, next to them.
 - **Wheel tags:** use `packaging.tags` where it has an API, and mirror what pip accepts. The manylinux/musllinux platform lists in `targets.py` follow pip's rules; keep them that way.
 - **`--dockerfile` must match Docker exactly or raise `DockerfileError`.** When you port BuildKit behaviour, link the file and commit in a comment (see `_heredocs` in `dockerfile.py`).
 - **Output:** `--json` keys are a public interface. Add keys; don't rename or remove them. Diagnostic notes (`wheelgap: note: ...`) go to stderr, never into `--json` or `--markdown` stdout.

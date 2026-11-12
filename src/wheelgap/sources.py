@@ -60,6 +60,9 @@ class Package:
     registry: str | None = None
     # The index picked `version` (an unpinned or ranged requirement): it isn't a pin from the input.
     version_from_index: bool = False
+    # uv.lock / pylock.toml: the sdist's URL and sha256, as the lock records them (for --build-info).
+    sdist_url: str | None = None
+    sdist_sha256: str | None = None
     # This run found the package on pypi.org's JSON API (pypi.fill), so its name is public there.
     found_on_pypi: bool = False
     # `files` are only some of the release's files (pixi.lock records the one it picked per platform), so the
@@ -202,6 +205,22 @@ def _filename(entry: dict) -> str | None:
     return None
 
 
+def _sdist_source(entry: object, hash_key: str) -> tuple[str | None, str | None]:
+    """(URL, sha256) of a uv.lock sdist (hash = "sha256:...") or a pylock.toml one (hashes = {sha256 = ...})."""
+    if not isinstance(entry, dict):
+        return None, None
+    url, digest = entry.get("url"), entry.get(hash_key)
+    if isinstance(digest, dict):
+        digest = digest.get("sha256")
+    elif isinstance(digest, str) and digest.startswith("sha256:"):
+        digest = digest.removeprefix("sha256:")
+    else:
+        digest = None
+    if not (isinstance(digest, str) and len(digest) == 64 and all(c in "0123456789abcdefABCDEF" for c in digest)):
+        digest = None
+    return (url if isinstance(url, str) else None), (digest.lower() if digest else None)
+
+
 def _uv_edges(p: dict) -> list[Edge]:
     groups = [p.get("dependencies", [])]
     for table in ("optional-dependencies", "dev-dependencies"):
@@ -227,6 +246,7 @@ def parse_uv_lock(path: Path) -> Source:
             files = [f for f in (_filename(w) for w in p.get("wheels", [])) if f]
             if p.get("sdist"):
                 files.append(_filename(p["sdist"]) or f"{p['name']}-{p.get('version')}.tar.gz")
+                pkg.sdist_url, pkg.sdist_sha256 = _sdist_source(p["sdist"], "hash")
             pkg.files = files
         i = len(source.packages)
         source.packages.append(pkg)
@@ -574,6 +594,7 @@ def parse_pylock(path: Path) -> Source:
             files = [f for f in (_filename(w) for w in p.get("wheels", [])) if f]
             if p.get("sdist"):
                 files.append(_filename(p["sdist"]) or f"{p['name']}-{p.get('version')}.tar.gz")
+                pkg.sdist_url, pkg.sdist_sha256 = _sdist_source(p["sdist"], "hashes")
             pkg.files = files
         pkgs.append(pkg)
     requires = data.get("requires-python")
