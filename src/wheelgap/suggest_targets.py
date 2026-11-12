@@ -11,8 +11,10 @@ import itertools
 import json
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NoReturn
 
 from .dockerfile import DockerfileError, final_from, read_dockerfile
 from .targets import DISTROS, PLATFORMS
@@ -154,8 +156,20 @@ _DOCUMENT_RE = re.compile(r"(---|\.\.\.)(?:[ \t]|$)")
 _CONTAINERFILES = ("Dockerfile", "Containerfile")
 _TEMPLATE_SUFFIXES = (".template", ".tmpl", ".tpl", ".j2", ".jinja", ".jinja2", ".in")
 # Folders whose Dockerfiles are test inputs, examples or build output rather than what the project ships.
-_SKIP_DIRS = {"node_modules", "__pycache__", "site-packages", "tests", "fixtures", "examples", "docs"}
+_SKIP_DIRS = {
+    "node_modules",
+    "__pycache__",
+    "site-packages",
+    "tests",
+    "test",
+    "fixtures",
+    "examples",
+    "example",
+    "docs",
+}
 _SKIP_DIRS |= {"target", "build", "dist"}
+# Files named like a Dockerfile that are something else: its docs, or code about Dockerfiles (dockerfile.py).
+_NOT_CONTAINERFILES = (".md", ".rst", ".txt", ".py", ".pyc", ".sh", ".json", ".yml", ".yaml", ".toml", ".dockerignore")
 
 
 class _Unsure(Exception):
@@ -176,6 +190,7 @@ class _Node:
     is_text: bool = False
     children: list[_Node] = field(default_factory=list)
     broken: bool = False  # a quoted value over several lines
+    next_line: bool = False  # the value starts on the line after the key
 
     def get(self, key: str) -> _Node | None:
         found = [c for c in self.children if c.key == key and not c.is_text]
@@ -240,17 +255,24 @@ def _strip_comment(text: str) -> str:
 
 
 def _split_key(text: str) -> tuple[str, str] | None:
-    """`key: value` -> (key, value), or None when the line isn't a plain mapping key."""
+    """`key: value` -> (key, value), or None when the line isn't a plain mapping key. A quoted key with escapes
+    (`"arch\\x69tecture":`) can't be read, so it's an error rather than a key that's never matched."""
     if not text or text[0] in "[{&*!|>%@`-?":
         return None
     if text[0] in "\"'":
-        end = text.find(text[0], 1)
-        if end < 0 or not text[end + 1 :].startswith(":"):
+        quote, i, escaped = text[0], 1, False
+        while i < len(text) and text[i] != quote or text[i : i + 2] == quote * 2 == "''":
+            if quote == '"' and text[i] == "\\" or quote == "'" and text[i : i + 2] == "''":
+                escaped, i = True, i + 1
+            i += 1
+        if i >= len(text) or not text[i + 1 :].startswith(":"):
             return None
-        rest = text[end + 2 :]
+        rest = text[i + 2 :]
         if rest and rest[0] not in " \t":
             return None
-        return text[1:end], rest.strip()
+        if escaped:
+            raise _Unsure(f"can't read the escapes in the key {text[: i + 1]}")
+        return text[1:i], rest.strip()
     m = re.search(r":(?:[ \t]|$)", text)
     if not m:
         return None
@@ -337,6 +359,11 @@ def _parse_tree(text: str) -> _Node:
             continue
         if stripped.startswith("\t") or "\t" in line[:indent]:
             raise _Unsure("tab in indentation", number)
+        if indent == 0 and stripped.startswith("%"):
+            directive = _strip_comment(stripped)
+            if started or not re.fullmatch(r"%YAML[ \t]+1\.2", directive):
+                raise _Unsure(f"the {directive} directive isn't read (only %YAML 1.2 before the document is)", number)
+            continue
         if indent == 0 and (marker := _DOCUMENT_RE.match(stripped)):
             if _strip_comment(stripped[marker.end() :]):
                 raise _Unsure(f"content on the {marker.group(1)} line", number)
@@ -349,29 +376,43 @@ def _parse_tree(text: str) -> _Node:
         started = True
         body = _strip_comment(stripped)
         nodes: list[_Node] = []
+        try:
+            pair = _split_key(body[1:].lstrip(" ") if body == "-" or body.startswith("- ") else body)
+        except _Unsure as e:
+            raise _Unsure(e.reason, number) from None
         if body == "-" or body.startswith("- "):
             rest = body[1:].lstrip(" ")
             item = _Node(number, indent + 0.5, None, rest)
             nodes.append(item)
-            if (pair := _split_key(rest)) is not None:
+            if pair is not None:
                 item.value = ""
                 key_column = indent + len(body) - len(rest)
                 nodes.append(_Node(number, key_column, pair[0], pair[1]))
                 block_column = key_column
             else:
                 block_column = indent
-        elif (pair := _split_key(body)) is not None:
+        elif pair is not None:
             nodes.append(_Node(number, indent, pair[0], pair[1]))
             block_column = indent
         else:
-            nodes.append(_Node(number, indent, None, body, is_text=True))
+            while stack[-1].indent >= indent:
+                stack.pop()
+            parent = stack[-1]
+            if parent.key is not None and not parent.value and not parent.children:
+                # `key:` with its value on the next line: the value belongs to the key (and is never read).
+                parent.value, parent.next_line = body, True
+                nodes = []
+                last = parent
+            else:
+                nodes.append(_Node(number, indent, None, body, is_text=True))
             block_column = indent
         for node in nodes:
             while stack[-1].indent >= node.indent:
                 stack.pop()
             stack[-1].children.append(node)
             stack.append(node)
-        last = nodes[-1]
+        if nodes:
+            last = nodes[-1]
         if (state := _continued(last.value)) is not None:
             parts = [last.value]
             while not state.done:
@@ -409,55 +450,101 @@ def _unquote(text: str, line: int) -> _Scalar:
     return _Scalar(text, False, line)
 
 
-def _flow_items(text: str, line: int, close: str) -> list[str]:
-    """The comma-separated items of `[...]` or `{...}`, holding scalars only."""
-    if not text.endswith(close):
-        raise _Unsure(f"can't read {text}", line)
-    inner = text[1:-1].strip()
-    if any(c in inner for c in "[]{}"):
-        raise _Unsure(f"can't read {text}", line)
-    items: list[str] = []
-    current = ""
-    quote = None
-    for ch in inner:
-        if quote:
-            current += ch
-            if ch == quote:
-                quote = None
-        elif ch in "\"'":
-            quote = ch
-            current += ch
-        elif ch == ",":
-            items.append(current.strip())
-            current = ""
-        else:
-            current += ch
-    if quote:
-        raise _Unsure(f"can't read {text}", line)
-    if current.strip():
-        items.append(current.strip())
-    if any(not item for item in items):
-        raise _Unsure(f"can't read {text}", line)
-    return items
+class _Flow:
+    """A strict reader for one flow collection: `[a, "b", 'c']`, `{os: x, python: "3.13"}`, or a list of such
+    mappings. Anything else (nesting, `k: v` or `?` in a list, escapes, comments, anchors) can't be read. As in YAML, a
+    quote only quotes at the start of an item: `it's` and `a"b` are plain."""
 
+    def __init__(self, text: str, line: int) -> None:
+        self.text, self.pos, self.line = text, 0, line
 
-def _flow_list(text: str, line: int) -> list[_Scalar]:
-    """`[a, "b", 'c']`."""
-    return [_unquote(item, line) for item in _flow_items(text, line, "]")]
+    def fail(self) -> NoReturn:
+        raise _Unsure(f"can't read {self.text}", self.line)
 
+    def peek(self, n: int = 0) -> str:
+        return self.text[self.pos + n : self.pos + n + 1]
 
-def _flow_mapping(text: str, line: int) -> dict[str, _Scalar]:
-    """`{ os: macos-latest, python: "3.14" }`."""
-    out: dict[str, _Scalar] = {}
-    for item in _flow_items(text, line, "}"):
-        pair = _split_key(item)
-        if pair is None or pair[0] in out:
-            raise _Unsure(f"can't read {text}", line)
-        out[pair[0]] = _unquote(pair[1], line)
-    return out
+    def spaces(self) -> None:
+        while self.peek() in (" ", "\t") and self.peek():
+            self.pos += 1
+
+    def read(self) -> object:
+        self.spaces()
+        value = self.seq() if self.peek() == "[" else self.mapping() if self.peek() == "{" else self.fail()
+        self.spaces()
+        if self.pos != len(self.text):
+            self.fail()
+        return value
+
+    def items(self, close: str, item: Callable[[], None]) -> None:
+        self.pos += 1
+        while True:
+            self.spaces()
+            if self.peek() == close:
+                self.pos += 1
+                return
+            item()
+            self.spaces()
+            if self.peek() == ",":
+                self.pos += 1
+            elif self.peek() != close:
+                self.fail()
+
+    def seq(self) -> list[object]:
+        out: list[object] = []
+        self.items("]", lambda: out.append(self.mapping() if self.peek() == "{" else self.scalar(key=False)))
+        return out
+
+    def mapping(self) -> dict[str, _Scalar]:
+        out: dict[str, _Scalar] = {}
+
+        def pair() -> None:
+            key = self.scalar(key=True)
+            if self.peek() != ":" or self.peek(1) not in (" ", "\t") or key.text in out:
+                self.fail()
+            self.pos += 1
+            self.spaces()
+            out[key.text] = self.scalar(key=False)
+
+        self.items("}", pair)
+        return out
+
+    def scalar(self, key: bool) -> _Scalar:
+        """A quoted or plain scalar. In a list, `k: v` would be a mapping; as a key, it stops at the `:`."""
+        start, ch = self.pos, self.peek()
+        if ch in ("'", '"'):
+            self.pos += 1
+            while True:
+                c = self.peek()
+                if not c or c == "\\" and ch == '"':
+                    self.fail()
+                self.pos += 1
+                if c == ch:
+                    if ch == "'" and self.peek() == "'":
+                        self.pos += 1
+                        continue
+                    break
+            value = _unquote(self.text[start : self.pos], self.line)
+            self.spaces()
+            if not key and self.peek() == ":":
+                self.fail()
+            return value
+        if not ch or ch in "[]{},#&*!|>%@`?" or ch == "-" and self.peek(1) in ("", " ", "\t", ",", "]", "}"):
+            self.fail()
+        while (c := self.peek()) and c not in ",]}":
+            if c in "[{" or c == "#" and self.text[self.pos - 1] in " \t":
+                self.fail()
+            if c == ":" and self.peek(1) in ("", " ", "\t", ",", "]", "}"):
+                if not key:
+                    self.fail()
+                break
+            self.pos += 1
+        return _Scalar(self.text[start : self.pos].rstrip(" \t"), False, self.line)
 
 
 def _scalar(node: _Node) -> _Scalar:
+    if node.next_line:
+        raise _Unsure(f"{node.key}: a value on the line after the key", node.line)
     if node.broken:
         raise _Unsure(f"{node.key}: a quoted value over several lines", node.line)
     if node.children or node.is_text:
@@ -474,12 +561,10 @@ def _data(node: _Node) -> object:
     if node.value:
         if node.children:
             raise _Unsure(f"can't read the value of {node.key or 'a list item'}", node.line)
-        if node.broken:
-            raise _Unsure(f"can't read {node.value} (a quoted value over several lines)", node.line)
-        if node.value.startswith("["):
-            return _flow_list(node.value, node.line)
-        if node.value.startswith("{"):
-            return _flow_mapping(node.value, node.line)
+        if node.broken or node.next_line:
+            raise _Unsure(f"can't read {node.value} (over several lines)", node.line)
+        if node.value.startswith(("[", "{")):
+            return _Flow(node.value, node.line).read()
         return _scalar(node)
     if not node.children:
         raise _Unsure(f"{node.key or 'a list item'} has no value", node.line)
@@ -599,8 +684,92 @@ def _literal(node: _Node) -> str:
     return value.text
 
 
-# An architecture a job's setup step sets: the input's value (None: the runner's own), or why it can't be read.
-_Arch = str | None | _Unsure
+def _unread_lines(node: _Node) -> None:
+    """Refuse a line that's neither a key nor a list item where one belongs (a `? key`, a stray scalar): it could hold
+    a key the scan would otherwise miss. Under a key with a value, such lines just continue that value."""
+    for child in node.children:
+        if child.is_text and not node.value:
+            raise _Unsure(f"can't read {child.value}", child.line)
+        if not child.value:
+            _unread_lines(child)
+
+
+@dataclass(frozen=True)
+class _Setup:
+    """An actions/setup-python or astral-sh/setup-uv step, with its inputs by lowercase name (as Actions reads them)."""
+
+    step: _Node
+    action: str
+    inputs: dict[str, _Node]
+
+    @property
+    def setup_python(self) -> bool:
+        return self.action == "actions/setup-python"
+
+
+# The inputs that pick the interpreter: a step that sets one under `if:` may or may not run.
+_INTERPRETER_INPUTS = ("python-version", "architecture", "freethreaded", "python-arch")
+
+
+def _setups(steps: _Node | None) -> list[_Setup]:
+    """The job's setup steps. A step whose `uses`, `with` or inputs can't be read for sure refuses the whole job, since
+    it might set the architecture or the Python."""
+    if steps is None:
+        return []
+    if steps.value and steps.value != "[]":
+        raise _Unsure(f"steps: {steps.value} isn't read", steps.line)
+    found = []
+    for step in steps.children:
+        if step.key is not None or step.is_text or step.value:
+            raise _Unsure(f"can't read the step {step.value or step.key}", step.line)
+        uses, with_, condition = step.get("uses"), step.get("with"), step.get("if")  # keys are case-sensitive
+        if uses is None:
+            continue
+        try:
+            text = _scalar(uses).text
+        except _Unsure as e:
+            raise _Unsure(f"can't read the uses: {uses.value or '...'} of a step", e.line) from None
+        action = text.split("@", 1)[0].lower()
+        if "${{" in text:
+            raise _Unsure(f"uses: {text} is an expression", uses.line)
+        if action not in _PYTHON_ACTIONS:
+            continue
+        inputs: dict[str, _Node] = {}
+        if with_ is not None:
+            if with_.value or any(c.key is None for c in with_.children):
+                raise _Unsure(f"with: {with_.value or '...'} isn't read", with_.line)
+            for c in with_.children:
+                name = str(c.key).lower()  # input names are case-insensitive (INPUT_<NAME>)
+                if name in inputs:
+                    raise _Unsure(f"with: sets {name} twice", c.line)
+                inputs[name] = c
+        if condition is not None and any(name in inputs for name in _INTERPRETER_INPUTS):
+            raise _Unsure(f"the {action} step has if: {condition.value or '...'}, so it may not run", condition.line)
+        found.append(_Setup(step, action, inputs))
+    return found
+
+
+# An architecture a job's setup step asks for: None (the runner's own), the input's value, the matrix key it's
+# taken from, or why it can't be read.
+_Arch = str | None | tuple[str, int] | _Unsure
+
+
+def _arch(setup: _Setup) -> _Arch:
+    if not setup.setup_python:
+        if (node := setup.inputs.get("python-arch")) is not None:
+            return _Unsure(f"setup-uv's python-arch: {node.value} isn't read", node.line)
+        return None
+    if (node := setup.inputs.get("architecture")) is None:
+        return None
+    try:
+        value = _scalar(node)
+    except _Unsure as e:
+        return _Unsure(f"architecture: {node.value} isn't read", e.line)
+    if m := _MATRIX_REF_RE.fullmatch(value.text):
+        return m.group(1), node.line
+    if "${{" in value.text:
+        return _Unsure(f"architecture: {value.text} isn't read", node.line)
+    return value.text
 
 
 def _read_job(job: _Node, path: str, out: Suggestions) -> None:
@@ -610,22 +779,14 @@ def _read_job(job: _Node, path: str, out: Suggestions) -> None:
     try:
         if job.value or job.get("<<") is not None:
             raise _Unsure("can't read the job", job.line)
-        if broken := next((n for n in job.walk() if n.broken), None):
-            raise _Unsure(f"a quoted value over several lines ({broken.key}), so the job isn't read", broken.line)
-        steps = job.get("steps")
-        if steps is not None:
-            if steps.value and steps.value != "[]":
-                raise _Unsure(f"steps: {steps.value} isn't read", steps.line)
-            if odd := next((s for s in steps.children if s.key is not None or s.is_text or s.value), None):
-                raise _Unsure(f"can't read the step {odd.value or odd.key}", odd.line)
+        setups = _setups(job.get("steps"))
     except _Unsure as e:
         unsure(_Unsure(e.reason + " (neither its runner nor its Python is read)", e.line))
         return
 
-    archs: list[_Arch] = []
-    for step in steps.children if steps is not None else []:
+    for setup in setups:
         try:
-            _read_step(job, step, path, out, archs)
+            _read_python(job, setup, path, out)
         except _Unsure as e:
             unsure(e)
 
@@ -641,66 +802,73 @@ def _read_job(job: _Node, path: str, out: Suggestions) -> None:
             raise _Unsure(
                 f"runs-on {runs_on.value or 'with several labels or a group'} isn't a single label", runs_on.line
             )
+        archs = list(dict.fromkeys(_arch(s) for s in setups)) or [None]
         if unread := next((a for a in archs if isinstance(a, _Unsure)), None):
             raise _Unsure(f"{unread.reason}, so the job's target isn't read", unread.line)
-        for value, source in _values(job, runs_on):
+        label_node = _scalar(runs_on)
+        label_key = m.group(1) if (m := _MATRIX_REF_RE.fullmatch(label_node.text)) else None
+        if label_key is None and "${{" in label_node.text:
+            raise _Unsure(f"runs-on: {label_node.text} is an expression", runs_on.line)
+        combos: list[dict[str, _Scalar]] = [{}]
+        if label_key is not None or any(isinstance(a, tuple) for a in archs):
+            # Each matrix combination runs its own runner with its own architecture.
+            combos, line = _matrix(job, runs_on)
+            if not combos:
+                raise _Unsure("the matrix is empty", line)
+        for combo in combos:
+            if label_key is None:
+                label_value, source = label_node, f"runs-on: {label_node.text}"
+            elif label_key in combo:
+                label_value = combo[label_key]
+                source = f"runs-on: {label_value.text} (matrix.{label_key}, line {runs_on.line})"
+            else:
+                raise _Unsure(f"matrix.{label_key} isn't set in every matrix combination", runs_on.line)
             try:
-                label = value.plain_text()
+                label = label_value.plain_text()
             except _Unsure as e:
                 unsure(e)
                 continue
             if (target := runner_target(label)) is None:
-                unsure(_Unsure(f"{label} isn't a GitHub-hosted runner wheelgap knows", value.line))
+                unsure(_Unsure(f"{label} isn't a GitHub-hosted runner wheelgap knows", label_value.line))
                 continue
             glibc, macos = _runner_os(label)
-            for arch in dict.fromkeys(archs or [None]):
-                if arch is None:
-                    out.targets.append(Found(target, path, value.line, source, glibc=glibc, macos=macos))
-                elif (mapped := _ARCHITECTURES.get((target, str(arch)))) is None:
-                    unsure(_Unsure(f"setup-python's architecture: {arch} on {label} isn't read", value.line))
-                else:
-                    detail = f"{source}, architecture: {arch}"
-                    out.targets.append(Found(mapped, path, value.line, detail, glibc=glibc, macos=macos))
+            for arch in archs:
+                detail = source
+                if isinstance(arch, tuple):
+                    if arch[0] not in combo:
+                        raise _Unsure(f"matrix.{arch[0]} isn't set in every matrix combination", arch[1])
+                    try:
+                        arch = combo[arch[0]].plain_text()
+                    except _Unsure as e:
+                        unsure(e)
+                        continue
+                    detail += f", architecture: {arch} (matrix)"
+                elif arch is not None:
+                    detail += f", architecture: {arch}"
+                mapped = target if arch is None else _ARCHITECTURES.get((target, str(arch)))
+                if mapped is None:
+                    unsure(_Unsure(f"setup-python's architecture: {arch} on {label} isn't read", label_value.line))
+                    continue
+                found = Found(mapped, path, label_value.line, detail, glibc=glibc, macos=macos)
+                if found not in out.targets:
+                    out.targets.append(found)
     except _Unsure as e:
         unsure(e)
 
 
-def _read_step(job: _Node, step: _Node, path: str, out: Suggestions, archs: list[_Arch]) -> None:
-    """The Python an actions/setup-python or astral-sh/setup-uv step installs, and the architecture it asks for."""
-    uses = step.get("uses")
-    if uses is None:
-        return
-    action = _scalar(uses).text.split("@", 1)[0].lower()
-    if action not in _PYTHON_ACTIONS:
-        return
-    setup_python = action == "actions/setup-python"
-    with_ = step.get("with")
-    if with_ is not None and (with_.value or any(c.key is None for c in with_.children)):
-        archs.append(_Unsure(f"with: {with_.value or '...'} isn't read", with_.line))
-        raise _Unsure(f"with: {with_.value or '...'} isn't read", with_.line)
-    inputs = {key: with_.get(key) if with_ is not None else None for key in ("architecture", "python-arch")}
-    if setup_python and (node := inputs["architecture"]) is not None:
-        try:
-            archs.append(_literal(node))
-        except _Unsure as e:
-            archs.append(_Unsure(f"architecture: {node.value} isn't read", e.line))
-    elif setup_python:
-        archs.append(None)
-    elif (node := inputs["python-arch"]) is not None:
-        archs.append(_Unsure(f"setup-uv's python-arch: {node.value} isn't read", node.line))
-
-    version = with_.get("python-version") if with_ is not None else None
+def _read_python(job: _Node, setup: _Setup, path: str, out: Suggestions) -> None:
+    """The Python an actions/setup-python or astral-sh/setup-uv step installs."""
+    version = setup.inputs.get("python-version")
     if version is None:
-        if setup_python:
-            file = with_.get("python-version-file") if with_ is not None else None
-            if file is not None:
+        if setup.setup_python:
+            if (file := setup.inputs.get("python-version-file")) is not None:
                 raise _Unsure(f"setup-python reads {_scalar(file).text}, which isn't read here", file.line)
             raise _Unsure(
-                "setup-python with no python-version (it reads .python-version, or uses the runner's)", step.line
+                "setup-python with no python-version (it reads .python-version, or uses the runner's)", setup.step.line
             )
         return
     freethreaded = False
-    if setup_python and (node := with_.get("freethreaded") if with_ is not None else None) is not None:
+    if setup.setup_python and (node := setup.inputs.get("freethreaded")) is not None:
         text = _literal(node)
         if text not in _TRUE + _FALSE:
             raise _Unsure(f"freethreaded: {text} isn't true or false", node.line)
@@ -717,11 +885,11 @@ def _read_step(job: _Node, step: _Node, path: str, out: Suggestions, archs: list
             continue
         python = f"3.{m.group(1)}{m.group(2)}"
         if freethreaded and not python.endswith("t"):
-            if int(m.group(1)) < 13:
-                reason = f"job {job.key}: freethreaded: true with {text}, which has no free-threaded build"
-                out.unreadable.append(Unreadable(path, value.line, reason))
-                continue
             python, source = python + "t", f"{source}, freethreaded: true"
+        if python.endswith("t") and int(m.group(1)) < 13:
+            reason = f"job {job.key}: {source} asks for a free-threaded {text}, but free-threading starts at 3.13"
+            out.unreadable.append(Unreadable(path, value.line, reason))
+            continue
         out.pythons.append(Found(python, path, value.line, source))
 
 
@@ -736,9 +904,7 @@ def read_workflow(path: Path, name: str, out: Suggestions) -> None:
         return
     try:
         root = _parse_tree(text)
-        outside = [n for top in root.children if top.key != "jobs" for n in top.walk()]
-        if broken := next((n for n in outside if n.broken), None):
-            raise _Unsure(f"a quoted value over several lines ({broken.key})", broken.line)
+        _unread_lines(root)
         jobs = root.get("jobs")
         if jobs is None:
             raise _Unsure("no jobs")
@@ -756,16 +922,16 @@ def read_workflow(path: Path, name: str, out: Suggestions) -> None:
 
 
 def _container_kind(name: str) -> str | None:
-    """ "file" for a Dockerfile or Containerfile (Dockerfile, Dockerfile.prod, prod.Dockerfile, also lowercase),
+    """ "file" for a Dockerfile or Containerfile (Dockerfile, dockerfile.dev, Containerfile.prod, prod.Dockerfile),
     "template" for one that a tool fills in first (Dockerfile.j2), None for anything else."""
     lower = name.lower()
-    if lower.endswith(".dockerignore"):
+    if lower.endswith(_NOT_CONTAINERFILES):
         return None
+    bases = ("dockerfile", "containerfile")
     if not (
-        name in _CONTAINERFILES
-        or lower in ("dockerfile", "containerfile")
-        or name.startswith(tuple(f"{base}{sep}" for base in _CONTAINERFILES for sep in ".-_"))
-        or lower.endswith((".dockerfile", ".containerfile"))
+        lower in bases
+        or lower.startswith(tuple(f"{base}{sep}" for base in bases for sep in ".-_"))
+        or lower.endswith(tuple(f".{base}" for base in bases))
     ):
         return None
     return "template" if lower.endswith(_TEMPLATE_SUFFIXES) else "file"
@@ -803,7 +969,8 @@ def read_docker(path: Path, name: str, out: Suggestions) -> None:
         image = read_dockerfile(path)
         base, platform, line = final_from(path.read_bytes().decode("utf-8-sig"))
     except DockerfileError as e:
-        out.unreadable.append(Unreadable(name, None, str(e).removeprefix(f"{path}: ")))
+        reason = str(e).removeprefix(f"{path}: ").removesuffix(", pass -p/-t instead")  # no -p/-t here
+        out.unreadable.append(Unreadable(name, None, reason))
         return
     except OSError as e:
         out.unreadable.append(Unreadable(name, None, f"couldn't read the file ({e.strerror or e})"))

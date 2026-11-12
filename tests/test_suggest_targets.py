@@ -7,7 +7,7 @@ import pytest
 from wheelgap.cli import main
 from wheelgap.dockerfile import final_from
 from wheelgap.suggest_targets import (
-    _flow_items,
+    _Flow,
     _runner_os,
     _same,
     _Scalar,
@@ -389,7 +389,7 @@ def test_dockerfile_it_cant_read(tmp_path):
     (tmp_path / "Dockerfile").write_text("ARG BASE=python:3.13\nFROM $BASE\n")
     found = suggest(tmp_path)
     assert found.targets == []
-    assert unreadable(found) == [("Dockerfile", None, "$BASE: build arguments are not supported, pass -p/-t instead")]
+    assert unreadable(found) == [("Dockerfile", None, "$BASE: build arguments are not supported")]
 
 
 def test_glibc_is_left_out_when_the_sources_disagree(tmp_path, capsys):
@@ -519,6 +519,7 @@ def read(tmp_path, text):
         ("macos-14", (None, "14.0")),
         ("macos-15-intel", (None, "15.0")),
         ("macos-15-xlarge", (None, "15.0")),
+        ("macos-15-large", (None, "15.0")),
         ("macos-latest", (None, None)),
         ("windows-2025", (None, None)),
     ],
@@ -555,27 +556,64 @@ def test_unquote(text, expected):
             _unquote(text, 1)
 
 
-@pytest.mark.parametrize(
-    ("text", "expected"),
-    [
-        ("[a, 'b, c', \"d\"]", ["a", "'b, c'", '"d"']),
-        ("[a]", ["a"]),
-        ("[]", []),
-        ("[ a , b ]", ["a", "b"]),
-        ("[a,,b]", None),
-        ("[a, [b]]", None),
-        ("[a, {b: c}]", None),
-        ("[a", None),
-        ("['a]", None),
-        ("[a,]", ["a"]),
-    ],
-)
-def test_flow_items(text, expected):
+# Each case was checked against PyYAML 6.0.3 (`yaml.safe_load("x: " + text)`): where the reader gives a value, it's
+# PyYAML's; where PyYAML reads something else (a mapping, nesting, an anchor) or errors, the reader refuses.
+FLOWS = [
+    ("[a, 'b, c', \"d\"]", ["a", "b, c", "d"]),
+    ("[it's, a\"b]", ["it's", 'a"b']),  # a quote inside a plain item is literal
+    ("[windows-latest, it's]", ["windows-latest", "it's"]),
+    ("{os: it's, python: a\"b}", {"os": "it's", "python": 'a"b'}),
+    ("[a,]", ["a"]),
+    ("[a:b]", ["a:b"]),
+    ("[a b, c]", ["a b", "c"]),
+    ("[ a , b ]", ["a", "b"]),
+    ("[]", []),
+    ("['it''s']", ["it's"]),
+    ('[{os: x, python: "3.13"}, {os: y}]', [{"os": "x", "python": "3.13"}, {"os": "y"}]),
+    ("[{os: a}, b]", [{"os": "a"}, "b"]),
+    ("{os: x, python: '3.13'}", {"os": "x", "python": "3.13"}),
+    ("[k: v]", None),  # [{k: v}]
+    ('["x": y]', None),  # [{x: y}]
+    ("[?b]", None),  # [{b: null}]
+    ("{a:b}", None),  # {"a:b": null}
+    ("[a,#b]", None),  # an error
+    ("[a #b]", None),  # an error
+    ("[a, [b]]", None),
+    ("[a, {b: [c]}]", None),
+    ("[a,,b]", None),
+    ('["a" b]', None),
+    ("[- a]", None),
+    ('["a\\tb"]', None),  # an escape
+    ("[&x a]", None),
+    ("[*x]", None),
+    ("[!!str a]", None),
+    ("[a", None),
+    ("['a]", None),
+]
+
+
+def _plain(value):
+    if isinstance(value, list):
+        return [_plain(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _plain(v) for k, v in value.items()}
+    return value.text
+
+
+@pytest.mark.parametrize(("text", "expected"), FLOWS)
+def test_flow(text, expected):
     if expected is None:
         with pytest.raises(_Unsure):
-            _flow_items(text, 1, "]")
+            _Flow(text, 1).read()
     else:
-        assert _flow_items(text, 1, "]") == expected
+        assert _plain(_Flow(text, 1).read()) == expected
+
+
+@pytest.mark.parametrize(("text", "expected"), FLOWS)
+def test_flow_matches_pyyaml(text, expected):
+    yaml = pytest.importorskip("yaml")
+    if expected is not None:
+        assert yaml.safe_load("x: " + text)["x"] == expected
 
 
 @pytest.mark.parametrize(
@@ -659,8 +697,14 @@ JOB = "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
             [("macos-arm64", CI, 7)],
             [(2, "job test is defined more than once"), (4, "job test is defined more than once")],
         ),
-        ('name: "a\n  b"\n' + JOB, [], [(1, "a quoted value over several lines (name)")]),
-        ("env:\n  A: 'x\n    y'\n" + JOB, [], [(2, "a quoted value over several lines (A)")]),
+        # A quoted value over several lines is joined, so it hides nothing; it's only refused where it's read.
+        ('name: "a\n  b"\n' + JOB, [("linux-x86_64", CI, 5)], []),
+        ("env:\n  A: 'x\n    y'\n" + JOB, [("linux-x86_64", CI, 6)], []),
+        (
+            'jobs:\n  test:\n    runs-on: "ubuntu-\n      latest"\n',
+            [],
+            [(3, "job test: runs-on: a quoted value over several lines")],
+        ),
         ("name: [a,\n  b\n", [], [(1, "[a, isn't closed before the end of the file")]),
         # A job.
         (
@@ -675,17 +719,7 @@ JOB = "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
         ),
         ("jobs:\n  test:\n    steps: []\n", [], [(2, "job test: no runs-on line")]),
         ("jobs:\n  call:\n    uses: ./.github/workflows/x.yml\n", [], []),
-        (
-            'jobs:\n  test:\n    name: "Build\n      it"\n    runs-on: windows-latest\n',
-            [],
-            [
-                (
-                    3,
-                    "job test: a quoted value over several lines (name), so the job isn't read "
-                    "(neither its runner nor its Python is read)",
-                )
-            ],
-        ),
+        ('jobs:\n  test:\n    name: "Build\n      it"\n    runs-on: windows-latest\n', [("win-amd64", CI, 5)], []),
         # Steps.
         (
             JOB + "    steps: [{uses: actions/setup-python@v6}]\n",
@@ -717,23 +751,21 @@ JOB = "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
         (
             JOB + "    steps:\n      - uses: actions/setup-python@v6\n        with: { python-version: '3.13' }\n",
             [],
-            [
-                (6, "job test: with: { python-version: '3.13' } isn't read"),
-                (6, "job test: with: { python-version: '3.13' } isn't read, so the job's target isn't read"),
-            ],
+            [(6, "job test: with: { python-version: '3.13' } isn't read (neither its runner nor its Python is read)")],
         ),
         (
-            # The continued quote swallows the next line, as YAML does, and then the job isn't read at all.
+            # The continued quote swallows the next line, as YAML does: setup-python has no python-version.
             JOB + "    steps:\n      - uses: actions/setup-python@v6\n        with:\n"
             '          cache: "pip\n          python-version: 3.9\n          "\n',
-            [],
-            [
-                (
-                    7,
-                    "job test: a quoted value over several lines (cache), so the job isn't read "
-                    "(neither its runner nor its Python is read)",
-                )
-            ],
+            [("linux-x86_64", CI, 3)],
+            [(5, "job test: setup-python with no python-version (it reads .python-version, or uses the runner's)")],
+        ),
+        (
+            # The same with a flow list.
+            JOB + "    steps:\n      - uses: actions/setup-python@v6\n        with:\n"
+            "          x: [a,\n          python-version: 3.9\n          ]\n",
+            [("linux-x86_64", CI, 3)],
+            [(5, "job test: setup-python with no python-version (it reads .python-version, or uses the runner's)")],
         ),
         # The runner.
         (
@@ -882,8 +914,14 @@ jobs:
 """,
     )
     # A flow collection over several lines is read as one value, from its first line.
-    assert refused == [(14, 'job test: can\'t read [ {os: ubuntu-24.04-arm, python: "3.14t"}]')]
-    assert targets == []
+    assert refused == []
+    assert targets == [
+        ("linux-x86_64", CI, 6),
+        ("win-amd64", CI, 6),
+        ("macos-arm64", CI, 6),
+        ("linux-aarch64", CI, 14),
+    ]
+    assert [(f.value, f.line) for f in found.pythons] == [("3.12", 12), ("3.13", 12), ("3.14t", 14)]
     workflow(
         tmp_path,
         """\
@@ -977,6 +1015,8 @@ jobs:
         ("macos-14", "architecture: arm64", [("macos-arm64", CI, 3)], []),
         ("macos-13", "architecture: x64", [("macos-x86_64", CI, 3)], []),
         ("ubuntu-24.04-arm", "architecture: arm64", [("linux-aarch64", CI, 3)], []),
+        ("windows-11-arm", "architecture: arm64", [("win-arm64", CI, 3)], []),
+        ("windows-latest", "Architecture: x86", [("win32", CI, 3)], []),  # input names are case-insensitive
         ("ubuntu-latest", "architecture: x64", [("linux-x86_64", CI, 3)], []),
         (
             "windows-latest",
@@ -1006,7 +1046,7 @@ jobs:
             "windows-latest",
             "architecture: ${{ matrix.arch }}",
             [],
-            [(8, "architecture: ${{ matrix.arch }} isn't read, so the job's target isn't read")],
+            [(3, "the job has no strategy.matrix")],
         ),
     ],
 )
@@ -1061,6 +1101,7 @@ jobs:
         ("freethreaded: true", ["3.13t"], []),
         ("freethreaded: 'True'", ["3.13t"], []),
         ("freethreaded: FALSE", ["3.13"], []),
+        ("FreeThreaded: true", ["3.13t"], []),
         ("freethreaded: yes", [], [(8, "freethreaded: yes isn't true or false")]),
         ("freethreaded: ${{ matrix.ft }}", [], [(8, "freethreaded: ${{ matrix.ft }} is an expression")]),
     ],
@@ -1105,7 +1146,13 @@ jobs:
         ("3.14t", "python-version: 3.14 (matrix.python, line 7), freethreaded: true"),
         ("3.14t", "python-version: 3.14t (matrix.python, line 7)"),
     ]
-    assert refused == [(11, "job test: freethreaded: true with 3.12, which has no free-threaded build")]
+    assert refused == [
+        (
+            11,
+            "job test: python-version: 3.12 (matrix.python, line 7), freethreaded: true asks for a free-threaded 3.12, "
+            "but free-threading starts at 3.13",
+        )
+    ]
 
 
 def test_setup_uv_python_arch(tmp_path):
@@ -1238,3 +1285,247 @@ def test_cli_says_the_snippet_combines_every_job(tmp_path, capsys):
     code, out, _ = run(capsys, "--suggest-targets", str(tmp_path))
     assert code == 0
     assert "They combine every job, lint,\nrelease and bot jobs too, so keep only the platforms you ship to:" in out
+
+
+SETUP = "jobs:\n  test:\n    runs-on: windows-latest\n    steps:\n"
+WHOLE_JOB = " (neither its runner nor its Python is read)"
+
+
+@pytest.mark.parametrize(
+    ("steps", "refused"),
+    [
+        # A setup step whose uses can't be read might set the architecture: the job isn't read at all.
+        ("      - uses: *sp\n", (5, "can't read the uses: *sp of a step")),
+        (
+            "      - uses: &sp actions/setup-python@v6\n",
+            (5, "can't read the uses: &sp actions/setup-python@v6 of a step"),
+        ),
+        (
+            "      - uses: !!str actions/setup-python@v6\n",
+            (5, "can't read the uses: !!str actions/setup-python@v6 of a step"),
+        ),
+        ("      - uses: >-\n          actions/setup-python@v6\n", (5, "can't read the uses: >- of a step")),
+        (
+            "      - uses:\n          actions/setup-python@v6\n",
+            (5, "can't read the uses: actions/setup-python@v6 of a step"),
+        ),
+        (
+            '      - uses: "actions\\x2fsetup-python@v6"\n',
+            (5, 'can\'t read the uses: "actions\\x2fsetup-python@v6" of a step'),
+        ),
+        ("      - uses: actions/setup-python@v6\n        with: {}\n        with:\n", (7, "with is set twice")),
+        (
+            "      - uses: actions/setup-python@v6\n        with:\n"
+            "          architecture: x64\n          Architecture: x86\n",
+            (8, "with: sets architecture twice"),
+        ),
+        (
+            "      - uses: actions/setup-python@v6\n        if: matrix.arch == 'x86'\n        with:\n"
+            "          python-version: '3.13'\n          architecture: x86\n",
+            (6, "the actions/setup-python step has if: matrix.arch == 'x86', so it may not run"),
+        ),
+        (
+            "      - uses: astral-sh/setup-uv@v7\n        if: runner.os == 'Linux'\n        with:\n"
+            "          python-version: '3.13'\n",
+            (6, "the astral-sh/setup-uv step has if: runner.os == 'Linux', so it may not run"),
+        ),
+        ("      - uses: ${{ inputs.action }}\n", (5, "uses: ${{ inputs.action }} is an expression")),
+    ],
+)
+def test_setup_steps_it_cant_read_refuse_the_job(tmp_path, steps, refused):
+    targets, got, found = read(tmp_path, SETUP + steps)
+    assert targets == []
+    assert found.pythons == []
+    assert got == [(refused[0], f"job test: {refused[1]}{WHOLE_JOB}")]
+
+
+def test_step_keys_are_case_sensitive(tmp_path):
+    # `Uses:` isn't `uses:` to Actions, so this isn't a setup-python step and its with: changes nothing.
+    targets, refused, found = read(
+        tmp_path, SETUP + "      - Uses: actions/setup-python@v6\n        with:\n          architecture: x86\n"
+    )
+    assert targets == [("win-amd64", CI, 3)]
+    assert found.pythons == [] and refused == []
+
+
+def test_a_step_with_if_and_no_interpreter_inputs_is_read(tmp_path):
+    targets, refused, found = read(
+        tmp_path,
+        SETUP + "      - uses: actions/setup-python@v6\n        if: always()\n        with:\n          cache: pip\n",
+    )
+    assert targets == [("win-amd64", CI, 3)]
+    assert refused == [
+        (5, "job test: setup-python with no python-version (it reads .python-version, or uses the runner's)")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("line", "key"),
+    [
+        ('          "arch\\x69tecture": x86\n', '"arch\\x69tecture"'),
+        ('          "free\\x74hreaded": true\n', '"free\\x74hreaded"'),
+        ("          'it''s': x\n", "'it''s'"),
+    ],
+)
+def test_quoted_keys_with_escapes_refuse_the_file(tmp_path, line, key):
+    targets, refused, _ = read(tmp_path, SETUP + "      - uses: actions/setup-python@v6\n        with:\n" + line)
+    assert targets == []
+    assert refused == [(7, f"can't read the escapes in the key {key}")]
+    _, refused, _ = read(tmp_path, '"contain\\x65r": x\n' + JOB)
+    assert refused == [(1, 'can\'t read the escapes in the key "contain\\x65r"')]
+
+
+def test_free_threading_starts_at_313(tmp_path):
+    _, refused, found = read(
+        tmp_path,
+        SETUP + "      - uses: actions/setup-python@v6\n        with:\n          python-version: 3.12t\n"
+        "      - uses: actions/setup-python@v6\n        with:\n          python-version: 3.13t\n",
+    )
+    assert [f.value for f in found.pythons] == ["3.13t"]
+    assert refused == [
+        (7, "job test: python-version: 3.12t asks for a free-threaded 3.12t, but free-threading starts at 3.13")
+    ]
+
+
+def test_freethreaded_is_a_setup_python_input_only(tmp_path):
+    _, _, found = read(
+        tmp_path,
+        SETUP
+        + "      - uses: astral-sh/setup-uv@v7\n        with:\n"
+        + "          python-version: '3.13'\n          freethreaded: true\n",
+    )
+    assert [f.value for f in found.pythons] == ["3.13"]
+
+
+@pytest.mark.parametrize(
+    ("header", "refused"),
+    [
+        ("%YAML 1.2\n---\n", []),
+        ("%YAML 1.1\n---\n", [(1, "the %YAML 1.1 directive isn't read (only %YAML 1.2 before the document is)")]),
+        (
+            "%TAG ! tag:example.com,2000:\n---\n",
+            [(1, "the %TAG ! tag:example.com,2000: directive isn't read (only %YAML 1.2 before the document is)")],
+        ),
+        ("  ---\n", [(1, "can't read ---")]),  # indented: not a document marker
+        ("---x\n", [(1, "can't read ---x")]),
+        ("----\n", [(1, "can't read ----")]),
+        ("? jobs\n", [(1, "can't read ? jobs")]),
+    ],
+)
+def test_directives_and_markers(tmp_path, header, refused):
+    targets, got, _ = read(tmp_path, header + JOB)
+    assert got == refused
+    assert targets == ([] if refused else [("linux-x86_64", CI, header.count("\n") + 3)])
+
+
+def test_architecture_from_a_literal_matrix(tmp_path):
+    # As in numpy's windows.yml: each combination has its own runner and architecture.
+    targets, refused, found = read(
+        tmp_path,
+        """\
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-2022
+            architecture: x86
+          - os: windows-11-arm
+            architecture: arm64
+          - os: ubuntu-latest
+            architecture: x86
+          - {os: macos-14, architecture: x64, name: it's}
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          architecture: ${{ matrix.architecture }}
+""",
+    )
+    assert targets == [("win32", CI, 7), ("win-arm64", CI, 9), ("macos-x86_64", CI, 13)]
+    assert found.targets[0].source == "runs-on: windows-2022 (matrix.os, line 3), architecture: x86 (matrix)"
+    assert found.targets[2].macos == "14.0"  # the runner's macOS stays with the Intel target
+    assert refused == [(11, "job test: setup-python's architecture: x86 on ubuntu-latest isn't read")]
+
+
+def test_architecture_from_the_matrix_on_a_fixed_runner(tmp_path):
+    targets, refused, found = read(
+        tmp_path,
+        """\
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          architecture: ${{ matrix.arch }}
+""",
+    )
+    assert targets == [("linux-x86_64", CI, 3)]
+    assert found.targets[0].glibc == "2.39"
+    assert refused == [(3, "job test: setup-python's architecture: arm64 on ubuntu-24.04 isn't read")]
+
+
+def test_continued_lines_follow_yaml_quoting_and_comments(tmp_path):
+    targets, refused, _ = read(
+        tmp_path,
+        """\
+env:
+  A: "x \\" # not a comment
+    y"
+  B: 'it''s # not a comment
+    either'
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, # windows-latest,
+             macos-14]
+""",
+    )
+    assert refused == []
+    assert targets == [("linux-x86_64", CI, 11), ("macos-arm64", CI, 11)]
+
+
+def test_dockerfile_names(tmp_path):
+    for name in ("dockerfile.dev", "Containerfile.prod", "Dockerfile.md", "dockerfile.py", "Dockerfile.dockerignore"):
+        (tmp_path / name).write_text("FROM python:3.13-slim\n")
+    for skipped in ("test", "example"):
+        (tmp_path / skipped).mkdir()
+        (tmp_path / skipped / "Dockerfile").write_text("FROM python:3.9\n")
+    assert [f.path for f in suggest(tmp_path).targets] == ["Containerfile.prod", "dockerfile.dev"]
+
+
+def test_values_on_the_next_line(tmp_path):
+    # Valid YAML that real workflows use (run:, key:, needs:): the value belongs to its key, never read as a line of
+    # its own, and refused where wheelgap would read it.
+    targets, refused, _ = read(
+        tmp_path,
+        """\
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    needs:
+      [
+        lint,
+      ]
+    steps:
+      - run:
+          tox -e py -- -v
+      - uses: actions/cache@v4
+        with:
+          key:
+            ${{ runner.os }}-x
+  other:
+    runs-on:
+      windows-latest
+""",
+    )
+    assert targets == [("linux-x86_64", CI, 3)]
+    assert refused == [(16, "job other: runs-on: a value on the line after the key")]

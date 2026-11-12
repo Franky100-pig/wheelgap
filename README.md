@@ -350,8 +350,9 @@ The snippet combines every job in every workflow, including lint, release and bo
 - **GitHub Actions** (`.github/workflows/*.yml` and `*.yaml`):
   - Each job's `runs-on`, as a single label or `${{ matrix.KEY }}` with a literal matrix. The matrix can use lists, also over several lines, and `include` and `exclude` entries, which are combined as GitHub does.
   - The `python-version` given to `actions/setup-python` or `astral-sh/setup-uv`, as a literal (`"3.13"`, `3.13.1`, `3.14t`) or from the matrix.
-  - setup-python's `freethreaded: true`, which adds the `t`.
-  - setup-python's `architecture`, where it's certain: `x86` on x64 Windows is `win32`, and `x64` on Apple silicon is `macos-x86_64` (Rosetta).
+  - setup-python's `freethreaded: true`, which adds the `t` (free-threading starts at 3.13, so `3.12t` is refused).
+  - setup-python's `architecture`, where it's certain: `x86` on x64 Windows is `win32`, and `x64` on Apple silicon is `macos-x86_64` (Rosetta). It can come from a literal matrix, which pairs each runner with its own architecture.
+  - Input names are case-insensitive, as Actions reads them (`Architecture: x86`). Step keys such as `uses` and `with` aren't.
 - **Runner labels.** [GitHub-hosted runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) labels map to targets as follows. Other Ubuntu versions (`ubuntu-22.04`, `ubuntu-22.04-arm`) and Windows images (`windows-2022`, `windows-2025-vs2026`) map the same way.
   - `ubuntu-latest`, `ubuntu-slim` and `ubuntu-24.04` → `linux-x86_64`.
   - `ubuntu-24.04-arm` → `linux-aarch64`.
@@ -359,21 +360,22 @@ The snippet combines every job in every workflow, including lint, release and bo
   - `windows-11-arm` → `win-arm64`.
   - `macos-latest`, `macos-14` and later, `xcode-*` and the `-xlarge` runners → `macos-arm64`.
   - `macos-13`, `macos-15-intel` and the `-large` runners → `macos-x86_64`.
-- **Runner versions.** A pinned label also names its glibc (`ubuntu-22.04` has 2.35, `ubuntu-24.04` 2.39) or its macOS version (`macos-14` is 14.0). A `-latest` label moves, so it names neither.
-- **Dockerfiles.** Every `Dockerfile`, `Containerfile`, `Dockerfile.*` and `*.Dockerfile` is read, except in hidden folders, virtual environments, `node_modules`, and `tests`, `fixtures`, `examples`, `docs`, `build`, `dist` and `target` folders. The final stage's image is read exactly as `--dockerfile` reads it, for the target, the Python and the glibc or musl version. Without `--platform` it's read as `linux/amd64`, and the output says so.
+- **Runner versions.** A pinned label also names its glibc (`ubuntu-22.04` has 2.35, `ubuntu-24.04` 2.39) or its macOS version (`macos-14` is 14.0). A `-latest` label moves, so it names neither. `ubuntu-26.04` names none yet: GitHub's runner-images readme doesn't give its glibc.
+- **Dockerfiles.** Every `Dockerfile`, `Containerfile`, `Dockerfile.*` (also `dockerfile.dev`) and `*.Dockerfile` is read, except in hidden folders, virtual environments, `node_modules`, and `tests`, `test`, `fixtures`, `examples`, `example`, `docs`, `build`, `dist` and `target` folders. The final stage's image is read exactly as `--dockerfile` reads it, for the target, the Python and the glibc or musl version. Without `--platform` it's read as `linux/amd64`, and the output says so.
 
 The snippet sets `glibc`, `musl` or `macos` only when every source of those targets names the same version. Otherwise a `#` line says why it's left out. It also leaves out `python` when no Python was found. `--json` prints the same as an object with `targets`, `python` (each with `file`, `line` and `from`), `unreadable` and `config`.
 
 There's no YAML parser in the standard library, so workflows are read with a conservative line scan. Anything it can't be sure of is listed under "Couldn't read" with its file and line, and never guessed:
 
-- expressions and computed matrices, and an `architecture` or `freethreaded` taken from the matrix;
+- expressions and computed matrices, and a `freethreaded` taken from the matrix;
+- a job with a setup step whose `uses` can't be read, which sets an input twice, or which picks the Python under an `if:` (the step may not run);
 - self-hosted and other unknown runner labels;
 - a job that runs in a `container:`;
 - an unquoted `3.10` (YAML reads it as the number 3.1) or `0x10`;
 - `python-version-file`;
-- flow-style `steps` or `with`;
-- a quoted value over several lines (the job isn't read at all);
-- more than one YAML document;
+- flow-style `steps` or `with`, a value on the line after its key, and a quoted value over several lines, where wheelgap would read it (elsewhere it's skipped whole);
+- a flow list with anything but plain or quoted scalars and flat `{...}` mappings, read as YAML reads them (`[it's]` is the string `it's`);
+- quoted keys with escapes, lines that are neither a key nor a list item, directives other than `%YAML 1.2`, and more than one YAML document;
 - a job id used twice;
 - Dockerfile templates (`Dockerfile.j2`, `Dockerfile.template`), files or folders it can't open, and Dockerfiles `--dockerfile` would reject.
 
