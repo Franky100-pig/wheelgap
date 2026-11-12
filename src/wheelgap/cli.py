@@ -25,6 +25,7 @@ from .check import CELL, EXPLAIN_LIMIT, Row, Status, check, explain, explain_lin
 from .dockerfile import DockerfileError, read_dockerfile
 from .github import github_annotations
 from .junit import write_junit
+from .logsafe import guarded_output, write_command
 from .offline import require_offline, undo_offline
 from .pyodide import (
     PyodideLock,
@@ -1112,6 +1113,20 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 reconfigure(errors="replace")
     argv = sys.argv[1:] if argv is None else argv
+    # `wheelgap mcp`: the MCP server (as `wheelgap-mcp`), so MCP registries can start it from the `wheelgap` package
+    # (`uvx wheelgap@VERSION mcp`). Unlike diff, a file or folder named mcp here doesn't make it an input: the MCP
+    # client picks the working directory, often a project with an mcp/ folder. `wheelgap ./mcp` checks such a folder,
+    # and `wheelgap mcp==1.0` the PyPI package. Its stdout is the protocol, not a log, so it isn't guarded.
+    if argv[:1] == ["mcp"]:
+        from .mcp import main as mcp_main
+
+        return mcp_main(argv[1:], prog="wheelgap mcp")
+    # Lockfile text must never run as a GitHub Actions workflow command in a CI log (see logsafe).
+    with guarded_output():
+        return _main(argv)
+
+
+def _main(argv: list[str]) -> int:
     # `wheelgap diff OLD NEW`: a subcommand only when "diff" comes first and isn't a file or folder here, so
     # `wheelgap ./diff` still checks a folder named diff (and `wheelgap diff==1.0` the PyPI package).
     if argv[:1] == ["diff"]:
@@ -1123,14 +1138,6 @@ def main(argv: list[str] | None = None) -> int:
             "wheelgap: note: reading ./diff as an input; for the comparison, run python -m wheelgap.diff",
             file=sys.stderr,
         )
-    # `wheelgap mcp`: the MCP server (as `wheelgap-mcp`), so MCP registries can start it from the `wheelgap` package
-    # (`uvx wheelgap@VERSION mcp`). Unlike diff, a file or folder named mcp here doesn't make it an input: the MCP
-    # client picks the working directory, often a project with an mcp/ folder. `wheelgap ./mcp` checks such a folder,
-    # and `wheelgap mcp==1.0` the PyPI package.
-    if argv[:1] == ["mcp"]:
-        from .mcp import main as mcp_main
-
-        return mcp_main(argv[1:], prog="wheelgap mcp")
     parser = make_parser()
     args = parser.parse_args(argv)
     if args.json and args.markdown:
@@ -1455,8 +1462,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.github_annotations:
         # Workflow commands work on stdout and stderr alike; stderr keeps --json and --markdown output clean.
+        # These are wheelgap's own (escaped in github.workflow_command), so they go past the logsafe guard.
         for command in github_annotations(rows, targets, sources, failing, advisory):
-            print(command, file=sys.stderr if args.json or args.markdown else sys.stdout)
+            write_command(command, sys.stderr if args.json or args.markdown else sys.stdout)
 
     if args.json:
         print(
