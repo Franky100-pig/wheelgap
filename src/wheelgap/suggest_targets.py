@@ -784,7 +784,9 @@ def dockerfiles(folder: Path, out: Suggestions) -> list[Path]:
         dirs[:] = sorted(
             d
             for d in dirs
-            if not d.startswith(".") and d not in _SKIP_DIRS and not (Path(top) / d / "pyvenv.cfg").exists()
+            if not d.startswith(".")
+            and d not in _SKIP_DIRS
+            and not os.path.exists(os.path.join(top, d, "pyvenv.cfg"))  # False, not an error, when unreadable
         )
         for f in sorted(files):
             kind = _container_kind(f)
