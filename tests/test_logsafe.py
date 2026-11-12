@@ -402,3 +402,16 @@ def test_an_error_in_the_guard_prints_a_fixed_message(capsys, fake_pypi, tmp_pat
     assert caught.value.code == 2
     out, err = capsys.readouterr()
     assert (out, err) == ("", "wheelgap: error: an internal error occurred while writing output\n")
+
+
+@pytest.mark.parametrize("name", ["::warning file=a,line=1::pwned", "a ##[error]b", "x_", "\u212aelvin", "pure'wheel"])
+def test_invalid_pixi_pypi_names_are_input_errors(capsys, fake_pypi, fixtures, tmp_path, name):
+    lock = (fixtures / "pixiproj" / "pixi.lock").read_text(encoding="utf-8")
+    assert lock.count("  name: winonly\n") == 1
+    quoted = "'" + name.replace("'", "''") + "'"
+    (tmp_path / "pixi.lock").write_text(lock.replace("  name: winonly\n", f"  name: {quoted}\n"), encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path / "pixi.lock"), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2
+    message = f"pixi.lock: a package has the name {name!r}, which isn't a valid package name (PEP 508)"
+    assert neutralize(message) in err
+    assert not commands(out + err)
