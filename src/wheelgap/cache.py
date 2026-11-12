@@ -1,5 +1,6 @@
 """A small on-disk cache of pinned index lookups (/<name>/<version>/json), so a repeat run needn't ask again,
-and of --conda-forge lookups (a version's conda-forge builds, cut down to what matching needs).
+of --conda-forge lookups (a version's conda-forge builds, cut down to what matching needs), and of --notes lookups
+(the coverage tracker's notes for a package).
 
 A cache that can't be read or written is only ever a miss: it never fails a run.
 """
@@ -120,6 +121,18 @@ def load_builds(name: str, version: str) -> list[dict] | str | None:
 
 def save_builds(name: str, version: str, builds: list[dict] | str) -> None:
     _save(CONDA_FORGE_KEY, name, version, "builds", builds)
+
+
+def load_notes(source: str, name: str) -> list | None:
+    """--notes: a package's cached tracker notes (see notes.py) from `source`, or None. An empty list is a cached
+    404. notes.py checks each note again."""
+    notes = _load(source, name, "notes", "notes")  # "notes" is no version, so it can't collide with a release
+    return notes if isinstance(notes, list) else None
+
+
+def save_notes(source: str, name: str, notes: list[dict]) -> None:
+    """Store a package's tracker notes, as notes.py checked them."""
+    _save(source, name, "notes", "notes", notes)
 
 
 def _save(index: str, name: str, version: str, key: str, value: object) -> None:
