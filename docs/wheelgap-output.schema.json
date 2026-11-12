@@ -73,6 +73,11 @@
                 }
             }
         },
+        "blocking_newer_python": {
+            "type": "array",
+            "description": "Present only when exactly two Python versions are checked and one is newer (3.14 and 3.15, or 3.14 and 3.15t; not 3.14 and 3.14t), and not written by 0.9.0 and older: the packages that block the move to the newer one, in the order of packages. A package is listed when the newer Python's result is source or missing on a platform where the older one's is wheel, n/a or bundled, not counting the platforms in ignored_targets. Empty when no package has a gap on the newer Python that the older one doesn't have too.",
+            "items": {"type": "string", "description": "Package name as written in the input."}
+        },
         "summary": {
             "type": "object",
             "additionalProperties": false,

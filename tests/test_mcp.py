@@ -113,6 +113,20 @@ def test_check_package(fake_pypi):
     assert fake_pypi == ["https://pypi.org/pypi/winonly/json"]
 
 
+def test_python_next(fake_pypi, fixtures):
+    (_, reply) = run(init(), call("check_package", name="purewheel", python="3.14,next-t", targets=["linux-x86_64"]))
+    assert reply["result"]["structuredContent"]["results"] == {
+        "3.14 linux-x86_64": "wheel",
+        "3.15t linux-x86_64": "wheel",
+    }
+    (_, reply) = run(
+        init(), call("check_lockfile", path=str(fixtures / "uvproj"), python="next", targets=["linux-x86_64"])
+    )
+    data = reply["result"]["structuredContent"]
+    assert data["targets"] == ["3.15 linux-x86_64"]
+    assert "next is Python 3.15, the newest CPython this wheelgap version knows" in data["notes"]
+
+
 def test_check_package_pinned_version_and_glibc(fake_pypi):
     (_, reply) = run(
         init(),

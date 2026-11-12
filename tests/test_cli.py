@@ -878,6 +878,75 @@ def test_markdown_summary_per_target(capsys, fixtures):
     assert not any(line.startswith("- ") for line in out.splitlines())
 
 
+UPGRADE = ("newpylag==1.0", "nowheels==0.9", "purewheel==3.1", "-t", "linux-x86_64,win-amd64", "--color", "never")
+NEXT_NOTE = "wheelgap: note: next is Python 3.15, the newest CPython this wheelgap version knows\n"
+
+
+def test_python_next_names_what_blocks_the_upgrade(capsys, fake_pypi):
+    # newpylag has a 3.14 wheel on Linux but not a 3.15 one; nowheels builds from source on both, so it doesn't block.
+    code, out, err = run(capsys, *UPGRADE, "-p", "3.14", "-p", "next")
+    assert code == 1
+    assert err == NEXT_NOTE
+    assert "Python 3.14, 3.15" in out
+    lines = out.splitlines()
+    summary = lines.index("2 of 3 packages have gaps: 2 will build from source.")
+    assert lines[summary + 1] == "blocking 3.15: newpylag"
+    # The order of -p doesn't matter, and next-t blocks the same way.
+    code, out, err = run(capsys, *UPGRADE, "-p", "next-t,3.14")
+    assert "blocking 3.15t: newpylag" in out.splitlines()
+    assert err == NEXT_NOTE.replace("next is Python 3.15", "next-t is Python 3.15t")
+
+    code, out, err = run(capsys, *UPGRADE, "-p", "3.14", "-p", "next", "--json")
+    assert code == 1
+    assert err == NEXT_NOTE
+    data = json.loads(out)
+    _assert_matches_output_schema(data)
+    assert data["blocking_newer_python"] == ["newpylag"]
+    assert {t["python"] for t in data["targets"]} == {"3.14", "3.15"}
+
+    code, out, _ = run(capsys, *UPGRADE, "-p", "3.14", "-p", "next", "--markdown")
+    assert "blocking 3.15: newpylag" in out.splitlines()
+
+    code, out, err = run(capsys, *UPGRADE, "-p", "3.14", "-p", "next", "-q")
+    assert out.splitlines()[-1] == "blocking 3.15: newpylag"
+    assert not err  # -q drops the note too
+
+
+def test_blocking_newer_python_only_counts_new_gaps(capsys, fake_pypi):
+    # Ignoring newpylag on Linux leaves only nowheels, which has gaps on 3.14 too.
+    code, out, _ = run(capsys, *UPGRADE, "-p", "3.14,3.15", "--ignore", "newpylag:linux-x86_64")
+    assert "blocking 3.15: none, apart from gaps 3.14 has too" in out.splitlines()
+    code, out, _ = run(capsys, *UPGRADE, "-p", "3.14,3.15", "--ignore", "newpylag:linux-x86_64", "--json")
+    assert json.loads(out)["blocking_newer_python"] == []
+    # Nothing is printed when there are no gaps at all.
+    code, out, _ = run(capsys, "purewheel==3.1", "-p", "3.14", "-p", "3.15", "--color", "never")
+    assert code == 0 and "blocking" not in out
+
+
+@pytest.mark.parametrize("pythons", [["3.15"], ["3.15", "3.15t"], ["3.13", "3.14", "3.15"]])
+def test_no_blocking_summary_without_exactly_two_pythons_one_newer(capsys, fake_pypi, pythons):
+    args = [arg for p in pythons for arg in ("-p", p)]
+    code, out, _ = run(capsys, *UPGRADE, *args)
+    assert code == 1 and "blocking" not in out
+    code, out, _ = run(capsys, *UPGRADE, *args, "--json")
+    data = json.loads(out)
+    _assert_matches_output_schema(data)
+    assert "blocking_newer_python" not in data
+    code, out, _ = run(capsys, *UPGRADE, *args, "--markdown")
+    assert "blocking" not in out
+
+
+def test_python_next_in_pyproject(capsys, fake_pypi, tmp_path):
+    (tmp_path / "requirements.txt").write_text("newpylag==1.0\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.wheelgap]\npython = ["3.14", "next"]\ntargets = ["linux-x86_64"]\n', encoding="utf-8"
+    )
+    code, out, err = run(capsys, str(tmp_path / "requirements.txt"), "--color", "never")
+    assert code == 1
+    assert err == NEXT_NOTE
+    assert "blocking 3.15: newpylag" in out.splitlines()
+
+
 def test_gap_summary_counts_each_package_once():
     from wheelgap.check import Row, Status
     from wheelgap.cli import Style, gap_summary

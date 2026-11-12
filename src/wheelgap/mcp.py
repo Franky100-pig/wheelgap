@@ -95,7 +95,8 @@ _STATUS_HELP = (
 
 _PYTHON_PROP = {
     "type": "string",
-    "description": "Target Python version(s), comma-separated, e.g. '3.13' or '3.12,3.14t' (t = free-threaded).",
+    "description": "Target Python version(s), comma-separated, e.g. '3.13' or '3.12,3.14t' (t = free-threaded); "
+    "'next' and 'next-t' mean the newest CPython wheelgap knows.",
 }
 _TARGETS_PROP = {
     "type": "array",
@@ -277,7 +278,7 @@ class ToolError(Exception):
     """A problem with the tool's arguments or input, reported to the model as a tool result with isError."""
 
 
-_PYTHON_RE = re.compile(r"\d+\.\d+t?", re.ASCII)
+_PYTHON_RE = re.compile(r"\d+\.\d+t?|next(-t)?", re.ASCII)
 _NAME_RE = re.compile(r"[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?", re.ASCII)
 _GAP = {Status.SOURCE.value, Status.MISSING.value, Status.UNKNOWN.value}
 
@@ -313,7 +314,9 @@ def _pythons(args: dict[str, Any]) -> list[str]:
     python = _string(args, "python") or ""
     parts = [p.strip() for p in python.split(",") if p.strip()]
     if bad := [p for p in parts if not _PYTHON_RE.fullmatch(p)]:
-        raise ToolError(f"can't read Python version(s) {', '.join(map(repr, bad))} (expected e.g. '3.13' or '3.14t')")
+        raise ToolError(
+            f"can't read Python version(s) {', '.join(map(repr, bad))} (expected e.g. '3.13', '3.14t' or 'next')"
+        )
     return parts
 
 

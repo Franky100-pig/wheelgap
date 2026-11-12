@@ -11,6 +11,15 @@ FAKE_INDEX = {
     "winonly": {"311": ["winonly-311-cp313-cp313-win_amd64.whl"]},
     "purewheel": {"3.1": ["purewheel-3.1-py3-none-any.whl"]},
     "nowheels": {"0.9": ["nowheels-0.9.tar.gz"]},
+    # Wheels for 3.14 on Linux and Windows, but for 3.15 on Windows only: it blocks the move to 3.15 on Linux.
+    "newpylag": {
+        "1.0": [
+            "newpylag-1.0-cp314-cp314-manylinux_2_17_x86_64.whl",
+            "newpylag-1.0-cp314-cp314-win_amd64.whl",
+            "newpylag-1.0-cp315-cp315-win_amd64.whl",
+            "newpylag-1.0.tar.gz",
+        ]
+    },
     "ranged": {
         "1.5": ["ranged-1.5-py3-none-any.whl"],
         "1.9": ["ranged-1.9.tar.gz"],
