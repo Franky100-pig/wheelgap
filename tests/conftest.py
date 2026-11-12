@@ -83,11 +83,13 @@ class FakeFiles:
     def __init__(self):
         self.files: dict[str, object] = {}
         self.calls: list[str] = []
+        self.timeouts: list[float | None] = []
 
 
 @pytest.fixture
 def fake_files(monkeypatch):
-    """Serves fake_files.files at https://files.example/<filename>, the URLs fake_pypi gives every file."""
+    """Serves fake_files.files at https://files.example/<filename>, the URLs fake_pypi gives every file, and at
+    https://files.pythonhosted.org/<any path>/<filename>, as a lock gives them."""
     import io
     import urllib.error
 
@@ -98,7 +100,9 @@ def fake_files(monkeypatch):
     def open_(req, timeout=None):
         url = req.full_url
         served.calls.append(url)
-        name = url.removeprefix("https://files.example/")
+        served.timeouts.append(timeout)
+        host, _, path = url.removeprefix("https://").partition("/")
+        name = path.rpartition("/")[2] if host in ("files.example", "files.pythonhosted.org") else ""
         if name not in served.files:
             raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
         body = served.files[name]
@@ -123,7 +127,7 @@ def fake_pypi(monkeypatch):
 
     calls = []
 
-    def fetch_json(url, timeout=20.0, attempts=4):
+    def fetch_json(url, timeout=20.0, attempts=4, deadline=None):
         calls.append(url)
         # Served at whatever WHEELGAP_INDEX_URL points at, so tests can assert which index was asked.
         parts = url.removeprefix(pypi.index_url() + "/").removesuffix("/json").split("/")

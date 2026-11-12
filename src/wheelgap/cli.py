@@ -1381,12 +1381,9 @@ def main(argv: list[str] | None = None) -> int:
         # What each explained `source` release needs to build, from its sdist (only for releases positively from
         # PyPI: see build.where). Nothing here changes the exit code, and a release whose sdist gives no answer just
         # gets no line.
-        build_info, took = lookup_all([r.package for r in gaps if source_targets(r, targets)], **cached)
-        if took is not None and not quiet:
-            note = (
-                f"wheelgap: note: build info: stopped after {took:.0f} s; packages not read by then have no build line"
-            )
-            print(Style(use_color(args.color)).dim(note), file=sys.stderr)
+        build_info, stopped = lookup_all([r.package for r in gaps if source_targets(r, targets)], **cached)
+        if stopped is not None and not quiet:
+            print(Style(use_color(args.color)).dim(f"wheelgap: note: {stopped}"), file=sys.stderr)
 
     if args.junit is not None:  # an empty PATH (an unset CI variable) is an error, not "no report"
         try:

@@ -58,7 +58,7 @@ class Package:
     # uv.lock / pylock.toml: the sdist's URL and sha256, as the lock records them (for --build-info).
     sdist_url: str | None = None
     sdist_sha256: str | None = None
-    # The JSON API index (pypi.index_url()) this run's lookup took the files from, if it did.
+    # The JSON API index (pypi.index_url()) this run took the files from, for a package the input listed none for.
     looked_up_on: str | None = None
 
     @property

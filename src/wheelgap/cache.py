@@ -89,10 +89,15 @@ _BUILD_FIELDS: dict[str, type | tuple[type, ...]] = {
 }
 
 
-def load_build(index: str, name: str, version: str) -> dict | None:
+def _build_kind(sha256: str) -> str:
+    return f"build:{sha256}" if sha256 else "build"
+
+
+def load_build(index: str, name: str, version: str, sha256: str) -> dict | None:
     """A release's cached build info: {"answer": None} when its sdist gives no answer, else {"answer": {"requires",
-    "backend", "backend_path", "build_script"}} (see build.py). None for a miss."""
-    entry = _fresh(index, name, version, "build")
+    "backend", "backend_path", "build_script"}} (see build.py). None for a miss. `sha256` is the sdist's, as a lock
+    gives it, or "" when the index gives the URL."""
+    entry = _fresh(index, name, version, _build_kind(sha256))
     if entry is None or "answer" not in entry:
         return None
     answer = entry["answer"]
@@ -108,9 +113,9 @@ def load_build(index: str, name: str, version: str) -> dict | None:
     return None
 
 
-def save_build(index: str, name: str, version: str, answer: dict | None) -> None:
+def save_build(index: str, name: str, version: str, sha256: str, answer: dict | None) -> None:
     """Store what a release's sdist says about its build, or None when it gives no answer for good."""
-    _save(index, name, version, "build", {"answer": answer})
+    _save(index, name, version, _build_kind(sha256), {"answer": answer})
 
 
 def _save(index: str, name: str, version: str, kind: str, data: dict) -> None:
