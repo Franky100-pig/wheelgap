@@ -310,38 +310,71 @@ Docker platform names also work with `-t`, for example `-t linux/amd64,linux/arm
 
 ### Suggest targets from your CI and Dockerfiles
 
-`wheelgap --suggest-targets [DIR]` (default: the current directory) reads the platforms and Pythons the project already names, and prints each suggestion with the file and line it came from, then a `[tool.wheelgap]` snippet to paste into `pyproject.toml`. It only suggests: nothing is changed or checked, and it exits 0.
+`wheelgap --suggest-targets [DIR]` (default: the current directory) reads the platforms and Pythons the project already names, and prints each suggestion with the file and line it came from, then a `[tool.wheelgap]` snippet to paste into `pyproject.toml`. It only suggests: nothing is changed or checked, and it exits 0. It can't be combined with `-p`, `-t`, `--dockerfile` or `--list-targets`, and a `DIR` that isn't a folder exits 2.
 
 ```
 $ wheelgap --suggest-targets
 Targets:
   linux-x86_64
-    .github/workflows/wheels.yml:5  runs-on: ubuntu-slim
+    .github/workflows/wheels.yml:5  runs-on: ubuntu-24.04
   linux-aarch64
     .github/workflows/test.yml:9  runs-on: ubuntu-24.04-arm (matrix.os, line 5)
   musl-x86_64
-    Dockerfile:4  FROM python:3.13-alpine (musl 1.2)
+    Dockerfile:4  FROM python:3.13-alpine (no --platform: read as linux/amd64, musl 1.2)
   win-amd64
     .github/workflows/test.yml:9  runs-on: windows-latest (matrix.os, line 5)
 Pythons:
   3.13
     .github/workflows/test.yml:8  python-version: 3.13 (matrix.python-version, line 14)
     Dockerfile:4                  FROM python:3.13-alpine
+  3.14
+    .github/workflows/test.yml:8  python-version: 3.14 (matrix.python-version, line 14)
 Couldn't read (not guessed):
   .github/workflows/wheels.yml:12  job build: the matrix is computed (${{ fromJSON(needs.plan.outputs.matrix) }})
 
-Suggested settings for pyproject.toml (nothing was changed or checked):
+Suggested settings for pyproject.toml (nothing was changed or checked). They combine every job, lint,
+release and bot jobs too, so keep only the platforms you ship to:
 
 [tool.wheelgap]
-python = ["3.13"]
+python = ["3.13", "3.14"]
 targets = ["linux-x86_64", "linux-aarch64", "musl-x86_64", "win-amd64"]
+glibc = "2.39"
 musl = "1.2"
 ```
 
-- **GitHub Actions** (`.github/workflows/*.yml` and `*.yaml`): each job's `runs-on`, as a single label or `${{ matrix.KEY }}` with a literal matrix (lists, `include` and `exclude`, combined as GitHub does), and the `python-version` given to `actions/setup-python` or `astral-sh/setup-uv`, as a literal (`"3.13"`, `3.13.1`, `3.14t`) or from the matrix. [GitHub-hosted runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) labels map to targets: `ubuntu-latest`, `ubuntu-slim` and `ubuntu-24.04` to `linux-x86_64`, `ubuntu-24.04-arm` to `linux-aarch64`; `windows-latest` and `windows-2025` to `win-amd64`, `windows-11-arm` to `win-arm64`; `macos-latest`, `macos-14` and later, and the `-xlarge` runners to `macos-arm64`; `macos-13`, `macos-15-intel` and the `-large` runners to `macos-x86_64`. Other Ubuntu versions (`ubuntu-22.04`, `ubuntu-22.04-arm`) and Windows images (`windows-2022`, `windows-2025-vs2026`) map the same way.
-- **Dockerfiles** (every `Dockerfile*` and `*.Dockerfile` outside hidden folders, `node_modules` and virtual environments): the final stage's image, read exactly as `--dockerfile` reads it, for the target, the Python and the glibc or musl version.
+The snippet combines every job in every workflow, including lint, release and bot jobs (the `plan` job above adds `linux-x86_64`), so check it before pasting and keep only the platforms you ship to.
 
-There's no YAML parser in the standard library, so workflows are read with a conservative line scan. Anything it can't be sure of is listed under "Couldn't read" with its file and line, and never guessed: an expression or a computed matrix, a self-hosted or other unknown runner label, a job that runs in a `container:`, an unquoted `3.10` (YAML reads it as the number 3.1), `python-version-file`, and Dockerfiles `--dockerfile` would reject. A `DIR` that isn't a folder exits 2. The snippet sets `glibc` or `musl` only when every source of those targets names the same version (a runner doesn't), and leaves out `python` when none was found. `--json` prints the same as an object with `targets`, `python` (each with `file`, `line` and `from`), `unreadable` and `config`.
+- **GitHub Actions** (`.github/workflows/*.yml` and `*.yaml`):
+  - Each job's `runs-on`, as a single label or `${{ matrix.KEY }}` with a literal matrix. The matrix can use lists, also over several lines, and `include` and `exclude` entries, which are combined as GitHub does.
+  - The `python-version` given to `actions/setup-python` or `astral-sh/setup-uv`, as a literal (`"3.13"`, `3.13.1`, `3.14t`) or from the matrix.
+  - setup-python's `freethreaded: true`, which adds the `t`.
+  - setup-python's `architecture`, where it's certain: `x86` on x64 Windows is `win32`, and `x64` on Apple silicon is `macos-x86_64` (Rosetta).
+- **Runner labels.** [GitHub-hosted runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) labels map to targets as follows. Other Ubuntu versions (`ubuntu-22.04`, `ubuntu-22.04-arm`) and Windows images (`windows-2022`, `windows-2025-vs2026`) map the same way.
+  - `ubuntu-latest`, `ubuntu-slim` and `ubuntu-24.04` → `linux-x86_64`.
+  - `ubuntu-24.04-arm` → `linux-aarch64`.
+  - `windows-latest` and `windows-2025` → `win-amd64`.
+  - `windows-11-arm` → `win-arm64`.
+  - `macos-latest`, `macos-14` and later, `xcode-*` and the `-xlarge` runners → `macos-arm64`.
+  - `macos-13`, `macos-15-intel` and the `-large` runners → `macos-x86_64`.
+- **Runner versions.** A pinned label also names its glibc (`ubuntu-22.04` has 2.35, `ubuntu-24.04` 2.39) or its macOS version (`macos-14` is 14.0). A `-latest` label moves, so it names neither.
+- **Dockerfiles.** Every `Dockerfile`, `Containerfile`, `Dockerfile.*` and `*.Dockerfile` is read, except in hidden folders, virtual environments, `node_modules`, and `tests`, `fixtures`, `examples`, `docs`, `build`, `dist` and `target` folders. The final stage's image is read exactly as `--dockerfile` reads it, for the target, the Python and the glibc or musl version. Without `--platform` it's read as `linux/amd64`, and the output says so.
+
+The snippet sets `glibc`, `musl` or `macos` only when every source of those targets names the same version. Otherwise a `#` line says why it's left out. It also leaves out `python` when no Python was found. `--json` prints the same as an object with `targets`, `python` (each with `file`, `line` and `from`), `unreadable` and `config`.
+
+There's no YAML parser in the standard library, so workflows are read with a conservative line scan. Anything it can't be sure of is listed under "Couldn't read" with its file and line, and never guessed:
+
+- expressions and computed matrices, and an `architecture` or `freethreaded` taken from the matrix;
+- self-hosted and other unknown runner labels;
+- a job that runs in a `container:`;
+- an unquoted `3.10` (YAML reads it as the number 3.1) or `0x10`;
+- `python-version-file`;
+- flow-style `steps` or `with`;
+- a quoted value over several lines (the job isn't read at all);
+- more than one YAML document;
+- a job id used twice;
+- Dockerfile templates (`Dockerfile.j2`, `Dockerfile.template`), files or folders it can't open, and Dockerfiles `--dockerfile` would reject.
+
+Setup steps inside your own composite actions aren't read.
 
 ### Free-threading and new Python readiness
 

@@ -1070,6 +1070,18 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--suggest-targets has no Markdown form (use --json)")
         if args.inputs:
             parser.error("--suggest-targets takes the project folder as its value: --suggest-targets DIR")
+        given = [
+            flag
+            for flag, value in (
+                ("-p", args.python),
+                ("-t", args.target),
+                ("--dockerfile", args.dockerfile),
+                ("--list-targets", args.list_targets),
+            )
+            if value
+        ]
+        if given:
+            parser.error(f"--suggest-targets only suggests, so it can't be used with {', '.join(given)}")
         try:
             found = suggest(Path(args.suggest_targets))
         except OSError as e:
