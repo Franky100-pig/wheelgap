@@ -1,4 +1,5 @@
-"""A small on-disk cache of pinned index lookups (/<name>/<version>/json), so a repeat run needn't ask again.
+"""A small on-disk cache of pinned index lookups (/<name>/<version>/json), and of the coverage tracker's notes for
+--explain (notes.py), so a repeat run needn't ask again.
 
 A cache that can't be read or written is only ever a miss: it never fails a run.
 """
@@ -51,25 +52,21 @@ def _path(index: str, name: str, version: str) -> Path:
     return cache_dir() / f"{digest}.json"
 
 
-def load_files(index: str, name: str, version: str) -> list[dict] | None:
-    """The cached file list of a pinned release, or None: not cached, older than MAX_AGE, or unreadable."""
+def _load(index: str, name: str, version: str) -> dict | None:
+    """A cache entry younger than MAX_AGE, or None: not cached, too old, or unreadable."""
     try:
         entry = json.loads(_path(index, name, version).read_text(encoding="utf-8"))
-        saved, files = entry["saved"], entry["files"]
+        saved = entry["saved"]
         if isinstance(saved, bool) or not isinstance(saved, int | float) or not 0 <= _now() - saved < MAX_AGE:
             return None
-        if isinstance(files, list) and all(isinstance(f, dict) and isinstance(f.get("filename"), str) for f in files):
-            return files
+        return entry if isinstance(entry, dict) else None
     except Exception:  # missing, corrupt or unreadable: a miss
-        pass
-    return None
+        return None
 
 
-def save_files(index: str, name: str, version: str, files: list[dict]) -> None:
-    """Store a pinned release's file list. Only `filename` and `yanked` are kept: they're all fill() reads,
-    and a file's URL (which a private mirror may sign) never reaches the disk."""
+def _save(index: str, name: str, version: str, entry: dict) -> None:
+    """Write an entry, stamped with the time; a cache that can't be written is only ever a miss."""
     try:
-        kept = [{k: f[k] for k in ("filename", "yanked") if k in f} for f in files]
         path = _path(index, name, version)
         path.parent.parent.mkdir(mode=0o700, parents=True, exist_ok=True)  # private to the user (not on Windows)
         path.parent.mkdir(mode=0o700, exist_ok=True)
@@ -77,7 +74,7 @@ def save_files(index: str, name: str, version: str, files: list[dict]) -> None:
         fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-", suffix=".json")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump({"saved": _now(), "files": kept}, f)
+                json.dump({"saved": _now(), **entry}, f)
             os.utime(tmp, (_now(), _now()))  # prune() reads the age from the mtime
             os.replace(tmp, path)
         except BaseException:
@@ -87,6 +84,37 @@ def save_files(index: str, name: str, version: str, files: list[dict]) -> None:
     except Exception:  # read-only home, full disk, a race on Windows...: the next run just looks it up again
         pass
     prune()
+
+
+def load_files(index: str, name: str, version: str) -> list[dict] | None:
+    """The cached file list of a pinned release, or None: not cached, older than MAX_AGE, or unreadable."""
+    entry = _load(index, name, version)
+    files = entry.get("files") if entry else None
+    if isinstance(files, list) and all(isinstance(f, dict) and isinstance(f.get("filename"), str) for f in files):
+        return files
+    return None
+
+
+def save_files(index: str, name: str, version: str, files: list[dict]) -> None:
+    """Store a pinned release's file list. Only `filename` and `yanked` are kept: they're all fill() reads,
+    and a file's URL (which a private mirror may sign) never reaches the disk."""
+    try:
+        kept = [{k: f[k] for k in ("filename", "yanked") if k in f} for f in files]
+    except Exception:
+        return
+    _save(index, name, version, {"files": kept})
+
+
+def load_notes(source: str, name: str) -> list | None:
+    """A package's cached tracker notes (see notes.py) from `source`, or None. An empty list is a cached 404."""
+    entry = _load(source, name, "notes")  # "notes" is no version, so it can't collide with a release
+    notes = entry.get("notes") if entry else None
+    return notes if isinstance(notes, list) else None
+
+
+def save_notes(source: str, name: str, notes: list[dict]) -> None:
+    """Store a package's tracker notes, as notes.py checked them."""
+    _save(source, name, "notes", {"notes": notes})
 
 
 def _own_folder(folder: Path) -> bool:

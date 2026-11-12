@@ -32,10 +32,11 @@ uv run --group dev pytest
 | `targets.py` | Targets (Python × platform) and the wheel tags each accepts |
 | `check.py` | The status per package and target (`wheel`, `source`, `missing`, `unknown`, `n/a`, `bundled`) and `--explain` reasons |
 | `pypi.py` | The only HTTP client (`fetch_json`: retries, https-only redirects) and the PyPI lookups (`fill`, `fill_all`, `recheck_lock`) |
-| `cache.py` | The 24-hour on-disk cache of pinned PyPI lookups (`--no-cache` and `--online` skip it) |
+| `cache.py` | The 24-hour on-disk cache of pinned PyPI lookups and of the tracker's notes (`--no-cache` and `--online` skip it) |
 | `dockerfile.py` | `--dockerfile`: reads the final stage's image and platform the way Docker/BuildKit does |
 | `offline.py` | `--offline`, `offline = true` and `check_lockfile(..., offline=True)`: refuse inputs that would need an index lookup |
 | `pyodide.py` | `--pyodide-lock`: packages Pyodide ships itself |
+| `notes.py` | `--explain`: the [coverage tracker](https://wheelgap.github.io/tracker/)'s notes for packages with gaps, looked up only for names known to come from PyPI (`--no-notes`, `--offline` and `--index-url` turn it off) |
 | `github.py` | `--github-annotations`: GitHub Actions `::error`/`::warning` lines, and each package's line in its input file |
 | `scan.py` | `python -m wheelgap.scan`: the data behind the [coverage tracker](https://wheelgap.github.io/tracker/) |
 | `diff.py` | `python -m wheelgap.diff OLD NEW`: packages that got worse between two lockfiles, and new packages with gaps |
@@ -44,6 +45,7 @@ uv run --group dev pytest
 ## Tests
 
 - **No network, ever.** Use the `fake_pypi` fixture in `tests/conftest.py`. To add a package, add it to `FAKE_INDEX`. The fixture returns the list of URLs fetched, so tests can assert what was (or wasn't) looked up. Lockfile fixtures live in `tests/fixtures/`; small one-off lockfiles go in `tmp_path`.
+- `--explain` asks the coverage tracker for notes; the autouse `tracker` fixture answers instead (a 404 for every name, unless a test adds a file with `tracker.add(name, note)`), and `tracker.calls` lists what was asked.
 - `fake_pypi` patches `wheelgap.pypi.fetch_json`. New code that fetches should call `pypi.fetch_json` at call time (as `pyodide.py` does), not import the name, so the fixture catches it.
 - **Every behaviour change gets a test that fails without the change.** Check this by reverting your source change and running the test.
 - **Write test files that contain non-ASCII text with `encoding="utf-8"`** (or use `write_bytes`). Windows CI otherwise writes cp1252.

@@ -20,6 +20,7 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
 
 from . import __version__, cache
+from . import notes as tracker
 from .api import running_python
 from .check import CELL, EXPLAIN_LIMIT, Row, Status, check, explain, explain_lines, marker_holds, reachable
 from .dockerfile import DockerfileError, read_dockerfile
@@ -34,7 +35,8 @@ from .pyodide import (
     check_targets,
     load_pyodide_lock,
 )
-from .pypi import check_index_url, fill_all, keeps_locked_files, recheck_lock, split_credentials
+from .pypi import DEFAULT_INDEX, check_index_url, fill_all, keeps_locked_files, recheck_lock, split_credentials
+from .pypi import index_url as json_index_url
 from .sources import (
     Package,
     Source,
@@ -208,6 +210,12 @@ def make_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--all", action="store_true", help="show every package, not just the ones with gaps")
     p.add_argument("--explain", action="store_true", help="for each gap, list the wheels that were rejected and why")
+    p.add_argument(
+        "--no-notes",
+        action="store_true",
+        help="with --explain, don't look up the coverage tracker's notes, which sends the names of PyPI packages with "
+        "gaps to wheelgap.github.io (--offline and --index-url never look them up)",
+    )
     p.add_argument(
         "-q",
         "--quiet",
@@ -538,7 +546,36 @@ def gap_targets(row: Row, targets: list[Target]) -> list[Target]:
     return [t for t in targets if row.results[t] in (Status.SOURCE, Status.MISSING) and t not in row.ignored]
 
 
-def render_explain(rows: list[Row], targets: list[Target], style: Style) -> list[str]:
+RowNotes = dict[int, list[tuple[tracker.Note, list[Target]]]]
+"""The tracker's notes that apply to a row's gaps, keyed by id(row), each with the gap targets it covers."""
+
+
+def tracker_notes(
+    rows: list[Row], targets: list[Target], looked_up: set[int], read_cache: bool, write_cache: bool
+) -> tuple[RowNotes, bool]:
+    """--explain: the coverage tracker's notes for each row with a gap, and whether the lookups were cut short.
+
+    Only names known to come from PyPI are looked up (tracker.from_pypi; `looked_up` holds the id() of each package
+    wheelgap looked up on pypi.org this run). A note is kept for the gap targets on its platforms, and only when it's
+    about the checked release (Note.applies_to): the tracker checked its latest release, which may not be yours.
+    """
+
+    def wanted(r: Row) -> bool:
+        return bool(gap_targets(r, targets)) and tracker.from_pypi(r.package, id(r.package) in looked_up)
+
+    found, cut = tracker.lookup([r.package.key for r in rows if wanted(r)], read_cache, write_cache)
+    out: RowNotes = {}
+    for r in rows:
+        if not wanted(r) or r.package.key not in found:
+            continue
+        gaps = gap_targets(r, targets)
+        matched = [(note, [t for t in gaps if note.covers(t.platform)]) for note in found[r.package.key]]
+        if kept := [(note, ts) for note, ts in matched if ts and note.applies_to(r.package.version)]:
+            out[id(r)] = kept
+    return out, cut
+
+
+def render_explain(rows: list[Row], targets: list[Target], style: Style, notes: RowNotes | None = None) -> list[str]:
     multi_py = len({t.python for t in targets}) > 1
     out = []
     for r in rows:
@@ -552,6 +589,16 @@ def render_explain(rows: list[Row], targets: list[Target], style: Style) -> list
                 out.append(f"  via: {' → '.join(path)}")
             lines = explain_lines(files, t, yanked=r.package.yanked, limit=EXPLAIN_LIMIT, dim=style.dim, align=True)
             out += [f"  {line}" for line in lines]
+            out.append("")
+        for note, ts in (notes or {}).get(id(r), []):
+            # Printed as is: a note is one line of plain text (tracker.parse). Like every other line, it goes out
+            # through print() to sys.stdout, so a filter on that stream (such as a guard against GitHub Actions
+            # workflow commands) sees it too.
+            platforms = ", ".join(dict.fromkeys(t.platform for t in ts))
+            head = f"{r.package.name} {r.package.version or '?'}: note from the wheelgap tracker for {platforms}"
+            out.append(f"{style.bold(head)} {style.dim(f'({note.kind})')}")
+            out.append(f"  - {note.text}")
+            out += [f"    {link}" for link in note.links]
             out.append("")
     return out
 
@@ -638,6 +685,7 @@ def report_json(
     explained: bool,
     pyodide_lock: PyodideLock | None = None,
     advisory: frozenset[Target] = frozenset(),
+    notes: RowNotes | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     gaps = [r for r in rows if not r.ok]
@@ -662,6 +710,11 @@ def report_json(
             }
             # Same targets as `rejected`, minus any without a path (inputs with no dependency graph).
             out["via"] = {t.label(multi_py): r.via[t] for t in gap_targets(r, targets) if t in r.via}
+            # The tracker's notes for this package's gaps, each with the gap targets it covers.
+            out["notes"] = [
+                {**note.as_json(), "targets": [t.label(multi_py) for t in ts]}
+                for note, ts in (notes or {}).get(id(r), [])
+            ]
         return out
 
     report: dict[str, object] = {
@@ -855,6 +908,7 @@ def render_markdown(
     pyodide_lock: PyodideLock | None,
     source_allowed: bool = False,
     advisory: frozenset[Target] = frozenset(),
+    notes: RowNotes | None = None,
 ) -> list[str]:
     """The same report as the text output, as GitHub-flavoured Markdown (for a job summary or a PR comment)."""
     plain = Style(False)
@@ -911,9 +965,11 @@ def render_markdown(
         if r.package.error:
             out += [f"Could not check {_md(r.package.name)}: {_code(r.package.error)}", ""]
     if args.explain and gaps:
-        # Fenced, so wheel filenames and reasons need no escaping.
-        lines = render_explain(gaps, targets, plain)
-        out += ["<details><summary>Why (rejected wheels)</summary>", "", "```", *lines, "```", "", "</details>", ""]
+        # Fenced, so wheel filenames, reasons and the tracker's notes need no escaping: inside a code block, Markdown
+        # and HTML are shown as text. The fence is longer than any run of backticks in it, so nothing can close it.
+        lines = render_explain(gaps, targets, plain, notes)
+        fence = "`" * max([3, *(len(run) + 1 for line in lines for run in re.findall(r"`+", line))])
+        out += ["<details><summary>Why (rejected wheels)</summary>", "", fence, *lines, fence, "", "</details>", ""]
     return out
 
 
@@ -1257,6 +1313,18 @@ def main(argv: list[str] | None = None) -> int:
                 )
     # --online asks the index again but saves the answer, so a plain run afterwards doesn't go back to an older one.
     cached = {"read_cache": not (args.no_cache or args.online), "write_cache": not args.no_cache}
+    # Packages with no files that fill_all looks up on pypi.org's JSON API (it skips those from other indexes): their
+    # names may go to the tracker for --explain's notes. Not pdm.lock or pylock.toml entries, whose lock names no index
+    # for them, nor --online's re-checks of locked files.
+    looked_up: set[int] = set()
+    if index_url is None and json_index_url() == DEFAULT_INDEX:
+        looked_up = {
+            id(p)
+            for s, needed in zip(sources, needed_by_source, strict=True)
+            if s.kind not in ("pdm", "pylock")
+            for p in needed
+            if p.files is None and not p.skip and not p.error
+        }
     other_index = fill_all(
         packages, refresh=args.online, python=single_python(targets), simple_index=index_url, **cached
     )
@@ -1338,6 +1406,18 @@ def main(argv: list[str] | None = None) -> int:
             r.ignored = frozenset(t for t in targets if t.platform in ignore_on[r.package.key])
     gaps = [r for r in rows if not r.ok]
     source_labels = [s.label for s in sources]
+    row_notes: RowNotes = {}
+    # The notes send package names to wheelgap.github.io: never offline, nor for a private index (--index-url).
+    if args.explain and gaps and not (args.no_notes or offline or index_url is not None):
+        row_notes, cut = tracker_notes(gaps, targets, looked_up, **cached)
+        if cut and not quiet:
+            print(
+                Style(use_color(args.color)).dim(
+                    "wheelgap: note: couldn't reach wheelgap.github.io in time, so some of the tracker's notes may be "
+                    "missing (--no-notes skips the lookup)"
+                ),
+                file=sys.stderr,
+            )
     # With --fail-on missing, source builds are accepted; missing and unknown packages still fail. Gaps on
     # --advisory targets never fail the run.
     fail_statuses = GAP_STATUSES if fail_on == "source" else (Status.MISSING, Status.UNKNOWN)
@@ -1359,14 +1439,25 @@ def main(argv: list[str] | None = None) -> int:
             print(command, file=sys.stderr if args.json or args.markdown else sys.stdout)
 
     if args.json:
-        print(report_json(rows, targets, source_labels, skipped, ignored, args.explain, pyodide_lock, advisory))
+        print(
+            report_json(rows, targets, source_labels, skipped, ignored, args.explain, pyodide_lock, advisory, row_notes)
+        )
         return code
 
     if args.markdown:
         print(
             "\n".join(
                 render_markdown(
-                    rows, targets, source_labels, skipped, ignored, args, pyodide_lock, source_allowed, advisory
+                    rows,
+                    targets,
+                    source_labels,
+                    skipped,
+                    ignored,
+                    args,
+                    pyodide_lock,
+                    source_allowed,
+                    advisory,
+                    row_notes,
                 )
             )
         )
@@ -1412,7 +1503,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.explain and gaps:
             if hidden:
                 print()
-            for ln in render_explain(gaps, targets, style):
+            for ln in render_explain(gaps, targets, style, row_notes):
                 print(ln)
 
     bundled = [r for r in rows if Status.BUNDLED in r.results.values()]

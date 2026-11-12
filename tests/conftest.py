@@ -62,15 +62,61 @@ def fixtures() -> Path:
     return FIXTURES
 
 
+class FakeTracker:
+    """The coverage tracker's package files (wheelgap.notes), served in place of wheelgap.github.io."""
+
+    def __init__(self):
+        self.files: dict[str, object] = {}  # by name; any other name is a 404
+        self.calls: list[str] = []  # the URLs asked for
+        self.options: list[tuple[float, int]] = []  # (timeout, attempts) of each request
+        self.respond = None  # a function of the name that answers instead (it may raise or sleep)
+
+    def add(self, name: str, *notes: dict, version: str = "1.0") -> None:
+        self.files[name] = {"schema": 1, "name": name, "version": version, "notes": list(notes)}
+
+    def fetch_json(self, url, timeout, attempts):
+        import urllib.error
+
+        from wheelgap import notes
+
+        self.calls.append(url)
+        self.options.append((timeout, attempts))
+        name = url.removeprefix(notes.TRACKER + "/").removesuffix(".json")
+        if self.respond is not None:
+            return self.respond(name)
+        if name not in self.files:
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+        return self.files[name]
+
+
+@pytest.fixture(autouse=True)
+def tracker(monkeypatch) -> FakeTracker:
+    """Every test gets a fake tracker with no files (each lookup is a 404), so --explain never reaches the network.
+    fake_pypi serves it too; a test that patches pypi.fetch_json itself gets no notes."""
+    from wheelgap import notes, pypi
+
+    fake, real = FakeTracker(), pypi.fetch_json
+
+    def fetch_json(url, timeout=20.0, attempts=4):
+        if url.startswith(notes.TRACKER + "/"):
+            return fake.fetch_json(url, timeout, attempts)
+        return real(url, timeout, attempts)
+
+    monkeypatch.setattr(pypi, "fetch_json", fetch_json)
+    return fake
+
+
 @pytest.fixture
-def fake_pypi(monkeypatch):
+def fake_pypi(monkeypatch, tracker):
     import urllib.error
 
-    from wheelgap import pypi
+    from wheelgap import notes, pypi
 
     calls = []
 
-    def fetch_json(url, timeout=20.0):
+    def fetch_json(url, timeout=20.0, attempts=4):
+        if url.startswith(notes.TRACKER + "/"):
+            return tracker.fetch_json(url, timeout, attempts)
         calls.append(url)
         # Served at whatever WHEELGAP_INDEX_URL points at, so tests can assert which index was asked.
         parts = url.removeprefix(pypi.index_url() + "/").removesuffix("/json").split("/")

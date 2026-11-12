@@ -148,6 +148,24 @@
                     "description": "Present with --explain: dependency path that installs the package, keyed by target label, for the same targets as rejected (uv.lock, and poetry.lock before lock-version 2.1). Empty object when the input has no graph.",
                     "additionalProperties": {"type": "array", "items": {"type": "string"}}
                 },
+                "notes": {
+                    "type": "array",
+                    "description": "Present with --explain: the coverage tracker's notes (https://github.com/wheelgap/tracker/blob/main/notes/README.md) that apply to this package's gaps, each with the gap targets it covers. Only looked up for packages known to come from PyPI, and never with --no-notes, --offline or --index-url. Empty when there are none, they weren't looked up, or the lookup failed. Treat text as untrusted plain text.",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["platforms", "kind", "text", "links", "versions", "updated", "targets"],
+                        "properties": {
+                            "platforms": {"type": "array", "items": {"type": "string"}, "description": "Platforms the note is about, or [\"all\"]."},
+                            "kind": {"type": "string", "description": "workaround, alternative, upstream-issue or other-source."},
+                            "text": {"type": "string", "description": "One line of plain text; backticks mark commands and names."},
+                            "links": {"type": "array", "items": {"type": "string"}, "description": "https:// URLs that back the note."},
+                            "versions": {"type": ["string", "null"], "description": "The releases the note is about (a version specifier), or null for all."},
+                            "updated": {"type": "string", "description": "When the note was last checked (YYYY-MM-DD)."},
+                            "targets": {"type": "array", "items": {"type": "string"}, "description": "The labels of this package's gap targets the note covers."}
+                        }
+                    }
+                },
                 "bundled": {
                     "description": "Present with --pyodide-lock when this package is bundled on a Pyodide target: the version Pyodide ships.",
                     "type": "string"
