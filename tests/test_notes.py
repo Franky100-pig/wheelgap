@@ -46,7 +46,7 @@ def run(capsys, *argv):
 
 
 def explain_json(capsys, *argv) -> dict:
-    code, out, err = run(capsys, *argv, "--json", "--explain")
+    code, out, err = run(capsys, *argv, "--json", "--explain", "--notes")
     assert code == 1 and not err
     return {p["name"]: p for p in json.loads(out)["packages"]}
 
@@ -54,7 +54,7 @@ def explain_json(capsys, *argv) -> dict:
 def test_note_shown_for_a_matching_target_and_not_another(capsys, tmp_path, tracker):
     tracker.add("pkg", note(), note(platforms=["macos-arm64"], text="Only about macOS."))
     folder = uv_lock(tmp_path)
-    code, out, err = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--explain")
+    code, out, err = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--explain", "--notes")
     assert code == 1 and not err
     # Under the explanation, once per package, with the gap targets it covers, its text as is, and its links.
     assert out.index("pkg 1.0 on win-amd64:") < out.index(HEAD)
@@ -69,7 +69,7 @@ def test_note_shown_for_a_matching_target_and_not_another(capsys, tmp_path, trac
 
 def test_note_for_another_platform_only_shows_nothing(capsys, tmp_path, tracker):
     tracker.add("pkg", note(platforms=["macos-arm64"]))
-    code, out, _ = run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain")
+    code, out, _ = run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
     assert code == 1 and HEAD not in out
     assert explain_json(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64")["pkg"]["notes"] == []
 
@@ -77,7 +77,7 @@ def test_note_for_another_platform_only_shows_nothing(capsys, tmp_path, tracker)
 def test_all_platforms_note(capsys, tmp_path, tracker):
     tracker.add("pkg", note(platforms=["all"]))
     folder = uv_lock(tmp_path)
-    code, out, _ = run(capsys, folder, "-p", "3.13,3.14t", "-t", "linux-x86_64,win-amd64", "--explain")
+    code, out, _ = run(capsys, folder, "-p", "3.13,3.14t", "-t", "linux-x86_64,win-amd64", "--explain", "--notes")
     assert f"{HEAD} linux-x86_64, win-amd64 (alternative)" in out
     pkg = explain_json(capsys, folder, "-p", "3.13,3.14t", "-t", "linux-x86_64,win-amd64")["pkg"]
     assert pkg["notes"][0]["targets"] == [
@@ -172,7 +172,7 @@ def test_nothing_fetched_for_a_package_not_known_to_be_on_pypi(capsys, tmp_path,
     else:
         (tmp_path / name).write_text(text, encoding="utf-8")
     tracker.add("pkg", note())
-    code, out, err = run(capsys, str(tmp_path / name), "-p", "3.13", "-t", "linux-x86_64", "--explain")
+    code, out, err = run(capsys, str(tmp_path / name), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
     assert code == 1 and "pkg 1.0 on linux-x86_64" in out and HEAD not in out
     assert tracker.calls == []
 
@@ -183,7 +183,7 @@ def test_nothing_fetched_for_a_pdm_entry_wheelgap_looked_up(capsys, tmp_path, tr
         '[metadata]\ngroups = ["default"]\n\n[[package]]\nname = "nowheels"\nversion = "0.9"\n', encoding="utf-8"
     )
     tracker.add("nowheels", note())
-    code, out, _ = run(capsys, str(tmp_path / "pdm.lock"), "-p", "3.13", "-t", "linux-x86_64", "--explain")
+    code, out, _ = run(capsys, str(tmp_path / "pdm.lock"), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
     assert code == 1 and fake_pypi and "nowheels 0.9 on linux-x86_64" in out
     assert tracker.calls == []
 
@@ -191,24 +191,24 @@ def test_nothing_fetched_for_a_pdm_entry_wheelgap_looked_up(capsys, tmp_path, tr
 @pytest.mark.parametrize(
     "flags",
     [
-        ["--no-notes"],
-        ["--offline"],
-        ["--index-url", "https://private.example/simple"],
-        [],  # no --explain
+        ["--explain"],  # opt-in: --explain alone makes no requests
+        ["--explain", "--notes", "--no-notes"],
+        ["--explain", "--notes", "--offline"],
+        ["--explain", "--notes", "--index-url", "https://private.example/simple"],
+        ["--notes"],  # no --explain
     ],
 )
 def test_nothing_fetched_with(capsys, tmp_path, tracker, flags):
     tracker.add("pkg", note())
-    explain = [] if not flags else ["--explain"]
-    code, out, err = run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", *explain, *flags)
+    code, out, err = run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", *flags)
     assert code == 1 and HEAD not in out
     assert tracker.calls == []
 
 
 def test_offline_in_config_implies_no_notes(capsys, tmp_path, tracker):
     tracker.add("pkg", note())
-    (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\noffline = true\n", encoding="utf-8")
-    run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain")
+    (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\noffline = true\nnotes = true\n", encoding="utf-8")
+    run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
     assert tracker.calls == []
 
 
@@ -227,7 +227,7 @@ def test_failed_lookup_prints_nothing_extra(capsys, tmp_path, tracker, respond):
     folder = uv_lock(tmp_path)
     expected = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--no-notes")
     tracker.respond = respond
-    assert run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain") == expected
+    assert run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes") == expected
     assert expected[0] == 1 and not expected[2]
     assert len(tracker.calls) == 1
 
@@ -260,7 +260,9 @@ def test_malformed_note_is_dropped(capsys, tmp_path, tracker, bad):
 def test_markdown_note_cannot_inject_markdown_or_html(capsys, tmp_path, tracker):
     text = "```` </details><script>alert(1)</script> [click](https://evil.example) **bold** <!-- @mention"
     tracker.add("pkg", note(text=text))
-    code, out, _ = run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--markdown")
+    code, out, _ = run(
+        capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes", "--markdown"
+    )
     assert code == 1
     lines = out.splitlines()
     fences = [i for i, line in enumerate(lines) if line and set(line) == {"`"}]
@@ -272,20 +274,22 @@ def test_markdown_note_cannot_inject_markdown_or_html(capsys, tmp_path, tracker)
 
 
 def test_markdown_fence_stays_three_backticks_without_notes(capsys, tmp_path):
-    code, out, _ = run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--markdown")
+    code, out, _ = run(
+        capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes", "--markdown"
+    )
     assert out.count("\n```\n") == 2
 
 
 def test_text_output_escapes_nothing(capsys, tmp_path, tracker):
     text = "Use `pkg[binary]` *not* <pkg> & _pkg_ \\ | #1"
     tracker.add("pkg", note(text=text))
-    _, out, _ = run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain")
+    _, out, _ = run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
     assert f"  - {text}\n" in out
 
 
 def test_one_short_attempt_per_request(capsys, tmp_path, tracker):
     folder = uv_lock(tmp_path, ("pkg", "1.0", PYPI), ("other", "2.0", PYPI))
-    run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain")
+    run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
     assert sorted(tracker.calls) == [f"{notes.TRACKER}/other.json", f"{notes.TRACKER}/pkg.json"]
     assert all(attempts == 1 and timeout <= 10 for timeout, attempts in tracker.options)
 
@@ -301,11 +305,11 @@ def test_stops_after_the_first_connection_failure(capsys, tmp_path, tracker, mon
     monkeypatch.setattr(notes, "WORKERS", 1)
     tracker.respond = _fail
     folder = uv_lock(tmp_path, ("a", "1.0", PYPI), ("b", "1.0", PYPI), ("c", "1.0", PYPI))
-    code, out, err = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain")
+    code, out, err = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
     assert code == 1 and len(tracker.calls) == 1
     assert err.count(CUT) == 1 and len(err.splitlines()) == 1
     tracker.calls.clear()
-    code, out, err = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--json", "-q")
+    code, out, err = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes", "--json", "-q")
     assert code == 1 and json.loads(out) and err == ""  # -q drops the note
 
 
@@ -315,7 +319,7 @@ def test_deadline_for_all_lookups(capsys, tmp_path, tracker, monkeypatch):
     tracker.respond = lambda name: release.wait(10) and {"schema": 1, "name": name, "notes": [NOTE]}
     try:
         start = time.monotonic()
-        code, out, err = run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain")
+        code, out, err = run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
         assert time.monotonic() - start < 5
         assert code == 1 and HEAD not in out and CUT in err
     finally:
@@ -326,8 +330,71 @@ def test_cached_for_a_day(capsys, tmp_path, tracker):
     tracker.add("pkg", note())
     folder = uv_lock(tmp_path, ("pkg", "1.0", PYPI), ("gone", "1.0", PYPI))  # gone: a 404, cached as no notes
     for _ in range(2):
-        _, out, _ = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain")
+        _, out, _ = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes")
         assert HEAD in out
     assert len(tracker.calls) == 2
-    run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--no-cache")
+    run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--notes", "--no-cache")
     assert len(tracker.calls) == 4
+
+
+HINT = "wheelgap: add --notes to show the tracker's notes for these packages (sends their names to wheelgap.github.io)"
+
+
+def test_explain_hints_at_notes_without_looking_them_up(capsys, tmp_path, tracker):
+    tracker.add("pkg", note())
+    folder = uv_lock(tmp_path)
+    code, out, err = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain")
+    assert code == 1 and HEAD not in out and err == HINT + "\n"
+    assert tracker.calls == []
+    # The same hint for --json and --markdown (on stderr), and --json has no notes to show.
+    code, out, err = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--json")
+    assert err == HINT + "\n" and json.loads(out)["packages"][0]["notes"] == []
+    # With colour, it's dim.
+    _, _, err = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--color", "always")
+    assert err == f"\033[2m{HINT}\033[0m\n"
+
+
+@pytest.mark.parametrize(
+    "flags,config,lock",
+    [
+        (["--json", "-q"], "", None),  # -q drops it
+        (["--no-notes"], "", None),  # turned off: no need to suggest it
+        ([], "notes = false", None),
+        (["--offline"], "", None),  # --notes would do nothing here
+        (["--index-url", "https://private.example/simple"], "", None),
+        ([], "", ("pkg", "1.0", "https://private.example/simple")),  # no package --notes would look up
+        ([], "", ("pkg", "1.0", "")),  # no gap: a package with a wheel (see below)
+    ],
+)
+def test_no_hint(capsys, tmp_path, tracker, flags, config, lock):
+    if config:
+        (tmp_path / "pyproject.toml").write_text(f"[tool.wheelgap]\n{config}\n", encoding="utf-8")
+    if lock and not lock[2]:
+        (tmp_path / "uv.lock").write_text(
+            f'version = 1\n[[package]]\nname = "pkg"\nversion = "1.0"\nsource = {{ registry = "{PYPI}" }}\n'
+            'wheels = [{ url = "https://files.example/pkg-1.0-py3-none-any.whl", hash = "sha256:00", size = 1 }]\n',
+            encoding="utf-8",
+        )
+        folder = str(tmp_path)
+    else:
+        folder = uv_lock(tmp_path, *([lock] if lock else []))
+    code, out, err = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", *flags)
+    assert code in (0, 1) and HINT not in err
+    assert tracker.calls == []
+
+
+def test_notes_in_config(capsys, tmp_path, tracker):
+    tracker.add("pkg", note())
+    folder = uv_lock(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\nnotes = true\n", encoding="utf-8")
+    code, out, err = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain")
+    assert code == 1 and HEAD in out and not err
+    tracker.calls.clear()
+    code, out, err = run(capsys, folder, "-p", "3.13", "-t", "linux-x86_64", "--explain", "--no-notes")
+    assert code == 1 and HEAD not in out and not err and tracker.calls == []
+
+
+def test_notes_in_config_must_be_a_boolean(capsys, tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[tool.wheelgap]\nnotes = "yes"\n', encoding="utf-8")
+    code, _, err = run(capsys, uv_lock(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2 and "notes must be a boolean" in err

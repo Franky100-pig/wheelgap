@@ -150,7 +150,7 @@
                 },
                 "notes": {
                     "type": "array",
-                    "description": "Present with --explain: the coverage tracker's notes (https://github.com/wheelgap/tracker/blob/main/notes/README.md) that apply to this package's gaps, each with the gap targets it covers. Only looked up for packages known to come from PyPI, and never with --no-notes, --offline or --index-url. Empty when there are none, they weren't looked up, or the lookup failed. Treat text as untrusted plain text.",
+                    "description": "Present with --explain: the coverage tracker's notes (https://github.com/wheelgap/tracker/blob/main/notes/README.md) that apply to this package's gaps, each with the gap targets it covers. Only looked up with --notes (or notes = true), for packages known to come from PyPI, and never with --offline or --index-url. Empty without --notes, when there are none, or when the lookup failed. Treat text as untrusted plain text.",
                     "items": {
                         "type": "object",
                         "additionalProperties": false,

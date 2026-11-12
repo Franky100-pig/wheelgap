@@ -211,10 +211,12 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--all", action="store_true", help="show every package, not just the ones with gaps")
     p.add_argument("--explain", action="store_true", help="for each gap, list the wheels that were rejected and why")
     p.add_argument(
-        "--no-notes",
-        action="store_true",
-        help="with --explain, don't look up the coverage tracker's notes, which sends the names of PyPI packages with "
-        "gaps to wheelgap.github.io (--offline and --index-url never look them up)",
+        "--notes",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="with --explain, also show the coverage tracker's notes for packages with gaps, which sends the names of "
+        "those from PyPI to wheelgap.github.io (never with --offline or --index-url; --no-notes overrides "
+        "notes = true)",
     )
     p.add_argument(
         "-q",
@@ -345,7 +347,7 @@ def load_config(path: Path) -> dict:
                 raise SourceError(f"{path}: [tool.wheelgap] {key} must be {example}")
             if key == "fail-on" and value not in FAIL_ON:
                 raise SourceError(f"{path}: [tool.wheelgap] fail-on must be one of: {', '.join(FAIL_ON)}")
-        elif key in ("quiet", "offline"):
+        elif key in ("quiet", "offline", "notes"):
             if not isinstance(value, bool):
                 raise SourceError(f"{path}: [tool.wheelgap] {key} must be a boolean")
         else:
@@ -550,6 +552,11 @@ RowNotes = dict[int, list[tuple[tracker.Note, list[Target]]]]
 """The tracker's notes that apply to a row's gaps, keyed by id(row), each with the gap targets it covers."""
 
 
+def notes_eligible(row: Row, targets: list[Target], looked_up: set[int]) -> bool:
+    """Whether --notes would look this row's package up: it has a gap, and its name is known to come from PyPI."""
+    return bool(gap_targets(row, targets)) and tracker.from_pypi(row.package, id(row.package) in looked_up)
+
+
 def tracker_notes(
     rows: list[Row], targets: list[Target], looked_up: set[int], read_cache: bool, write_cache: bool
 ) -> tuple[RowNotes, bool]:
@@ -560,13 +567,12 @@ def tracker_notes(
     about the checked release (Note.applies_to): the tracker checked its latest release, which may not be yours.
     """
 
-    def wanted(r: Row) -> bool:
-        return bool(gap_targets(r, targets)) and tracker.from_pypi(r.package, id(r.package) in looked_up)
-
-    found, cut = tracker.lookup([r.package.key for r in rows if wanted(r)], read_cache, write_cache)
+    found, cut = tracker.lookup(
+        [r.package.key for r in rows if notes_eligible(r, targets, looked_up)], read_cache, write_cache
+    )
     out: RowNotes = {}
     for r in rows:
-        if not wanted(r) or r.package.key not in found:
+        if not notes_eligible(r, targets, looked_up) or r.package.key not in found:
             continue
         gaps = gap_targets(r, targets)
         matched = [(note, [t for t in gaps if note.covers(t.platform)]) for note in found[r.package.key]]
@@ -1407,14 +1413,25 @@ def main(argv: list[str] | None = None) -> int:
     gaps = [r for r in rows if not r.ok]
     source_labels = [s.label for s in sources]
     row_notes: RowNotes = {}
-    # The notes send package names to wheelgap.github.io: never offline, nor for a private index (--index-url).
-    if args.explain and gaps and not (args.no_notes or offline or index_url is not None):
-        row_notes, cut = tracker_notes(gaps, targets, looked_up, **cached)
-        if cut and not quiet:
+    # Opt-in, since it sends package names to wheelgap.github.io: --explain on a lockfile makes no requests by default.
+    # Never offline, nor for a private index (--index-url).
+    notes_asked = args.notes if args.notes is not None else config.get("notes")
+    if args.explain and gaps and not offline and index_url is None:
+        if notes_asked:
+            row_notes, cut = tracker_notes(gaps, targets, looked_up, **cached)
+            if cut and not quiet:
+                print(
+                    Style(use_color(args.color)).dim(
+                        "wheelgap: note: couldn't reach wheelgap.github.io in time, so some of the tracker's notes may "
+                        "be missing"
+                    ),
+                    file=sys.stderr,
+                )
+        elif notes_asked is None and not quiet and any(notes_eligible(r, targets, looked_up) for r in gaps):
             print(
                 Style(use_color(args.color)).dim(
-                    "wheelgap: note: couldn't reach wheelgap.github.io in time, so some of the tracker's notes may be "
-                    "missing (--no-notes skips the lookup)"
+                    "wheelgap: add --notes to show the tracker's notes for these packages "
+                    "(sends their names to wheelgap.github.io)"
                 ),
                 file=sys.stderr,
             )

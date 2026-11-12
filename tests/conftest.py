@@ -91,7 +91,7 @@ class FakeTracker:
 
 @pytest.fixture(autouse=True)
 def tracker(monkeypatch) -> FakeTracker:
-    """Every test gets a fake tracker with no files (each lookup is a 404), so --explain never reaches the network.
+    """Every test gets a fake tracker with no files (each lookup is a 404), so --notes never reaches the network.
     fake_pypi serves it too; a test that patches pypi.fetch_json itself gets no notes."""
     from wheelgap import notes, pypi
 

@@ -13,6 +13,10 @@ from wheelgap.check import Status
 from wheelgap.cli import main
 from wheelgap.targets import ALIASES, DEFAULT_PLATFORMS, PLATFORMS
 
+NOTES_HINT = (
+    "wheelgap: add --notes to show the tracker's notes for these packages (sends their names to wheelgap.github.io)\n"
+)
+
 
 def run(capsys, *argv):
     code = main(list(argv))
@@ -1559,7 +1563,7 @@ def test_ignore_on_one_target_text(capsys, fixtures, target):
 def test_ignore_on_one_target_keeps_other_targets(capsys, fixtures):
     args = (str(fixtures / "armgap"), *ARMGAP_TWO, "--color", "never", "--explain")
     code, out, err = run(capsys, *args, "--ignore", "newglibc:musl-aarch64")
-    assert code == 1 and not err
+    assert code == 1 and err == NOTES_HINT  # the only stderr line: --notes would look armlib up
     assert "ignored: newglibc (musl-aarch64)" in out
     # Per-target counts leave the ignored cell out; newglibc still counts on linux-aarch64.
     assert "linux-aarch64  1 missing\n" in out
@@ -1582,7 +1586,7 @@ def test_ignore_on_one_target_keeps_other_targets(capsys, fixtures):
 def test_ignore_on_one_target_json(capsys, fixtures):
     args = (str(fixtures / "armgap"), *ARMGAP_TWO, "--json", "--explain")
     code, out, err = run(capsys, *args, "--ignore", "armlib:musl-aarch64,newglibc:linux-aarch64")
-    assert code == 1 and not err
+    assert code == 1 and err == NOTES_HINT
     data = json.loads(out)
     _assert_matches_output_schema(data)
     assert data["ignored"] == []  # still whole-package names only

@@ -1,4 +1,4 @@
-"""--explain: the coverage tracker's notes for a package with a gap, such as "use `psycopg2-binary`".
+"""--explain --notes: the coverage tracker's notes for a package with a gap, such as "use `psycopg2-binary`".
 
 Notes record what a scan can't know: a binary extra, a system library to install, a conda-forge build. The tracker
 publishes them in each package's file, https://wheelgap.github.io/tracker/data/packages/<name>.json (its format:
@@ -6,8 +6,9 @@ https://github.com/wheelgap/tracker/blob/main/notes/README.md). They come from a
 untrusted: a note that isn't exactly in the published format is dropped whole, never shown in part.
 
 Looking a package up sends its name to wheelgap.github.io, so the CLI only asks for packages known to come from PyPI
-(see from_pypi), and never with --offline, --index-url or --no-notes. The lookups are optional extras, so they're
-bounded: one attempt each, a short timeout, a deadline for them all, and none after the first connection failure.
+(see from_pypi), only with --notes (or notes = true), and never with --offline or --index-url. The lookups are
+optional extras, so they are bounded: one attempt each, a short timeout, a deadline for them all, and none after
+the first connection failure.
 """
 
 from __future__ import annotations
