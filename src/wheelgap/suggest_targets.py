@@ -93,19 +93,19 @@ def _python_order(version: str) -> tuple[int, int, str]:
 # Labels are case-insensitive. Anything else (self-hosted, larger Linux/Windows runners, which take custom names)
 # can't be read.
 _RUNNERS = [
-    (re.compile(r"ubuntu-\d+\.\d+-arm"), "linux-aarch64"),
-    (re.compile(r"ubuntu-(?:latest|slim|\d+\.\d+)"), "linux-x86_64"),
-    (re.compile(r"windows-11(?:-vs\d+)?-arm"), "win-arm64"),
-    (re.compile(r"windows-(?:latest|\d{4}(?:-vs\d+)?)"), "win-amd64"),
+    (re.compile(r"ubuntu-\d+\.\d+-arm", re.ASCII), "linux-aarch64"),
+    (re.compile(r"ubuntu-(?:latest|slim|\d+\.\d+)", re.ASCII), "linux-x86_64"),
+    (re.compile(r"windows-11(?:-vs\d+)?-arm", re.ASCII), "win-arm64"),
+    (re.compile(r"windows-(?:latest|\d{4}(?:-vs\d+)?)", re.ASCII), "win-amd64"),
     # macos-latest has been Apple silicon since 2024; -large runners are Intel, -xlarge (and xcode-*) Apple silicon.
-    (re.compile(r"macos-(?:latest|\d+)-xlarge|macos-latest|xcode-\d+(?:-xlarge)?"), "macos-arm64"),
-    (re.compile(r"macos-(?:latest|\d+)-large|macos-\d+-intel|macos-(?:1[0-3])"), "macos-x86_64"),
-    (re.compile(r"macos-(?:1[4-9]|[2-9]\d)"), "macos-arm64"),
+    (re.compile(r"macos-(?:latest|\d+)-xlarge|macos-latest|xcode-\d+(?:-xlarge)?", re.ASCII), "macos-arm64"),
+    (re.compile(r"macos-(?:latest|\d+)-large|macos-\d+-intel|macos-(?:1[0-3])", re.ASCII), "macos-x86_64"),
+    (re.compile(r"macos-(?:1[4-9]|[2-9]\d)", re.ASCII), "macos-arm64"),
 ]
 # The OS a pinned label runs (a -latest label moves, so it names none): Ubuntu's glibc, from the distro table, and
 # the macOS version, which is the newest a macOS wheel may need there.
-_UBUNTU_RE = re.compile(r"ubuntu-(\d+\.\d+)(?:-arm)?")
-_MACOS_RE = re.compile(r"macos-(\d+)(?:-intel|-large|-xlarge)?")
+_UBUNTU_RE = re.compile(r"ubuntu-(\d+\.\d+)(?:-arm)?", re.ASCII)
+_MACOS_RE = re.compile(r"macos-(\d+)(?:-intel|-large|-xlarge)?", re.ASCII)
 
 
 def runner_target(label: str) -> str | None:
@@ -145,18 +145,14 @@ _TRUE, _FALSE = ("true", "True", "TRUE"), ("false", "False", "FALSE")
 # setup-python and setup-uv versions read for sure: 3.13, 3.13.1, 3.14t. Others (3.x, pypy3.10, >=3.11) aren't.
 _PYTHON_RE = re.compile(r"3\.(\d+)(?:\.\d+)?(t?)", re.ASCII)
 _PYTHON_ACTIONS = ("actions/setup-python", "astral-sh/setup-uv")
-_MATRIX_REF_RE = re.compile(r"\$\{\{[ \t]*matrix\.([A-Za-z_][A-Za-z0-9_-]*)[ \t]*\}\}")
+_MATRIX_REF_RE = re.compile(r"\$\{\{[ \t]*matrix\.([A-Za-z_][A-Za-z0-9_-]*)[ \t]*\}\}", re.ASCII)
 _WS = " \t"  # YAML's whitespace: never NBSP or other Unicode spaces, which are ordinary characters to it
-# A block scalar header with an anchor or tag (`&a |`, `!!str >-`): where its lines end isn't read, so it's refused.
-_PROPERTY_BLOCK_RE = re.compile(r"(?:[&!][^ \t]*[ \t]+)+[|>][-+0-9]*")
 # Line breaks YAML 1.1 or 1.2 knows besides \n (\r\n is fine): the lines they make aren't the ones split on here.
 _ODD_BREAK_RE = re.compile("\r(?!\n)|[\x85\u2028\u2029]")
-_BLOCK_SCALAR_RE = re.compile(r"[|>][-+0-9]*")
 _NUMBER_RE = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?", re.ASCII)
 # Plain scalars YAML 1.1 or 1.2 reads as something other than the string (0x10 is 16, yes may be true): GitHub's
 # reading of them isn't certain, so they're never compared or suggested.
 _AMBIGUOUS_RE = re.compile(r"[-+]?0[xo][0-9a-fA-F_]+|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)|(?i:yes|no|on|off|y|n)")
-_DOCUMENT_RE = re.compile(r"(---|\.\.\.)(?:[ \t]|$)")
 
 _CONTAINERFILES = ("Dockerfile", "Containerfile")
 _TEMPLATE_SUFFIXES = (".template", ".tmpl", ".tpl", ".j2", ".jinja", ".jinja2", ".in")
@@ -184,27 +180,51 @@ class _Unsure(Exception):
         self.line = line
 
 
+class _Computed(_Unsure):
+    """A matrix (or a part of one) that's computed: it can't be read, but GitHub still runs the job."""
+
+
+class _NotRead(Exception):
+    """A line outside the YAML this scanner reads: the whole file is refused."""
+
+    def __init__(self, line: int, text: str):
+        super().__init__(text)
+        self.line = line
+        self.text = text
+
+
+class _Opaque:
+    """A value the grammar accepts but never reads: refused wherever a value is read."""
+
+    def __init__(self, what: str) -> None:
+        self.what = what
+
+
+_BLOCK = _Opaque("a multi-line value")  # `key: |` and the lines under it
+_LINES = _Opaque("a value over several lines")  # a plain scalar continued on more-indented lines
+_ALIAS = _Opaque("an alias")  # `key: *name`
+_ESCAPED = _Opaque("a quoted value with escapes")  # `key: "a\tb"`
+
+
 @dataclass
 class _Node:
-    """A line of a workflow: `key: value`, a list item (`- value`, key None) or text it can't read (is_text)."""
+    """A line of a workflow: `key: value`, or a list item (`- value`, key None). `value` is what's on the line (None
+    when the value is the indented lines below): a _Scalar, a flow list, or _BLOCK."""
 
     line: int
     indent: float
     key: str | None
-    value: str
-    is_text: bool = False
+    value: object = None
+    raw: str = ""  # the value as written, for messages
     children: list[_Node] = field(default_factory=list)
-    broken: bool = False  # a quoted value over several lines
-    next_line: bool = False  # the value starts on the line after the key
 
     def get(self, key: str) -> _Node | None:
-        found = [c for c in self.children if c.key == key and not c.is_text]
+        if self.value is _ALIAS:
+            raise _Unsure(f"{self.key}: {self.raw} is an alias, which isn't read", self.line)
+        found = [c for c in self.children if c.key == key]
         if len(found) > 1:
             raise _Unsure(f"{key} is set twice", found[1].line)
         return found[0] if found else None
-
-    def walk(self) -> list[_Node]:
-        return [self, *(n for c in self.children for n in c.walk())]
 
 
 @dataclass(frozen=True)
@@ -236,367 +256,343 @@ class _Scalar:
         return self.text
 
 
-def _strip_comment(text: str) -> str:
-    """Drop a trailing `# comment` (a # at the start or after a space or tab, outside quotes)."""
-    return _scan(text, _FlowState(), continued=False)
+# The YAML this scanner reads: every line of a workflow must be one of these, or the file isn't read at all. Rather
+# than parse YAML (the standard library has no parser), it accepts only a small subset whose meaning is certain:
+# - blank lines, and comments (a `#` at the start of a line or after a space or tab);
+# - `key:` or `key: VALUE`, with a key of letters, digits, `_`, `.` and `-` or a whole quoted key without escapes;
+# - `-`, `- VALUE` or `- key: VALUE` (a list item);
+# - `---` first (after an optional `%YAML 1.2`).
+# VALUE is one of these, then an optional comment:
+# - a plain scalar on one line, that doesn't start with an indicator and holds no `: ` or ` #`;
+# - a whole single- or double-quoted scalar on one line, without escapes (`\` or `''`);
+# - a flow list `[a, 'b']` or mapping `{k: a, "l": 'b'}` on one line, of such scalars and flow collections, with no
+#   `:` or `#` in plain items and a space after each key's `:`;
+# - a block scalar header (`|`, `>-`, `|2`...), whose lines are skipped by their indentation;
+# - an anchor alone (`&name`, for the block below it) or an alias alone (`*name`, never read);
+# - a plain scalar continued on more-indented lines, or starting on the line after its key (never read: as in
+#   YAML, nothing under a scalar can be a key);
+# - a double-quoted scalar on one line with escapes (never read);
+# - `[` alone, opening a flow list over several lines (also on the line after the key, as Prettier writes it): one item
+#   per line, each but the last followed by `,`, then `]`.
+_KEY_RE = re.compile(r"[A-Za-z0-9_.-]+", re.ASCII)
+_QUOTED_RE = re.compile(r"'[^'\n]*'(?!')|\"[^\"\\\n]*\"")  # no escapes: no `\` in "...", no `''` in '...'
+_BLOCK_HEADER_RE = re.compile(r"[|>](?:[1-9][-+]?|[-+][1-9]?)?", re.ASCII)
+_ESCAPED_RE = re.compile(r'"(?:[^"\\\n]|\\.)*"')  # a double-quoted scalar with escapes, which are never decoded
+_PROPERTY_RE = re.compile(r"([&*])[A-Za-z0-9_-]+", re.ASCII)  # an anchor or an alias, alone
+# A plain item in a flow collection: no flow indicators, quotes, `:` or `#`, and no other indicator to start with.
+_FLOW_PLAIN_RE = re.compile(r"(?:[^ \t,\[\]{}:#'\"&*!|>%@`?\\-]|-(?=[^ \t,\[\]{}:#'\"]))[^,\[\]{}:#'\"\\]*")
 
 
-def _split_key(text: str) -> tuple[str, str] | None:
-    """`key: value` -> (key, value), or None when the line isn't a plain mapping key. A quoted key with escapes
-    (`"arch\\x69tecture":`) can't be read, so it's an error rather than a key that's never matched."""
-    if not text or text[0] in "[{&*!|>%@`-?":
+def _comment_only(rest: str) -> bool:
+    """Nothing after a value but spaces and a comment (whose `#` follows a space or tab, as YAML requires)."""
+    return not rest.strip(_WS) or (rest[0] in _WS and rest.lstrip(_WS).startswith("#"))
+
+
+def _plain(text: str) -> str | None:
+    """A plain scalar on one line, before any comment, or None when the text isn't one this scanner reads."""
+    m = re.search(r"[ \t]#", text)
+    value = (text[: m.start()] if m else text).rstrip(_WS)
+    if not value or value[0] in ",[]{}#&*!|>'\"%@`?:" or value[0] == "-" and (len(value) == 1 or value[1] in _WS):
         return None
-    if text[0] in "\"'":
-        quote, i, escaped = text[0], 1, False
-        while i < len(text) and text[i] != quote or text[i : i + 2] == quote * 2 == "''":
-            if quote == '"' and text[i] == "\\" or quote == "'" and text[i : i + 2] == "''":
-                escaped, i = True, i + 1
-            i += 1
-        if i >= len(text) or not text[i + 1 :].startswith(":"):
-            return None
-        rest = text[i + 2 :]
-        if rest and rest[0] not in " \t":
-            return None
-        if escaped:
-            raise _Unsure(f"can't read the escapes in the key {text[: i + 1]}")
-        return text[1:i], rest.strip(_WS)
-    m = re.search(r":(?:[ \t]|$)", text)
-    if not m:
+    # After the first character, quotes, brackets and the other indicators are ordinary characters of a plain
+    # scalar in block context (as in `uses: actions/setup-python@v6` or `if: github.ref == 'refs/heads/main'`); only
+    # `: ` and ` #` aren't.
+    if re.search(r":(?:[ \t]|$)", value):
         return None
-    return text[: m.start()].rstrip(_WS), text[m.end() :].strip(_WS)
-
-
-@dataclass
-class _FlowState:
-    """Where a quoted value or flow collection is, partway through: the open quote and the bracket depth."""
-
-    quote: str | None = None
-    depth: int = 0
-    spans_quote: bool = False  # a quoted string continued onto another line
-
-    @property
-    def done(self) -> bool:
-        return self.quote is None and self.depth == 0
-
-
-def _starts(text: str, i: int, flow: bool) -> bool:
-    """Whether a quote or bracket at text[i] starts a scalar or collection, as YAML has it: at the start of the text,
-    after `[`, `{` or `,` inside a flow collection, or after `: ` or `- ` (with a space or tab between). Anywhere else
-    (`x:'y`, `it's`, `a"b`) it's an ordinary character of a plain scalar."""
-    j = i - 1
-    while j >= 0 and text[j] in _WS:
-        j -= 1
-    if j < 0:
-        return True
-    previous = text[j]
-    if flow and previous in "[{,":
-        return True
-    if j == i - 1:
-        return False
-    return previous == ":" or previous == "-" and (j == 0 or text[j - 1] in _WS)
-
-
-def _scan(text: str, state: _FlowState, continued: bool = True) -> str:
-    """Read on through one line, tracking quotes and flow collections; return the line up to any comment. For a line
-    that continues a value (`continued`), a `]` or `}` with nothing open is an error."""
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if state.quote == '"':
-            if ch == "\\":
-                i += 2
-                continue
-            if ch == '"':
-                state.quote = None
-        elif state.quote == "'":
-            if ch == "'":
-                if text[i + 1 : i + 2] == "'":
-                    i += 2
-                    continue
-                state.quote = None
-        elif ch == "#" and (i == 0 or text[i - 1] in _WS):
-            return text[:i].rstrip(_WS)
-        elif ch in "\"'[{" and _starts(text, i, state.depth > 0):
-            if ch in "[{":
-                state.depth += 1
-            else:
-                state.quote = ch
-        elif ch in "]}" and state.depth > 0:
-            state.depth -= 1
-        elif ch in "]}" and continued:
-            raise _Unsure(f"can't read {text.strip(_WS)}")
-        i += 1
-    if state.quote is not None:
-        state.spans_quote = True
-    return text.rstrip(_WS)
-
-
-def _continued(value: str) -> _FlowState | None:
-    """The state at the end of the line, when the value is a quoted string or flow collection that doesn't end there."""
-    if not value or value[0] not in "\"'[{":
-        return None
-    state = _FlowState()
-    _scan(value, state, continued=False)
-    return None if state.done else state
-
-
-def _parse_tree(text: str) -> _Node:
-    """The workflow as a tree of lines, by indentation. Block scalars (`run: |`) are skipped, and a quoted value or
-    flow collection over several lines is joined onto its first line."""
-    if m := _ODD_BREAK_RE.search(text):
-        raise _Unsure(f"a line break YAML may read differently ({m.group()!r})", text[: m.start()].count("\n") + 1)
-    root = _Node(0, -1, None, "")
-    stack = [root]
-    lines = [raw.rstrip("\r") for raw in text.split("\n")]
-    block_indent: int | None = None  # skipping a block scalar's lines indented more than this
-    started = ended = False  # content seen; a `...` document end seen
-    number = 0
-    while number < len(lines):
-        line = lines[number]
-        number += 1
-        stripped = line.lstrip(" ")
-        indent = len(line) - len(stripped)
-        if block_indent is not None:
-            if not stripped.strip(_WS) or indent > block_indent:
-                continue
-            block_indent = None
-        if not stripped.strip(_WS) or stripped.lstrip(_WS).startswith("#"):
-            continue
-        if stripped.startswith("\t") or "\t" in line[:indent]:
-            raise _Unsure("tab in indentation", number)
-        if indent == 0 and stripped.startswith("%"):
-            directive = _strip_comment(stripped)
-            if started or not re.fullmatch(r"%YAML[ \t]+1\.2", directive):
-                raise _Unsure(f"the {directive} directive isn't read (only %YAML 1.2 before the document is)", number)
-            continue
-        if indent == 0 and (marker := _DOCUMENT_RE.match(stripped)):
-            if _strip_comment(stripped[marker.end() :]):
-                raise _Unsure(f"content on the {marker.group(1)} line", number)
-            if marker.group(1) == "---" and started:
-                raise _Unsure("more than one YAML document", number)
-            ended = marker.group(1) == "..."
-            continue
-        if ended:
-            raise _Unsure("content after the end of the YAML document", number)
-        started = True
-        body = _strip_comment(stripped)
-        is_item = body == "-" or body.startswith("- ")
-        base = indent + 0.5 if is_item else indent
-        parent = next(n for n in reversed(stack) if n.indent < base)
-        if parent.value or parent.is_text:
-            # A further line of the parent's (plain) value: text, whatever it looks like. It never starts a quoted
-            # value or flow collection of its own.
-            while stack[-1] is not parent:
-                stack.pop()
-            parent.children.append(_Node(number, indent, None, body, is_text=True))
-            continue
-        nodes: list[_Node] = []
-        try:
-            pair = _split_key(body[1:].lstrip(" ") if is_item else body)
-        except _Unsure as e:
-            raise _Unsure(e.reason, number) from None
-        if is_item:
-            rest = body[1:].lstrip(" ")
-            item = _Node(number, indent + 0.5, None, rest)
-            nodes.append(item)
-            if pair is not None:
-                item.value = ""
-                key_column = indent + len(body) - len(rest)
-                nodes.append(_Node(number, key_column, pair[0], pair[1]))
-                block_column = key_column
-            else:
-                block_column = indent
-        elif pair is not None:
-            nodes.append(_Node(number, indent, pair[0], pair[1]))
-            block_column = indent
-        else:
-            while stack[-1].indent >= indent:
-                stack.pop()
-            parent = stack[-1]
-            if parent.key is not None and not parent.value and not parent.children and body[0] not in "?:":
-                # `key:` with its value on the next line: the value belongs to the key. A block scalar header there
-                # isn't read, and a scalar there is refused wherever it's read.
-                if _BLOCK_SCALAR_RE.fullmatch(body) or _PROPERTY_BLOCK_RE.fullmatch(body):
-                    raise _Unsure(f"a block scalar ({body}) on the line after {parent.key}: isn't read", number)
-                parent.value, parent.next_line = body, True
-                nodes = []
-                last = parent
-            else:
-                nodes.append(_Node(number, indent, None, body, is_text=True))
-            block_column = indent
-        for node in nodes:
-            while stack[-1].indent >= node.indent:
-                stack.pop()
-            stack[-1].children.append(node)
-            stack.append(node)
-        if nodes:
-            last = nodes[-1]
-        if last.is_text:
-            continue
-        if _PROPERTY_BLOCK_RE.fullmatch(last.value):
-            raise _Unsure(f"a block scalar with an anchor or tag ({last.value}) isn't read", number)
-        if (state := _continued(last.value)) is not None:
-            parts = [last.value]
-            while not state.done:
-                if number >= len(lines):
-                    raise _Unsure(f"{last.value} isn't closed before the end of the file", last.line)
-                try:
-                    parts.append(_scan(lines[number].strip(_WS), state))
-                except _Unsure as e:
-                    raise _Unsure(e.reason, number + 1) from None
-                number += 1
-            last.value = " ".join(p for p in parts if p)
-            last.broken = state.spans_quote or last.value[0] in "\"'"
-        elif _BLOCK_SCALAR_RE.fullmatch(last.value):
-            block_indent = block_column
-    return root
-
-
-def _unquote(text: str, line: int) -> _Scalar:
-    if not text:
-        raise _Unsure("no value", line)
-    if text[0] in ("'", '"'):
-        quote = text[0]
-        if len(text) < 2 or text[-1] != quote:
-            raise _Unsure(f"can't read {text}", line)
-        inner = text[1:-1]
-        if quote == '"':
-            if "\\" in inner:
-                raise _Unsure(f"can't read the escapes in {text}", line)
-            if '"' in inner:
-                raise _Unsure(f"can't read {text}", line)
-        elif "'" in inner.replace("''", ""):
-            raise _Unsure(f"can't read {text}", line)
-        else:
-            inner = inner.replace("''", "'")
-        return _Scalar(inner, True, line)
-    if text[0] in "[]{}&*!|>%@`" or text.startswith(("- ", "? ")) or text in ("-", "?"):
-        raise _Unsure(f"can't read {text}", line)
-    return _Scalar(text, False, line)
+    return value
 
 
 class _Flow:
-    """A strict reader for one flow collection: `[a, "b", 'c']`, `{os: x, python: "3.13"}`, or a list of such
-    mappings. Anything else (nesting, `k: v` or `?` in a list, escapes, comments, anchors) can't be read. As in YAML, a
-    quote only quotes at the start of an item: `it's` and `a"b` are plain."""
+    """A flow list or mapping on one line, as the grammar above allows it."""
 
-    def __init__(self, text: str, line: int) -> None:
-        self.text, self.pos, self.line = text, 0, line
+    def __init__(self, text: str, line: int, pos: int = 0) -> None:
+        self.text, self.line, self.pos = text, line, pos
 
     def fail(self) -> NoReturn:
-        raise _Unsure(f"can't read {self.text}", self.line)
+        raise _NotRead(self.line, self.text)
 
-    def peek(self, n: int = 0) -> str:
-        return self.text[self.pos + n : self.pos + n + 1]
+    def peek(self) -> str:
+        return self.text[self.pos : self.pos + 1]
 
     def spaces(self) -> None:
-        while self.peek() in (" ", "\t") and self.peek():
+        while self.peek() and self.peek() in _WS:
             self.pos += 1
 
-    def read(self) -> object:
-        self.spaces()
-        value = self.seq() if self.peek() == "[" else self.mapping() if self.peek() == "{" else self.fail()
-        self.spaces()
-        if self.pos != len(self.text):
-            self.fail()
-        return value
+    def collection(self) -> object:
+        return self.seq() if self.peek() == "[" else self.mapping() if self.peek() == "{" else self.fail()
 
     def items(self, close: str, item: Callable[[], None]) -> None:
         self.pos += 1
-        while True:
-            self.spaces()
-            if self.peek() == close:
-                self.pos += 1
-                return
+        self.spaces()
+        while self.peek() != close:
             item()
             self.spaces()
             if self.peek() == ",":
                 self.pos += 1
+                self.spaces()
             elif self.peek() != close:
                 self.fail()
+        self.pos += 1
+
+    def value(self) -> object:
+        return self.collection() if self.peek() in ("[", "{") else self.scalar()
 
     def seq(self) -> list[object]:
         out: list[object] = []
-        self.items("]", lambda: out.append(self.mapping() if self.peek() == "{" else self.scalar(key=False)))
+        self.items("]", lambda: out.append(self.value()))
         return out
 
-    def mapping(self) -> dict[str, _Scalar]:
-        out: dict[str, _Scalar] = {}
+    def mapping(self) -> dict[str, object]:
+        out: dict[str, object] = {}
 
         def pair() -> None:
-            key = self.scalar(key=True)
-            if self.peek() != ":" or self.peek(1) not in (" ", "\t") or key.text in out:
+            m = _QUOTED_RE.match(self.text, self.pos) or _KEY_RE.match(self.text, self.pos)
+            key = m.group()[1:-1] if m and m.group()[0] in "'\"" else m.group() if m else ""
+            # `key: value`, with a space after the colon (JSON's `"key":value` isn't read)
+            if (
+                not m
+                or self.text[m.end() : m.end() + 1] != ":"
+                or self.text[m.end() + 1 : m.end() + 2] not in (" ", "\t")
+            ):
                 self.fail()
-            self.pos += 1
+            if key in out:
+                self.fail()
+            self.pos = m.end() + 1
             self.spaces()
-            out[key.text] = self.scalar(key=False)
+            out[key] = self.value()
 
         self.items("}", pair)
         return out
 
-    def scalar(self, key: bool) -> _Scalar:
-        """A quoted or plain scalar. In a list, `k: v` would be a mapping; as a key, it stops at the `:`."""
-        start, ch = self.pos, self.peek()
-        if ch in ("'", '"'):
-            self.pos += 1
-            while True:
-                c = self.peek()
-                if not c or c == "\\" and ch == '"':
-                    self.fail()
-                self.pos += 1
-                if c == ch:
-                    if ch == "'" and self.peek() == "'":
-                        self.pos += 1
-                        continue
-                    break
-            value = _unquote(self.text[start : self.pos], self.line)
-            self.spaces()
-            if not key and self.peek() == ":":
-                self.fail()
-            return value
-        if not ch or ch in "[]{},#&*!|>%@`?" or ch == "-" and self.peek(1) in ("", " ", "\t", ",", "]", "}"):
-            self.fail()
-        while (c := self.peek()) and c not in ",]}":
-            if c in "[{" or c == "#" and self.text[self.pos - 1] in " \t":
-                self.fail()
-            if c == ":" and self.peek(1) in ("", " ", "\t", ",", "]", "}"):
-                if not key:
-                    self.fail()
-                break
-            self.pos += 1
-        return _Scalar(self.text[start : self.pos].rstrip(" \t"), False, self.line)
+    def scalar(self) -> _Scalar:
+        if m := _QUOTED_RE.match(self.text, self.pos):
+            self.pos = m.end()
+            return _Scalar(m.group()[1:-1], True, self.line)
+        if m := _FLOW_PLAIN_RE.match(self.text, self.pos):
+            value = m.group().rstrip(_WS)
+            self.pos = m.start() + len(value)
+            return _Scalar(value, False, self.line)
+        self.fail()
+
+
+_OPEN = object()  # `[` alone: a flow list continues on the next lines
+
+
+def _value(text: str, line: int) -> tuple[object, str]:
+    """The VALUE after `key:` or `- ` (spaces already skipped), parsed, and as written."""
+    if not text or text.startswith("#"):
+        return None, ""
+    if text[0] in "'\"":
+        if (m := _QUOTED_RE.match(text)) and _comment_only(text[m.end() :]):
+            return _Scalar(m.group()[1:-1], True, line), m.group()
+        if (m := _ESCAPED_RE.match(text)) and _comment_only(text[m.end() :]):
+            return _ESCAPED, m.group()
+        raise _NotRead(line, text)
+    if (m := _PROPERTY_RE.match(text)) and _comment_only(text[m.end() :]):
+        # An anchor on the block below (read as it is) or an alias (never read).
+        return (None if m.group(1) == "&" else _ALIAS), m.group()
+    if text[0] == "[" and _comment_only(text[1:]):
+        return _OPEN, "["
+    if text[0] in "[{":
+        flow = _Flow(text, line)
+        value = flow.collection()
+        if not _comment_only(text[flow.pos :]):
+            raise _NotRead(line, text)
+        return value, text[: flow.pos]
+    if text[0] in "|>":
+        if not (m := _BLOCK_HEADER_RE.match(text)) or not _comment_only(text[m.end() :]):
+            raise _NotRead(line, text)
+        return _BLOCK, m.group()
+    if (plain := _plain(text)) is None:
+        raise _NotRead(line, text)
+    return _Scalar(plain, False, line), plain
+
+
+def _split_key(body: str) -> tuple[str, str] | None:
+    """`key: rest` -> (key, rest with leading spaces skipped), or None when the line doesn't start with a key."""
+    if body[:1] in ("'", '"'):
+        if not (m := _QUOTED_RE.match(body)):
+            return None
+        key, after = m.group()[1:-1], body[m.end() :]
+    elif m := _KEY_RE.match(body):
+        key, after = m.group(), body[m.end() :]
+    else:
+        return None
+    if not after.startswith(":") or after[1:2] not in ("", " ", "\t"):
+        return None
+    return key, after[1:].lstrip(_WS)
+
+
+def _flow_children(mapping: dict[str, object], line: int, indent: float) -> list[_Node]:
+    """A flow mapping's entries as the nodes a block mapping would have."""
+    children = []
+    for key, value in mapping.items():
+        node = _Node(line, indent + 1, key, value, value.text if isinstance(value, _Scalar) else "...")
+        if isinstance(value, dict):
+            node.children, node.value = _flow_children(value, line, indent + 1), None
+        children.append(node)
+    return children
+
+
+def _parse_tree(text: str) -> _Node:
+    """The workflow as a tree of lines, by indentation, if every line is in the grammar above; else _NotRead."""
+    if m := _ODD_BREAK_RE.search(text):
+        raise _NotRead(text[: m.start()].count("\n") + 1, f"a line break other than \\n ({m.group()!r})")
+    root = _Node(0, -1, None)
+    stack = [root]
+    lines = [raw.removesuffix("\r") for raw in text.split("\n")]
+    block_column: int | None = None  # skipping a block scalar's lines indented more than this
+    plain: tuple[_Node, int] | None = None  # a plain scalar's node and column, while its lines may continue
+    started = directive = False
+    number = 0
+
+    def content(i: int) -> bool:
+        stripped = lines[i].strip(_WS)
+        return bool(stripped) and not stripped.startswith("#")
+
+    def attach(node: _Node) -> None:
+        while stack[-1].indent >= node.indent:
+            stack.pop()
+        parent = stack[-1]
+        if parent.value is not None:  # a further line under a key or item that has its value already
+            raise _NotRead(node.line, lines[node.line - 1])
+        if parent.children and (
+            parent.children[0].indent != node.indent or (parent.children[0].key is None) != (node.key is None)
+        ):
+            raise _NotRead(node.line, lines[node.line - 1])  # indentation that doesn't line up, or keys and items
+        parent.children.append(node)
+        stack.append(node)
+
+    def flow_lines(node: _Node, start: int) -> int:
+        """Read a flow list over several lines into node, from the line after `[`; return the next line's index."""
+        base = len(lines[node.line - 1]) - len(lines[node.line - 1].lstrip(" "))
+        items: list[object] = []
+        i, closed = start, True  # closed: the last item had its comma (or there's none yet)
+        while i < len(lines):
+            line = lines[i]
+            i += 1
+            if not content(i - 1):
+                continue
+            indent, body = len(line) - len(line.lstrip(" ")), line.strip(_WS)
+            if "\t" in line[:indent] or line[indent : indent + 1] == "\t":
+                raise _NotRead(i, line)
+            if body.startswith("]"):
+                if indent < base or not _comment_only(body[1:]):
+                    raise _NotRead(i, line)
+                node.value, node.raw = items, "[...]"
+                return i
+            if indent <= base or not closed:
+                raise _NotRead(i, line)
+            flow = _Flow(body, i)
+            items.append(flow.value())
+            flow.spaces()
+            closed = flow.peek() == ","
+            if not _comment_only(body[flow.pos + closed :]):
+                raise _NotRead(i, line)
+        raise _NotRead(node.line, lines[node.line - 1])  # never closed
+
+    while number < len(lines):
+        line = lines[number]
+        number += 1
+        indent = len(line) - len(line.lstrip(" "))
+        if block_column is not None:
+            if not line.strip(_WS) or indent > block_column:
+                continue
+            block_column = None
+        if plain is not None:
+            # A plain scalar goes on over more-indented lines (a comment ends it). Nothing under a scalar can be a key,
+            # so these lines are text whatever they look like; only `: ` would make the YAML invalid.
+            if content(number - 1) and indent > plain[1]:
+                if "\t" in line[:indent] or re.search(r":(?:[ \t]|$)", line.split(" #")[0].rstrip(_WS)):
+                    raise _NotRead(number, line)
+                plain[0].value = _LINES
+                if re.search(r"[ \t]#", line):
+                    plain = None
+                continue
+            if line.strip(_WS):
+                plain = None
+        if not content(number - 1):
+            continue
+        body = line[indent:]
+        if body[0] == "\t":
+            raise _NotRead(number, line)
+        if not started and indent == 0 and body.startswith("%"):
+            if directive or not re.fullmatch(r"%YAML[ \t]+1\.2", body.split("#")[0].rstrip(_WS)):
+                raise _NotRead(number, line)
+            directive = True
+            continue
+        if not started and indent == 0 and body.startswith("---") and _comment_only(body[3:]):
+            started = True
+            continue
+        if directive and not started:
+            raise _NotRead(number, line)  # %YAML must be followed by ---
+        started = True
+        is_item = body == "-" or body.startswith(("- ", "-\t"))
+        rest = body[1:].lstrip(_WS) if is_item else body
+        try:
+            pair = _split_key(rest)
+            if pair is None and not is_item:
+                raise _NotRead(number, line)
+            if is_item:
+                item = _Node(number, indent + 0.5, None)
+                attach(item)
+                if pair is None:
+                    item.value, item.raw = _value(rest, number)
+                    node, column = item, indent
+                else:
+                    column = indent + len(body) - len(rest)
+                    node = _Node(number, column, pair[0])
+                    attach(node)
+                    node.value, node.raw = _value(pair[1], number)
+            else:
+                assert pair is not None
+                node = _Node(number, indent, pair[0])
+                attach(node)
+                node.value, node.raw = _value(pair[1], number)
+                column = indent
+        except _NotRead as e:
+            raise _NotRead(number, line) from e
+        if node.value is _BLOCK:
+            block_column = column
+        elif node.value is _OPEN:
+            node.value = None
+            number = flow_lines(node, number)
+        elif isinstance(node.value, _Scalar) and not node.value.quoted and not re.search(r"[ \t]#", line):
+            plain = node, column
+        elif node.value is None and node.key is not None:
+            following = next((i for i in range(number, len(lines)) if content(i)), None)
+            if following is not None and len(lines[following]) - len(lines[following].lstrip(" ")) > column:
+                below = lines[following].strip(_WS)
+                if below.split(" #")[0].rstrip(_WS) == "[":  # Prettier's `key:` with `[` alone on the next line
+                    number = flow_lines(node, following + 1)
+                elif not below.startswith(("-", "#")) and _split_key(below) is None and _plain(below) is not None:
+                    plain = node, column  # a plain scalar starting on the line after its key
+                    node.raw = below
+        if isinstance(node.value, dict):  # `key: {a: b}` is the mapping a: b
+            node.children, node.value = _flow_children(node.value, node.line, node.indent), None
+    return root
 
 
 def _scalar(node: _Node) -> _Scalar:
-    if node.next_line:
-        raise _Unsure(f"{node.key}: a value on the line after the key", node.line)
-    if node.broken:
-        raise _Unsure(f"{node.key}: a quoted value over several lines", node.line)
-    if node.children or node.is_text:
-        raise _Unsure(f"can't read the value of {node.key or 'a list item'}", node.line)
-    if _BLOCK_SCALAR_RE.fullmatch(node.value):
-        raise _Unsure(f"{node.key}: a multi-line value", node.line)
-    return _unquote(node.value, node.line)
+    if isinstance(node.value, _Scalar) and not node.children:
+        return node.value
+    if isinstance(node.value, _Opaque):
+        raise _Unsure(f"{node.key or 'a list item'}: {node.value.what} isn't read", node.line)
+    if node.value is None and not node.children:
+        raise _Unsure(f"{node.key or 'a list item'} has no value", node.line)
+    raise _Unsure(f"{node.key or 'a list item'}: {node.raw or '...'} isn't a single value", node.line)
 
 
 def _data(node: _Node) -> object:
     """A matrix value: a scalar, a list of scalars, a list of flat mappings or a mapping of those."""
-    if node.is_text:
-        raise _Unsure(f"can't read {node.value}", node.line)
-    if node.value:
-        if node.children:
-            raise _Unsure(f"can't read the value of {node.key or 'a list item'}", node.line)
-        if node.broken:
-            raise _Unsure(f"can't read {node.value} (a quoted value over several lines)", node.line)
-        if node.value.startswith(("[", "{")):  # also on the line after the key (Prettier writes them so)
-            return _Flow(node.value, node.line).read()
-        return _scalar(node)
+    if isinstance(node.value, _Opaque):
+        raise _Unsure(f"{node.key or 'a list item'}: {node.value.what} isn't read", node.line)
+    if node.value is not None:
+        return node.value
     if not node.children:
         raise _Unsure(f"{node.key or 'a list item'} has no value", node.line)
-    if all(c.key is None and not c.is_text for c in node.children):
+    if all(c.key is None for c in node.children):
         return [_data(c) for c in node.children]
-    if any(c.key is None for c in node.children):
-        raise _Unsure(f"can't read {node.key or 'a list item'}", node.line)
     out: dict[str, object] = {}
     for c in node.children:
         if c.key in out:
@@ -619,26 +615,28 @@ def _matrix(job: _Node, where: _Node) -> tuple[list[dict[str, _Scalar]], int]:
     node = strategy.get("matrix") if strategy is not None else None
     if node is None:
         raise _Unsure("the job has no strategy.matrix", where.line)
-    if node.value:
-        raise _Unsure(f"the matrix is computed ({node.value})", node.line)
+    if isinstance(node.value, _Scalar) and "${{" in node.value.text:
+        raise _Computed(f"the matrix is computed ({node.raw})", node.line)
     data = _data(node)
     if not isinstance(data, dict):
         raise _Unsure("can't read the matrix", node.line)
 
     def scalars(key: str, value: object) -> list[_Scalar]:
         if isinstance(value, _Scalar) and "${{" in value.text:
-            raise _Unsure(f"matrix.{key} is computed ({value.text})", value.line)
-        if not isinstance(value, list) or not value or not all(isinstance(v, _Scalar) for v in value):
+            raise _Computed(f"matrix.{key} is computed ({value.text})", value.line)
+        if value == []:
+            raise _Unsure(f"matrix.{key} is an empty list", node.line)
+        if not isinstance(value, list) or not all(isinstance(v, _Scalar) for v in value):
             raise _Unsure("the matrix has values that aren't a plain list", node.line)
         for v in value:
             if "${{" in v.text:
-                raise _Unsure(f"the matrix has a computed value ({v.text})", v.line)
+                raise _Computed(f"the matrix has a computed value ({v.text})", v.line)
         return value
 
     def entries(key: str) -> list[dict[str, _Scalar]]:
         value = data.get(key, [])
         if isinstance(value, _Scalar) and "${{" in value.text:
-            raise _Unsure(f"the matrix's {key} is computed ({value.text})", value.line)
+            raise _Computed(f"the matrix's {key} is computed ({value.text})", value.line)
         if not isinstance(value, list) or not all(isinstance(e, dict) for e in value):
             raise _Unsure(f"can't read the matrix's {key}", node.line)
         out = []
@@ -647,7 +645,7 @@ def _matrix(job: _Node, where: _Node) -> tuple[list[dict[str, _Scalar]], int]:
                 if not isinstance(v, _Scalar):
                     raise _Unsure(f"the matrix's {key} has values that aren't plain", node.line)
                 if "${{" in v.text:
-                    raise _Unsure(f"the matrix has a computed value ({v.text})", v.line)
+                    raise _Computed(f"the matrix has a computed value ({v.text})", v.line)
             out.append(entry)
         return out
 
@@ -661,21 +659,46 @@ def _matrix(job: _Node, where: _Node) -> tuple[list[dict[str, _Scalar]], int]:
     # https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations
     # Excludes first (an exclude matches every combination that has all its values); then each include is added to
     # every original combination whose original values it doesn't change (later includes may overwrite what earlier
-    # ones added), or else becomes a combination of its own.
+    # ones added), or else becomes a combination of its own. Every comparison is made, so one that can't be told apart
+    # is refused even where another value already decides the match.
     combos: list[dict[str, _Scalar]] = []
     if dims:
         for values in itertools.product(*dims.values()):
             combo = dict(zip(dims, values, strict=True))
-            if not any(all(_same(combo[k], v) for k, v in e.items()) for e in exclude):
+            if not any(all([_same(combo[k], v) for k, v in e.items()]) for e in exclude):
                 combos.append(combo)
     extra = []
     for entry in include:
-        matching = [c for c in combos if all(k not in dims or _same(c[k], v) for k, v in entry.items())]
+        matching = [c for c in combos if all([_same(c[k], v) for k, v in entry.items() if k in dims])]
         for c in matching:
             c.update(entry)
         if not matching:
             extra.append(dict(entry))
     return combos + extra, node.line
+
+
+def _matrix_runs(job: _Node) -> None:
+    """Refuse a job whose matrix may have no combinations, since GitHub then runs nothing. A computed matrix is
+    refused only where it's used; one with values that aren't plain still has a combination for sure when every
+    dimension is a list with something in it and nothing is excluded."""
+    try:
+        every, line = _matrix(job, job)
+    except _Computed:
+        return
+    except _Unsure:
+        node = job.get("strategy").get("matrix")  # type: ignore[union-attr]
+        try:
+            data = _data(node)  # type: ignore[arg-type]
+        except _Unsure:
+            data = None
+        if not isinstance(data, dict) or "exclude" in data:
+            raise
+        dims = [v for k, v in data.items() if k not in ("include", "exclude")]
+        if not all(isinstance(v, list) and v for v in dims) or not (dims or data.get("include")):
+            raise
+        return
+    if not every:
+        raise _Unsure("the matrix is empty", line)
 
 
 def _matrix_values(job: _Node, key: str, where: _Node) -> list[_Scalar]:
@@ -684,9 +707,9 @@ def _matrix_values(job: _Node, key: str, where: _Node) -> list[_Scalar]:
         raise _Unsure("the matrix is empty", line)
     if not all(key in c for c in combos):
         raise _Unsure(f"matrix.{key} isn't set in every matrix combination", where.line)
-    values: dict[tuple[int, str], _Scalar] = {}
+    values: dict[tuple[int, str, bool], _Scalar] = {}
     for c in combos:
-        values.setdefault((c[key].line, c[key].text), c[key])
+        values.setdefault((c[key].line, c[key].text, c[key].quoted), c[key])
     return list(values.values())
 
 
@@ -711,16 +734,6 @@ def _literal(node: _Node) -> str:
     return value.text
 
 
-def _unread_lines(node: _Node) -> None:
-    """Refuse a line that's neither a key nor a list item where one belongs (a `? key`, a stray scalar): it could hold
-    a key the scan would otherwise miss. Under a key with a value, such lines just continue that value."""
-    for child in node.children:
-        if child.is_text and not node.value:
-            raise _Unsure(f"can't read {child.value}", child.line)
-        if not child.value:
-            _unread_lines(child)
-
-
 @dataclass(frozen=True)
 class _Setup:
     """An actions/setup-python or astral-sh/setup-uv step, with its inputs by lowercase name (as Actions reads them)."""
@@ -743,19 +756,21 @@ def _setups(steps: _Node | None) -> list[_Setup]:
     it might set the architecture or the Python."""
     if steps is None:
         return []
-    if steps.value and steps.value != "[]":
-        raise _Unsure(f"steps: {steps.value} isn't read", steps.line)
+    if steps.value == []:
+        return []
+    if steps.value is not None:
+        raise _Unsure(f"steps: {steps.raw} isn't read", steps.line)
     found = []
     for step in steps.children:
-        if step.key is not None or step.is_text or step.value:
-            raise _Unsure(f"can't read the step {step.value or step.key}", step.line)
+        if step.key is not None or step.value is not None:
+            raise _Unsure(f"can't read the step {step.raw or step.key}", step.line)
         uses, with_, condition = step.get("uses"), step.get("with"), step.get("if")  # keys are case-sensitive
         if uses is None:
             continue
         try:
             text = _scalar(uses).text
         except _Unsure as e:
-            raise _Unsure(f"can't read the uses: {uses.value or '...'} of a step", e.line) from None
+            raise _Unsure(f"can't read the uses: {uses.raw or '...'} of a step", e.line) from None
         action = text.split("@", 1)[0].lower()
         if "${{" in text:
             raise _Unsure(f"uses: {text} is an expression", uses.line)
@@ -763,15 +778,15 @@ def _setups(steps: _Node | None) -> list[_Setup]:
             continue
         inputs: dict[str, _Node] = {}
         if with_ is not None:
-            if with_.value or any(c.key is None for c in with_.children):
-                raise _Unsure(f"with: {with_.value or '...'} isn't read", with_.line)
+            if with_.value is not None or any(c.key is None for c in with_.children):
+                raise _Unsure(f"with: {with_.raw or '...'} isn't read", with_.line)
             for c in with_.children:
                 name = str(c.key).lower()  # input names are case-insensitive (INPUT_<NAME>)
                 if name in inputs:
                     raise _Unsure(f"with: sets {name} twice", c.line)
                 inputs[name] = c
         if condition is not None and any(name in inputs for name in _INTERPRETER_INPUTS):
-            raise _Unsure(f"the {action} step has if: {condition.value or '...'}, so it may not run", condition.line)
+            raise _Unsure(f"the {action} step has if: {condition.raw or '...'}, so it may not run", condition.line)
         found.append(_Setup(step, action, inputs))
     return found
 
@@ -784,14 +799,14 @@ _Arch = str | None | tuple[str, int] | _Unsure
 def _arch(setup: _Setup) -> _Arch:
     if not setup.setup_python:
         if (node := setup.inputs.get("python-arch")) is not None:
-            return _Unsure(f"setup-uv's python-arch: {node.value} isn't read", node.line)
+            return _Unsure(f"setup-uv's python-arch: {node.raw} isn't read", node.line)
         return None
     if (node := setup.inputs.get("architecture")) is None:
         return None
     try:
         value = _scalar(node)
     except _Unsure as e:
-        return _Unsure(f"architecture: {node.value} isn't read", e.line)
+        return _Unsure(f"architecture: {node.raw} isn't read", e.line)
     if m := _MATRIX_REF_RE.fullmatch(value.text):
         return m.group(1), node.line
     if "${{" in value.text:
@@ -807,17 +822,13 @@ def _read_job(job: _Node, path: str, out: Suggestions) -> None:
         out.unreadable.append(Unreadable(path, e.line, f"job {job.key}: {e.reason}"))
 
     try:
-        if job.value or job.get("<<") is not None:
+        if job.value is not None:
             raise _Unsure("can't read the job", job.line)
         setups = _setups(job.get("steps"))
         if (strategy := job.get("strategy")) is not None and strategy.get("matrix") is not None:
-            try:
-                every, matrix_line = _matrix(job, job)
-            except _Unsure:
-                pass  # refused where the matrix is used; a computed one still runs the job
-            else:
-                if not every:  # GitHub runs no job at all
-                    raise _Unsure("the matrix is empty", matrix_line)
+            # A matrix that can't be read might have no combinations, and then GitHub runs no job at all; a computed
+            # one is refused only where it's used.
+            _matrix_runs(job)
     except _Unsure as e:
         unsure(_Unsure(e.reason + " (neither its runner nor its Python is read)", e.line))
         return
@@ -836,10 +847,8 @@ def _read_job(job: _Node, path: str, out: Suggestions) -> None:
             return
         if (container := job.get("container")) is not None:
             raise _Unsure("runs in a container, whose platform isn't read", container.line)
-        if runs_on.children or runs_on.value.startswith(("[", "{")):
-            raise _Unsure(
-                f"runs-on {runs_on.value or 'with several labels or a group'} isn't a single label", runs_on.line
-            )
+        if runs_on.children or isinstance(runs_on.value, list):
+            raise _Unsure(f"runs-on {runs_on.raw or 'with a group or labels'} isn't a single label", runs_on.line)
         # Each step that picks an interpreter adds its architecture; a setup-uv step without a Python picks none.
         pickers = [s for s in setups if s.setup_python or {"python-version", "python-arch"} & s.inputs.keys()]
         archs = list(dict.fromkeys(_arch(s) for s in pickers)) or [None]
@@ -957,12 +966,16 @@ def read_workflow(path: Path, name: str, out: Suggestions) -> None:
 def read_workflow_text(text: str, name: str, out: Suggestions) -> None:
     try:
         root = _parse_tree(text)
-        _unread_lines(root)
         jobs = root.get("jobs")
         if jobs is None:
             raise _Unsure("no jobs")
-        if jobs.value or jobs.broken or any(j.key is None for j in jobs.children):
+        if jobs.value is not None or any(j.key is None for j in jobs.children):
             raise _Unsure("can't read the jobs", jobs.line)
+    except _NotRead as e:
+        shown = e.text.strip(_WS)
+        shown = shown if len(shown) <= 60 else shown[:57] + "..."
+        out.unreadable.append(Unreadable(name, e.line, f"uses YAML this scanner doesn't read: {shown}"))
+        return
     except _Unsure as e:
         out.unreadable.append(Unreadable(name, e.line, e.reason))
         return

@@ -34,7 +34,7 @@ uv run --group dev pytest
 | `pypi.py` | The only HTTP client (`fetch_json`: retries, https-only redirects) and the PyPI lookups (`fill`, `fill_all`, `recheck_lock`) |
 | `cache.py` | The 24-hour on-disk cache of pinned PyPI lookups, `--conda-forge` lookups and the tracker's notes (`--no-cache` and `--online` skip it) |
 | `dockerfile.py` | `--dockerfile`: reads the final stage's image and platform the way Docker/BuildKit does |
-| `suggest_targets.py` | `--suggest-targets`: targets and Pythons read from GitHub Actions workflows (a conservative line scan) and Dockerfiles |
+| `suggest_targets.py` | `--suggest-targets`: targets and Pythons read from GitHub Actions workflows (only files whose every line is in a small, strict subset of YAML) and Dockerfiles |
 | `offline.py` | `--offline`, `offline = true` and `check_lockfile(..., offline=True)`: refuse inputs that would need an index lookup |
 | `pyodide.py` | `--pyodide-lock`: packages Pyodide ships itself |
 | `condaforge.py` | `--conda-forge`: under `--explain`, whether conda-forge has a build of the same package and version that fits a gap's target (anaconda.org, through `pypi.fetch_json`) |

@@ -426,7 +426,7 @@ dependencies = [
 dev = [
     { name = "mypy" },
     { name = "pytest" },
-    { name = "pyyaml", marker = "platform_machine != 'ARM64' or sys_platform != 'win32'" },
+    { name = "pyyaml", marker = "python_full_version >= '3.12' or platform_machine != 'ARM64' or sys_platform != 'win32'" },
     { name = "ruff" },
 ]
 
@@ -437,6 +437,6 @@ requires-dist = [{ name = "packaging", specifier = ">=26.3" }]
 dev = [
     { name = "mypy", specifier = ">=1.13" },
     { name = "pytest", specifier = ">=8" },
-    { name = "pyyaml", marker = "platform_machine != 'ARM64' or sys_platform != 'win32'", specifier = ">=6.0.2" },
+    { name = "pyyaml", marker = "python_full_version >= '3.12' or platform_machine != 'ARM64' or sys_platform != 'win32'", specifier = ">=6.0.2" },
     { name = "ruff", specifier = ">=0.8" },
 ]

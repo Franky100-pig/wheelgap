@@ -398,7 +398,7 @@ musl = "1.2"
 The snippet combines every job in every workflow, including lint, release and bot jobs (the `plan` job above adds `linux-x86_64`), so check it before pasting and keep only the platforms you ship to.
 
 - **GitHub Actions** (`.github/workflows/*.yml` and `*.yaml`):
-  - Each job's `runs-on`, as a single label or `${{ matrix.KEY }}` with a literal matrix. The matrix can use lists, also over several lines, and `include` and `exclude` entries, which are combined as GitHub does.
+  - Each job's `runs-on`, as a single label or `${{ matrix.KEY }}` with a literal matrix. The matrix can use lists and `include` and `exclude` entries, which are combined as GitHub does.
   - The `python-version` given to `actions/setup-python` or `astral-sh/setup-uv`, as a literal (`"3.13"`, `3.13.1`, `3.14t`) or from the matrix.
   - setup-python's `freethreaded: true`, which adds the `t` (free-threading starts at 3.13, so `3.12t` is refused).
   - setup-python's `architecture`, where it's certain: `x86` on x64 Windows is `win32`, and `x64` on Apple silicon is `macos-x86_64` (Rosetta). It can come from a literal matrix, which pairs each runner with its own architecture.
@@ -415,18 +415,28 @@ The snippet combines every job in every workflow, including lint, release and bo
 
 The snippet sets `glibc`, `musl` or `macos` only when every source of those targets names the same version. Otherwise a `#` line says why it's left out. It also leaves out `python` when no Python was found. `--json` prints the same as an object with `targets`, `python` (each with `file`, `line` and `from`), `unreadable` and `config`.
 
-There's no YAML parser in the standard library, so workflows are read with a conservative line scan. Anything it can't be sure of is listed under "Couldn't read" with its file and line, and never guessed:
+There's no YAML parser in the standard library, so a workflow is read only when every line is in a small subset of YAML whose meaning is certain. Otherwise the whole file is listed under "Couldn't read: uses YAML this scanner doesn't read", with the first line that isn't. The subset is:
+
+- **Lines.** Blank lines and comments, `key:` or `key: VALUE` (letters, digits, `_`, `.` and `-`, or a whole quoted key without escapes), and list items (`- VALUE`, `- key: VALUE`). A leading `---` (after an optional `%YAML 1.2`) is allowed too.
+- **Values.** A VALUE is one of:
+  - a plain scalar on one line;
+  - a whole single- or double-quoted scalar on one line;
+  - a one-line flow list or mapping of such scalars, with a space after each `:`;
+  - a block scalar header (`|`, `>-`...);
+  - a flow list over several lines, as Prettier writes it, with `[` ending its line (or alone on the next), one item per line, and `]` on its own line.
+- **Accepted but never read.** Anchors and aliases (`&paths`, `*paths`), double-quoted values with escapes, and plain values continued on more-indented lines (long `if:` and `run:` lines) are accepted where they aren't needed, and refused where wheelgap would read them.
+
+Everything else isn't read: multi-line quoted values, anchors or tags inside a value, `? ` keys, `<<` merge keys, a second document, flow collections in other layouts, and line breaks other than `\n` and `\r\n`. Non-ASCII spaces such as NBSP are ordinary characters, as they are to YAML.
+
+In a file that is read, anything wheelgap can't be sure of is still listed under "Couldn't read" with its file and line, and never guessed:
 
 - expressions and computed matrices, and a `freethreaded` taken from the matrix;
+- a matrix that might have no combinations (an empty list, or an `exclude` that can't be worked out): GitHub would run nothing, so the job isn't read;
 - a job with a setup step whose `uses` can't be read, which sets an input twice, or which picks the Python under an `if:` (the step may not run);
 - self-hosted and other unknown runner labels;
 - a job that runs in a `container:`;
 - an unquoted `3.10` (YAML reads it as the number 3.1) or `0x10`;
 - `python-version-file`;
-- flow-style `steps` or `with`, a scalar on the line after its key, and a quoted value over several lines, where wheelgap would read it (elsewhere it's skipped whole; a flow list on the line after its key is read);
-- a flow list with anything but plain or quoted scalars and flat `{...}` mappings, read as YAML reads them (`[it's]` is the string `it's`);
-- quoted keys with escapes, lines that are neither a key nor a list item, directives other than `%YAML 1.2`, and more than one YAML document;
-- block scalars with an anchor or tag (`&a |`) or on the line after their key, and line breaks other than `\n` and `\r\n`. Non-ASCII spaces such as NBSP are ordinary characters, as they are to YAML;
 - a job id used twice;
 - Dockerfile templates (`Dockerfile.j2`, `Dockerfile.template`), files or folders it can't open, and Dockerfiles `--dockerfile` would reject.
 

@@ -8,14 +8,13 @@ from wheelgap.cli import main
 from wheelgap.dockerfile import final_from
 from wheelgap.suggest_targets import (
     _Flow,
+    _NotRead,
     _runner_os,
     _same,
     _Scalar,
     _split_key,
-    _starts,
-    _strip_comment,
-    _unquote,
     _Unsure,
+    _value,
     runner_target,
     suggest,
 )
@@ -25,6 +24,10 @@ def run(capsys, *argv):
     code = main(list(argv))
     out = capsys.readouterr()
     return code, out.out, out.err
+
+
+NOT_READ = "uses YAML this scanner doesn't read: "
+JOB_NOT_READ = " (neither its runner nor its Python is read)"
 
 
 def workflow(tmp_path, text, name="ci.yml"):
@@ -165,8 +168,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest,
-             [windows-latest]]
+        os: [ubuntu-latest, [windows-latest]]
   nomatrix:
     runs-on: ${{ matrix.os }}
   expression:
@@ -196,22 +198,23 @@ jobs:
     assert unreadable(found) == [
         (path, 8, "job wheels: the matrix is computed (${{ fromJSON(needs.plan.outputs.matrix) }})"),
         (path, 13, "job computed: matrix.runner is computed (${{ fromJSON(inputs.runners) }})"),
-        (path, 18, "job multiline: can't read [ubuntu-latest, [windows-latest]]"),
-        (path, 21, "job nomatrix: the job has no strategy.matrix"),
+        (path, 17, "job multiline: the matrix has values that aren't a plain list"),
+        (path, 20, "job nomatrix: the job has no strategy.matrix"),
         (
             path,
-            23,
+            22,
             "job expression: runs-on: ${{ inputs.os == 'arm' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }} "
             "is an expression",
         ),
-        (path, 25, "job self: runs-on [self-hosted, linux, ARM64] isn't a single label"),
-        (path, 27, "job group: runs-on with several labels or a group isn't a single label"),
-        (path, 30, "job custom: build-box-1 isn't a GitHub-hosted runner wheelgap knows"),
-        (path, 33, "job container: runs in a container, whose platform isn't read"),
+        (path, 24, "job self: runs-on [self-hosted, linux, ARM64] isn't a single label"),
+        (path, 26, "job group: runs-on with a group or labels isn't a single label"),
+        (path, 29, "job custom: build-box-1 isn't a GitHub-hosted runner wheelgap knows"),
+        (path, 32, "job container: runs in a container, whose platform isn't read"),
         (
             path,
-            40,
-            "job ambiguous: can't tell whether GitHub counts 'macos-latest' and 'MACOS-LATEST' as the same value",
+            39,
+            "job ambiguous: can't tell whether GitHub counts 'macos-latest' and 'MACOS-LATEST' as the same value "
+            "(neither its runner nor its Python is read)",
         ),
     ]
 
@@ -295,7 +298,7 @@ jobs:
         ("'3.x'", "python-version 3.x isn't a CPython version wheelgap can read"),
         ("pypy3.10", "python-version pypy3.10 isn't a CPython version wheelgap can read"),
         ("'>=3.11'", "python-version >=3.11 isn't a CPython version wheelgap can read"),
-        ("|\n            3.12\n            3.13", "python-version: a multi-line value"),
+        ("|\n            3.12\n            3.13", "python-version: a multi-line value isn't read"),
     ],
 )
 def test_python_versions_it_cant_read(tmp_path, value, reason):
@@ -529,123 +532,162 @@ def test_runner_os(label, os_):
     assert _runner_os(label) == os_
 
 
-@pytest.mark.parametrize(
-    ("text", "expected"),
-    [
-        ('"3.13"', ("3.13", True)),
-        ("'it''s'", ("it's", True)),
-        ("ubuntu-latest", ("ubuntu-latest", False)),
-        ('"a\\b"', "can't read the escapes"),
-        ('"a"b"', "can't read"),
-        ("'a'b'", "can't read"),
-        ('"abc', "can't read"),
-        ("'", "can't read"),
-        ("", "no value"),
-        ("*alias", "can't read"),
-        ("&anchor x", "can't read"),
-        ("- x", "can't read"),
-        ("? x", "can't read"),
-        ("!!str x", "can't read"),
-    ],
-)
-def test_unquote(text, expected):
-    if isinstance(expected, tuple):
-        scalar = _unquote(text, 1)
-        assert (scalar.text, scalar.quoted) == expected
-    else:
-        with pytest.raises(_Unsure, match=expected):
-            _unquote(text, 1)
-
-
-# Each case was checked against PyYAML 6.0.3 (`yaml.safe_load("x: " + text)`): where the reader gives a value, it's
-# PyYAML's; where PyYAML reads something else (a mapping, nesting, an anchor) or errors, the reader refuses.
+# Each accepted case was checked against PyYAML 6.0.3 (`yaml.safe_load("x: " + text)`): where the reader gives a value,
+# it's PyYAML's. Everything else is outside the YAML the scanner reads, valid YAML or not.
 FLOWS = [
     ("[a, 'b, c', \"d\"]", ["a", "b, c", "d"]),
-    ("[it's, a\"b]", ["it's", 'a"b']),  # a quote inside a plain item is literal
-    ("[windows-latest, it's]", ["windows-latest", "it's"]),
-    ("{os: it's, python: a\"b}", {"os": "it's", "python": 'a"b'}),
     ("[a,]", ["a"]),
-    ("[a:b]", ["a:b"]),
     ("[a b, c]", ["a b", "c"]),
     ("[ a , b ]", ["a", "b"]),
     ("[]", []),
-    ("['it''s']", ["it's"]),
+    ("{}", {}),
+    ("[-x, a-b]", ["-x", "a-b"]),
     ('[{os: x, python: "3.13"}, {os: y}]', [{"os": "x", "python": "3.13"}, {"os": "y"}]),
     ("[{os: a}, b]", [{"os": "a"}, "b"]),
     ("{os: x, python: '3.13'}", {"os": "x", "python": "3.13"}),
-    ("[k: v]", None),  # [{k: v}]
-    ('["x": y]', None),  # [{x: y}]
-    ("[?b]", None),  # [{b: null}]
-    ("{a:b}", None),  # {"a:b": null}
-    ("[a,#b]", None),  # an error
-    ("[a #b]", None),  # an error
-    ("[a, [b]]", None),
-    ("[a, {b: [c]}]", None),
+    ("{\"A\": b, 'C': d}", {"A": "b", "C": "d"}),
+    ("[a, [b]]", ["a", ["b"]]),
+    ("{a: {b: [c]}}", {"a": {"b": ["c"]}}),
+    # Not read:
+    ("[it's]", None),  # a quote inside a plain item
+    ('[a"b]', None),
+    ("[a:b]", None),  # a colon in a plain item
+    ("{a:b}", None),
+    ('{"A":"b #"}', None),  # JSON's key:value with no space
+    ("{A: x:'y}", None),
+    ("{A: a - 'b}", None),
+    ('{A: &a "b #"}', None),  # an anchor in a flow collection
+    ('[!!str "b #"]', None),  # a tag
+    ('{? "a #" : b}', None),
+    ("[*x]", None),
+    ("[k: v]", None),  # a mapping in a list
+    ('["x": y]', None),
+    ("[?b]", None),
+    ("[a,#b]", None),
+    ("[a #b]", None),
     ("[a,,b]", None),
     ('["a" b]', None),
     ("[- a]", None),
     ('["a\\tb"]', None),  # an escape
-    ("[&x a]", None),
-    ("[*x]", None),
-    ("[!!str a]", None),
+    ("['it''s']", None),
     ("[a", None),
     ("['a]", None),
+    ("{a: b, a: c}", None),  # a key twice
 ]
 
 
-def _plain(value):
+def _plain_data(value):
     if isinstance(value, list):
-        return [_plain(v) for v in value]
+        return [_plain_data(v) for v in value]
     if isinstance(value, dict):
-        return {k: _plain(v) for k, v in value.items()}
+        return {k: _plain_data(v) for k, v in value.items()}
     return value.text
 
 
 @pytest.mark.parametrize(("text", "expected"), FLOWS)
 def test_flow(text, expected):
     if expected is None:
-        with pytest.raises(_Unsure):
-            _Flow(text, 1).read()
+        with pytest.raises(_NotRead):
+            flow = _Flow(text, 1)
+            flow.collection()
+            if flow.pos != len(text):
+                raise _NotRead(1, text)
     else:
-        assert _plain(_Flow(text, 1).read()) == expected
+        flow = _Flow(text, 1)
+        assert _plain_data(flow.collection()) == expected
+        assert flow.pos == len(text)
 
 
-@pytest.mark.parametrize(("text", "expected"), FLOWS)
+@pytest.mark.parametrize(("text", "expected"), [(t, e) for t, e in FLOWS if e is not None])
 def test_flow_matches_pyyaml(text, expected):
     yaml = pytest.importorskip("yaml")
-    if expected is not None:
-        assert yaml.safe_load("x: " + text)["x"] == expected
+    assert yaml.safe_load("x: " + text)["x"] == expected
 
 
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
-        ("a # c", "a"),
-        ("a#b", "a#b"),
-        ("# c", ""),
-        ('"a # b" # c', '"a # b"'),
-        ("'it''s # x' # c", "'it''s # x'"),
-        ('"a\\" # b" # c', '"a\\" # b"'),
-        ("key: it's # c", "key: it's"),
-        ("a\t# c", "a"),
+        # Plain scalars: indicators only matter first; `: ` and ` #` anywhere.
+        ("ubuntu-latest", ("ubuntu-latest", False)),
+        ("actions/setup-python@v6", ("actions/setup-python@v6", False)),
+        ("github.ref == 'refs/heads/main' && x", ("github.ref == 'refs/heads/main' && x", False)),
+        ('echo "a" [b] {c} | d > e & f * g ! h % i', ('echo "a" [b] {c} | d > e & f * g ! h % i', False)),
+        ("${{ matrix.os }}", ("${{ matrix.os }}", False)),
+        ("a#b", ("a#b", False)),
+        ("a # comment", ("a", False)),
+        ("a\t# comment", ("a", False)),
+        ("x:'y", ("x:'y", False)),
+        ("-1", ("-1", False)),
+        ("nbsp # not a comment", ("nbsp # not a comment", False)),
+        ("'it'", ("it", True)),
+        ('"a # b"  # c', ("a # b", True)),
+        ("''", ("", True)),
+        ("# just a comment", None),
+        ("", None),
+        # Not read:
+        ("a: b", "refused"),
+        ("a:", "refused"),
+        ("&a value", "refused"),
+        ("*a value", "refused"),
+        ("!!str x", "refused"),
+        ("? x", "refused"),
+        (": x", "refused"),
+        ("- x", "refused"),
+        ("%x", "refused"),
+        ("@x", "refused"),
+        ("`x", "refused"),
+        ("'it''s'", "refused"),
+        ("'a'b", "refused"),
+        ("'a'#c", "refused"),  # `#` straight after a quote isn't a comment
+        ('"a', "refused"),
+        ("[a]x", "refused"),
+        ("[a]#c", "refused"),
+        ("|x", "refused"),
+        ("|-2x", "refused"),
+        ("&a |", "refused"),
+        ("!!str |", "refused"),
     ],
 )
-def test_strip_comment(text, expected):
-    assert _strip_comment(text) == expected
+def test_value(text, expected):
+    if expected == "refused":
+        with pytest.raises(_NotRead):
+            _value(text, 1)
+        return
+    value, _ = _value(text, 1)
+    assert (value if value is None else (value.text, value.quoted)) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [
+        ("|", "a multi-line value"),
+        (">-", "a multi-line value"),
+        ("|2", "a multi-line value"),
+        ("|+1  # c", "a multi-line value"),
+        ("*anchor", "an alias"),
+        ('"a\\tb"', "a quoted value with escapes"),
+        ('"a\\"b" # c', "a quoted value with escapes"),
+    ],
+)
+def test_values_that_are_never_read(text, kind):
+    value, _ = _value(text, 1)
+    assert value.what == kind
 
 
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
+        ("runs-on: x", ("runs-on", "x")),
+        ("on:", ("on", "")),
+        ("key:\tx", ("key", "x")),
         ('"on": push', ("on", "push")),
         ("'a b': c", ("a b", "c")),
-        ('"runs-on":', ("runs-on", "")),
-        ('"a"x: y', None),
-        ('"a":x', None),
-        ('"a', None),
         ("a:b", None),
-        ("a:", ("a", "")),
-        ("key: v: w", ("key", "v: w")),
+        ("a b: c", None),
+        ('"arch\\x69tecture": x86', None),  # escapes in a quoted key
+        ("'it''s': x", None),
+        ("<<: *defaults", None),
+        ("? key", None),
         ("[a]: b", None),
         ("plain text", None),
     ],
@@ -681,177 +723,209 @@ JOB = "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
 @pytest.mark.parametrize(
     ("text", "targets", "refused"),
     [
-        # Documents.
-        ("--- # a comment\n" + JOB, [("linux-x86_64", CI, 4)], []),
-        ("---\n" + JOB + "...\n", [("linux-x86_64", CI, 4)], []),
-        ("--- on: push\n" + JOB, [], [(1, "content on the --- line")]),
-        (JOB + "---\n" + JOB, [], [(4, "more than one YAML document")]),
-        (JOB + "...\nname: x\n", [], [(5, "content after the end of the YAML document")]),
-        # The file and its jobs.
-        (JOB + "jobs:\n  b:\n    runs-on: windows-latest\n", [], [(4, "jobs is set twice")]),
-        ("name: x\n", [], [(None, "no jobs")]),
-        ("jobs: {test: {runs-on: ubuntu-latest}}\n", [], [(1, "can't read the jobs")]),
-        ("jobs:\n  - test\n", [], [(1, "can't read the jobs")]),
-        ("jobs:\n\ttest:\n", [], [(2, "tab in indentation")]),
+        (("--- # a comment\n" + JOB), [("linux-x86_64", ".github/workflows/ci.yml", 4)], []),
+        (("---\n" + JOB + "...\n"), [], [(5, "uses YAML this scanner doesn't read: ...")]),
+        (("--- on: push\n" + JOB), [], [(1, "uses YAML this scanner doesn't read: --- on: push")]),
+        ((JOB + "---\n" + JOB), [], [(4, "uses YAML this scanner doesn't read: ---")]),
+        ((JOB + "...\nname: x\n"), [], [(4, "uses YAML this scanner doesn't read: ...")]),
+        ((JOB + "jobs:\n  b:\n    runs-on: windows-latest\n"), [], [(4, "jobs is set twice")]),
+        (("name: x\n"), [], [(None, "no jobs")]),
+        (("jobs: {test: {runs-on: ubuntu-latest}}\n"), [("linux-x86_64", ".github/workflows/ci.yml", 1)], []),
+        (("jobs:\n  - test\n"), [], [(1, "can't read the jobs")]),
+        (("jobs:\n\ttest:\n"), [], [(2, "uses YAML this scanner doesn't read: test:")]),
         (
-            JOB + "  test:\n    runs-on: windows-latest\n  other:\n    runs-on: macos-14\n",
-            [("macos-arm64", CI, 7)],
+            (JOB + "  test:\n    runs-on: windows-latest\n  other:\n    runs-on: macos-14\n"),
+            [("macos-arm64", ".github/workflows/ci.yml", 7)],
             [(2, "job test is defined more than once"), (4, "job test is defined more than once")],
         ),
-        # A quoted value over several lines is joined, so it hides nothing; it's only refused where it's read.
-        ('name: "a\n  b"\n' + JOB, [("linux-x86_64", CI, 5)], []),
-        ("env:\n  A: 'x\n    y'\n" + JOB, [("linux-x86_64", CI, 6)], []),
+        (('name: "a\n  b"\n' + JOB), [], [(1, "uses YAML this scanner doesn't read: name: \"a")]),
+        (("env:\n  A: 'x\n    y'\n" + JOB), [], [(2, "uses YAML this scanner doesn't read: A: 'x")]),
         (
-            'jobs:\n  test:\n    runs-on: "ubuntu-\n      latest"\n',
+            ('jobs:\n  test:\n    runs-on: "ubuntu-\n      latest"\n'),
             [],
-            [(3, "job test: runs-on: a quoted value over several lines")],
+            [(3, "uses YAML this scanner doesn't read: runs-on: \"ubuntu-")],
         ),
-        ("name: [a,\n  b\n", [], [(1, "[a, isn't closed before the end of the file")]),
-        # A job.
+        (("name: [a,\n  b\n"), [], [(1, "uses YAML this scanner doesn't read: name: [a,")]),
         (
-            "jobs:\n  test: *job\n",
+            ("jobs:\n  test: *job\n"),
             [],
             [(2, "job test: can't read the job (neither its runner nor its Python is read)")],
         ),
         (
-            "jobs:\n  test:\n    <<: *defaults\n    runs-on: ubuntu-latest\n",
+            ("jobs:\n  test:\n    <<: *defaults\n    runs-on: ubuntu-latest\n"),
             [],
-            [(2, "job test: can't read the job (neither its runner nor its Python is read)")],
+            [(3, "uses YAML this scanner doesn't read: <<: *defaults")],
         ),
-        ("jobs:\n  test:\n    steps: []\n", [], [(2, "job test: no runs-on line")]),
-        ("jobs:\n  call:\n    uses: ./.github/workflows/x.yml\n", [], []),
-        ('jobs:\n  test:\n    name: "Build\n      it"\n    runs-on: windows-latest\n', [("win-amd64", CI, 5)], []),
-        # Steps.
+        (("jobs:\n  test:\n    steps: []\n"), [], [(2, "job test: no runs-on line")]),
+        (("jobs:\n  call:\n    uses: ./.github/workflows/x.yml\n"), [], []),
         (
-            JOB + "    steps: [{uses: actions/setup-python@v6}]\n",
+            ('jobs:\n  test:\n    name: "Build\n      it"\n    runs-on: windows-latest\n'),
+            [],
+            [(3, "uses YAML this scanner doesn't read: name: \"Build")],
+        ),
+        (
+            (JOB + "    steps: [{uses: actions/setup-python@v6}]\n"),
             [],
             [
                 (
                     4,
-                    "job test: steps: [{uses: actions/setup-python@v6}] isn't read "
-                    "(neither its runner nor its Python is read)",
+                    "job test: steps: [{uses: actions/setup-python@v6}] isn't read" + JOB_NOT_READ,
                 )
             ],
         ),
         (
-            JOB + "    steps: *steps\n",
+            (JOB + "    steps: *steps\n"),
             [],
             [(4, "job test: steps: *steps isn't read (neither its runner nor its Python is read)")],
         ),
         (
-            JOB + "    steps:\n      - { uses: actions/setup-python@v6, with: {python-version: '3.13'} }\n",
+            (JOB + "    steps:\n      - { uses: actions/setup-python@v6, with: {python-version: '3.13'} }\n"),
+            [("linux-x86_64", ".github/workflows/ci.yml", 3)],
+            [],
+        ),
+        (
+            (JOB + "    steps:\n      - uses: actions/setup-python@v6\n        with: { python-version: '3.13' }\n"),
+            [("linux-x86_64", ".github/workflows/ci.yml", 3)],
+            [],
+        ),
+        (
+            (
+                JOB + "    steps:\n      - uses: actions/setup-python@v6\n        with:\n"
+                '          cache: "pip\n          python-version: 3.9\n          "\n'
+            ),
+            [],
+            [(7, "uses YAML this scanner doesn't read: cache: \"pip")],
+        ),
+        (
+            (
+                JOB + "    steps:\n      - uses: actions/setup-python@v6\n        with:\n"
+                "          x: [a,\n          python-version: 3.9\n          ]\n"
+            ),
+            [],
+            [(7, "uses YAML this scanner doesn't read: x: [a,")],
+        ),
+        (
+            (
+                "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
+                "        os: ubuntu-latest\n"
+            ),
             [],
             [
                 (
                     5,
-                    "job test: can't read the step { uses: actions/setup-python@v6, with: {python-version: '3.13'} } "
-                    "(neither its runner nor its Python is read)",
+                    "job test: the matrix has values that aren't a plain list" + JOB_NOT_READ,
                 )
             ],
         ),
         (
-            JOB + "    steps:\n      - uses: actions/setup-python@v6\n        with: { python-version: '3.13' }\n",
+            ("jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        - ubuntu-latest\n"),
             [],
-            [(6, "job test: with: { python-version: '3.13' } isn't read (neither its runner nor its Python is read)")],
+            [(5, "job test: can't read the matrix (neither its runner nor its Python is read)")],
         ),
         (
-            # The continued quote swallows the next line, as YAML does: setup-python has no python-version.
-            JOB + "    steps:\n      - uses: actions/setup-python@v6\n        with:\n"
-            '          cache: "pip\n          python-version: 3.9\n          "\n',
-            [("linux-x86_64", CI, 3)],
-            [(5, "job test: setup-python with no python-version (it reads .python-version, or uses the runner's)")],
-        ),
-        (
-            # The same with a flow list.
-            JOB + "    steps:\n      - uses: actions/setup-python@v6\n        with:\n"
-            "          x: [a,\n          python-version: 3.9\n          ]\n",
-            [("linux-x86_64", CI, 3)],
-            [(5, "job test: setup-python with no python-version (it reads .python-version, or uses the runner's)")],
-        ),
-        # The runner.
-        (
-            "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: ubuntu-latest\n",
-            [],
-            [(5, "job test: the matrix has values that aren't a plain list")],
-        ),
-        (
-            "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        - ubuntu-latest\n",
-            [],
-            [(5, "job test: can't read the matrix")],
-        ),
-        (
-            "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
-            "        os:\n          - ${{ inputs.os }}\n",
+            (
+                "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
+                "        os:\n          - ${{ inputs.os }}\n"
+            ),
             [],
             [(7, "job test: the matrix has a computed value (${{ inputs.os }})")],
         ),
         (
-            "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
-            "        os: [ubuntu-latest]\n        include: x\n",
+            (
+                "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
+                "        os: [ubuntu-latest]\n        include: x\n"
+            ),
             [],
             [(5, "job test: can't read the matrix's include")],
         ),
         (
-            "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
-            "        os: [ubuntu-latest]\n        include:\n          - os: [windows-latest]\n",
+            (
+                "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
+                "        os: [ubuntu-latest]\n        include:\n          - os: [windows-latest]\n"
+            ),
             [],
             [(5, "job test: the matrix's include has values that aren't plain")],
         ),
         (
-            "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
-            "        os: [ubuntu-latest]\n        include:\n          - os: ${{ inputs.os }}\n",
+            (
+                "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
+                "        os: [ubuntu-latest]\n        include:\n          - os: ${{ inputs.os }}\n"
+            ),
             [],
             [(8, "job test: the matrix has a computed value (${{ inputs.os }})")],
         ),
         (
-            "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
-            "        os: [ubuntu-latest]\n        exclude:\n          - arch: x86\n",
+            (
+                "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
+                "        os: [ubuntu-latest]\n        exclude:\n          - arch: x86\n"
+            ),
             [],
-            [(5, "job test: the matrix excludes a key it doesn't have")],
+            [(5, "job test: the matrix excludes a key it doesn't have (neither its runner nor its Python is read)")],
         ),
         (
-            "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
-            "        os: [ubuntu-latest]\n        exclude:\n          - os: ubuntu-latest\n",
+            (
+                "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
+                "        os: [ubuntu-latest]\n        exclude:\n          - os: ubuntu-latest\n"
+            ),
             [],
             [(5, "job test: the matrix is empty (neither its runner nor its Python is read)")],
         ),
         (
-            "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
-            "        python: ['3.13']\n        include:\n          - os: ubuntu-latest\n            python: '3.12'\n",
+            (
+                "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
+                "        python: ['3.13']\n        include:\n"
+                "          - os: ubuntu-latest\n            python: '3.12'\n"
+            ),
             [],
             [(3, "job test: matrix.os isn't set in every matrix combination")],
         ),
         (
-            "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
-            "        os: [ubuntu-latest]\n        include:\n          - OS: windows-latest\n",
+            (
+                "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
+                "        os: [ubuntu-latest]\n        include:\n          - OS: windows-latest\n"
+            ),
             [],
             [(5, "job test: the matrix has keys that differ only in case (OS, os)")],
         ),
         (
-            "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
-            "        os: [ubuntu-latest]\n        n: [0x10, 16]\n        exclude:\n          - n: 16\n",
+            (
+                "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
+                "        os: [ubuntu-latest]\n        n: [0x10, 16]\n        exclude:\n          - n: 16\n"
+            ),
             [],
-            [(7, "job test: can't tell how GitHub reads the unquoted 0x10 (quote it)")],
+            [
+                (
+                    7,
+                    "job test: can't tell how GitHub reads the unquoted 0x10 (quote it)" + JOB_NOT_READ,
+                )
+            ],
         ),
         (
-            "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
-            "        os: [ubuntu-latest]\n        python: ['3.12', 3.13]\n"
-            "        exclude:\n          - python: '3.13'\n",
+            (
+                "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
+                "        os: [ubuntu-latest]\n        python: ['3.12', 3.13]\n"
+                "        exclude:\n          - python: '3.13'\n"
+            ),
             [],
-            [(9, "job test: can't tell whether GitHub counts '3.13' and '3.13' as the same value")],
+            [
+                (
+                    9,
+                    "job test: can't tell whether GitHub counts '3.13' and '3.13' as the same value" + JOB_NOT_READ,
+                )
+            ],
         ),
         (
-            "jobs:\n  test:\n    runs-on: ${{ matrix['os'] }}\n",
+            ("jobs:\n  test:\n    runs-on: ${{ matrix['os'] }}\n"),
             [],
             [(3, "job test: runs-on: ${{ matrix['os'] }} is an expression")],
         ),
         (
-            "jobs:\n  test:\n    runs-on: >-\n      ubuntu-latest\n",
+            ("jobs:\n  test:\n    runs-on: >-\n      ubuntu-latest\n"),
             [],
-            [(3, "job test: runs-on: a multi-line value")],
+            [(3, "job test: runs-on: a multi-line value isn't read")],
         ),
         (
-            "jobs:\n  test:\n    runs-on: 0x10\n",
+            ("jobs:\n  test:\n    runs-on: 0x10\n"),
             [],
             [(3, "job test: can't tell how GitHub reads the unquoted 0x10 (quote it)")],
         ),
@@ -890,6 +964,8 @@ jobs:
 
 
 def test_multi_line_flow_lists(tmp_path):
+    # The one form read: `[` ending the key's line (or alone on the next one, as Prettier writes it), one item per
+    # line with a comma after all but the last, and `]` on its own line. Each item keeps its own line.
     targets, refused, found = read(
         tmp_path,
         """\
@@ -904,51 +980,48 @@ jobs:
 
           macos-14
         ]
-        python: ["3.12",
-                 "3.13"]
+        python:
+          [
+            "3.12",
+            '3.13',
+          ]
         include: [
-          {os: ubuntu-24.04-arm, python: "3.14t"}]
+          {os: ubuntu-24.04-arm, python: "3.14t"}
+        ]
     steps:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
 """,
     )
-    # A flow collection over several lines is read as one value, from its first line.
     assert refused == []
     assert targets == [
-        ("linux-x86_64", CI, 6),
-        ("macos-arm64", CI, 6),
-        ("win-amd64", CI, 6),
-        ("linux-aarch64", CI, 14),
+        ("linux-x86_64", CI, 7),
+        ("win-amd64", CI, 8),
+        ("macos-arm64", CI, 10),
+        ("linux-aarch64", CI, 18),
     ]
-    assert [(f.value, f.line) for f in found.pythons] == [("3.12", 12), ("3.13", 12), ("3.14t", 14)]
-    workflow(
-        tmp_path,
-        """\
-jobs:
-  test:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [
-          ubuntu-latest,  # a comment
-          "windows-latest",
+    assert [(f.value, f.line) for f in found.pythons] == [("3.12", 14), ("3.13", 15), ("3.14t", 18)]
 
-          macos-14
-        ]
-        python: ["3.12",
-                 '3.13']
-    steps:
-      - uses: actions/setup-python@v6
-        with:
-          python-version: ${{ matrix.python }}
-""",
+
+@pytest.mark.parametrize(
+    ("value", "line"),
+    [
+        ('["3.12",\n                 "3.13"]', 6),  # items on the line with `[`
+        ("[\n          '3.12', '3.13',\n        ]", 7),  # two items on a line
+        ("[\n          '3.12'\n          '3.13'\n        ]", 8),  # a missing comma
+        ("[\n          '3.12',", 6),  # never closed
+        ("[\n        '3.12',\n        ]", 7),  # an item no deeper than its key
+        ("\n          ['3.12', '3.13']", 7),  # a one-line flow list on the next line
+    ],
+)
+def test_flow_lists_over_several_lines_in_other_forms_are_refused(tmp_path, value, line):
+    _, refused, _ = read(
+        tmp_path,
+        "jobs:\n  test:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        python: " + value + "\n",
     )
-    found = suggest(tmp_path)
-    assert where(found.targets) == [("linux-x86_64", CI, 6), ("macos-arm64", CI, 6), ("win-amd64", CI, 6)]
-    assert where(found.pythons) == [("3.12", CI, 12), ("3.13", CI, 12)]
-    assert found.unreadable == []
+    assert refused[0][0] == line
+    assert refused[0][1].startswith("uses YAML this scanner doesn't read")
 
 
 def test_block_scalars_are_skipped(tmp_path):
@@ -1297,14 +1370,6 @@ WHOLE_JOB = " (neither its runner nor its Python is read)"
     [
         # A setup step whose uses can't be read might set the architecture: the job isn't read at all.
         ("      - uses: *sp\n", (5, "can't read the uses: *sp of a step")),
-        (
-            "      - uses: &sp actions/setup-python@v6\n",
-            (5, "can't read the uses: &sp actions/setup-python@v6 of a step"),
-        ),
-        (
-            "      - uses: !!str actions/setup-python@v6\n",
-            (5, "can't read the uses: !!str actions/setup-python@v6 of a step"),
-        ),
         ("      - uses: >-\n          actions/setup-python@v6\n", (5, "can't read the uses: >- of a step")),
         (
             "      - uses:\n          actions/setup-python@v6\n",
@@ -1334,6 +1399,7 @@ WHOLE_JOB = " (neither its runner nor its Python is read)"
     ],
 )
 def test_setup_steps_it_cant_read_refuse_the_job(tmp_path, steps, refused):
+    # (An anchored or tagged uses: isn't in the grammar at all, so its file isn't read: see test_value.)
     targets, got, found = read(tmp_path, SETUP + steps)
     assert targets == []
     assert found.pythons == []
@@ -1371,9 +1437,9 @@ def test_a_step_with_if_and_no_interpreter_inputs_is_read(tmp_path):
 def test_quoted_keys_with_escapes_refuse_the_file(tmp_path, line, key):
     targets, refused, _ = read(tmp_path, SETUP + "      - uses: actions/setup-python@v6\n        with:\n" + line)
     assert targets == []
-    assert refused == [(7, f"can't read the escapes in the key {key}")]
+    assert refused == [(7, f"uses YAML this scanner doesn't read: {line.strip()}")]
     _, refused, _ = read(tmp_path, '"contain\\x65r": x\n' + JOB)
-    assert refused == [(1, 'can\'t read the escapes in the key "contain\\x65r"')]
+    assert refused == [(1, 'uses YAML this scanner doesn\'t read: "contain\\x65r": x')]
 
 
 def test_free_threading_starts_at_313(tmp_path):
@@ -1402,15 +1468,17 @@ def test_freethreaded_is_a_setup_python_input_only(tmp_path):
     ("header", "refused"),
     [
         ("%YAML 1.2\n---\n", []),
-        ("%YAML 1.1\n---\n", [(1, "the %YAML 1.1 directive isn't read (only %YAML 1.2 before the document is)")]),
+        ("%YAML 1.1\n---\n", [(1, "uses YAML this scanner doesn't read: %YAML 1.1")]),
         (
             "%TAG ! tag:example.com,2000:\n---\n",
-            [(1, "the %TAG ! tag:example.com,2000: directive isn't read (only %YAML 1.2 before the document is)")],
+            [(1, "uses YAML this scanner doesn't read: %TAG ! tag:example.com,2000:")],
         ),
-        ("  ---\n", [(1, "can't read ---")]),  # indented: not a document marker
-        ("---x\n", [(1, "can't read ---x")]),
-        ("----\n", [(1, "can't read ----")]),
-        ("? jobs\n", [(1, "can't read ? jobs")]),
+        ("%YAML 1.2\n", [(2, "uses YAML this scanner doesn't read: jobs:")]),  # %YAML must be followed by ---
+        ("  ---\n", [(1, "uses YAML this scanner doesn't read: ---")]),  # indented: not a document marker
+        ("---x\n", [(1, "uses YAML this scanner doesn't read: ---x")]),
+        ("----\n", [(1, "uses YAML this scanner doesn't read: ----")]),
+        ("--- # a comment\n", []),
+        ("? jobs\n", [(1, "uses YAML this scanner doesn't read: ? jobs")]),
     ],
 )
 def test_directives_and_markers(tmp_path, header, refused):
@@ -1436,7 +1504,7 @@ jobs:
             architecture: arm64
           - os: ubuntu-latest
             architecture: x86
-          - {os: macos-14, architecture: x64, name: it's}
+          - {os: macos-14, architecture: x64, name: intel}
     steps:
       - uses: actions/setup-python@v6
         with:
@@ -1472,26 +1540,45 @@ jobs:
     assert refused == [(3, "job test: setup-python's architecture: arm64 on ubuntu-24.04 isn't read")]
 
 
-def test_continued_lines_follow_yaml_quoting_and_comments(tmp_path):
+@pytest.mark.parametrize(
+    ("env", "refused"),
+    [
+        # Quoted values over several lines aren't in the grammar, whatever they hold.
+        ('  A: "x \\" # not a comment\n    y"\n', (2, 'A: "x \\" # not a comment')),
+        ("  B: 'it''s # not a comment\n    either'\n", (2, "B: 'it''s # not a comment")),
+        ("  C: 'one\n    two'\n", (2, "C: 'one")),
+        # A plain value goes on over more-indented lines: those are text, never keys.
+        ('  D: echo building\n    "quoted\n    runs-on: windows-latest\n', (4, "runs-on: windows-latest")),
+    ],
+)
+def test_values_over_several_lines(tmp_path, env, refused):
+    _, got, _ = read(tmp_path, "env:\n" + env + JOB)
+    assert got == [(refused[0], f"uses YAML this scanner doesn't read: {refused[1]}")]
+
+
+def test_plain_values_over_several_lines_are_skipped(tmp_path):
     targets, refused, _ = read(
         tmp_path,
         """\
-env:
-  A: "x \\" # not a comment
-    y"
-  B: 'it''s # not a comment
-    either'
 jobs:
   test:
+    if: github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && "quoted
+      - looks like an item
+      [ or a list {
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, # windows-latest,
-             macos-14]
+        os: [ubuntu-latest, macos-14]  # windows-latest
+    steps:
+      - run: pip install
+          numpy
+      - run:
+          tox -e py
 """,
     )
     assert refused == []
-    assert targets == [("linux-x86_64", CI, 11), ("macos-arm64", CI, 11)]
+    assert targets == [("linux-x86_64", CI, 10), ("macos-arm64", CI, 10)]
 
 
 def test_dockerfile_names(tmp_path):
@@ -1529,7 +1616,7 @@ jobs:
 """,
     )
     assert targets == [("linux-x86_64", CI, 3)]
-    assert refused == [(16, "job other: runs-on: a value on the line after the key")]
+    assert refused == [(16, "job other: runs-on: a value over several lines isn't read")]
 
 
 X86 = (
@@ -1539,63 +1626,50 @@ X86 = (
 
 
 @pytest.mark.parametrize(
-    ("before", "label"),
+    ("before", "refused"),
     [
-        # A quote after `:` with no space is part of a plain scalar, so it can't swallow the lines after it.
-        ("    env: {A: x:'y}\n", "quote after a colon in a flow mapping"),
-        ('    env: {A: x:"y, B: z}\n', "double quote after a colon"),
-        ("    env:\n      A: x:'y # a comment\n", "quote after a colon in a block mapping"),
-        ("    env:\n      A: it's [not a list\n", "quote and bracket inside a plain scalar"),
-        # A further line of a plain scalar never starts a quoted value or flow collection of its own.
-        ('    steps:\n      - run: echo building\n          "quoted\n', "quote on a continuation line"),
-        ("    steps:\n      - run: echo building\n          - 'quoted\n", "- ' on a continuation line"),
-        ("    steps:\n      - run: echo building\n          [not, closed\n", "[ on a continuation line"),
-        ("    steps:\n      - run: echo building\n          {not: closed\n", "{ on a continuation line"),
+        # A quote or bracket inside a plain block scalar is an ordinary character: read.
+        ("    env:\n      A: x:'y # a comment\n", None),
+        ("    env:\n      A: it's [not a list\n", None),
+        # Further lines of a plain scalar are text, whatever they start with: read.
+        ('    steps:\n      - run: echo building\n          "quoted\n', None),
+        ("    steps:\n      - run: echo building\n          - 'quoted\n", None),
+        ("    steps:\n      - run: echo building\n          [not, closed\n", None),
+        ("    steps:\n      - run: echo building\n          {not closed\n", None),
+        # (`: ` in a further line would make the YAML invalid, so that's refused.)
+        ("    steps:\n      - run: echo building\n          {not: closed\n", (6, "{not: closed")),
+        # Outside the grammar (the review's cases): the file isn't read.
+        ("    env: {A: x:'y}\n", (4, "env: {A: x:'y}")),
+        ('    env: {A: x:"y, B: z}\n', (4, 'env: {A: x:"y, B: z}')),
+        ('    env: {"A":"b #"}\n', (4, 'env: {"A":"b #"}')),
+        ("    env: {A: a - 'b}\n", (4, "env: {A: a - 'b}")),
+        ('    env: {A: &a "b #"}\n', (4, 'env: {A: &a "b #"}')),
+        ('    env: [!!str "b #"]\n', (4, 'env: [!!str "b #"]')),
+        ('    env: {? "a #" : b}\n', (4, 'env: {? "a #" : b}')),
+        ("    env: [a\n      'b]\n", (4, "env: [a")),
+        ('    env:\n      A: &a "b\n', (5, 'A: &a "b')),
+        ('    env: ""#K: \'\n', (4, 'env: ""#K: \'')),
     ],
 )
-def test_quotes_and_brackets_only_open_where_yaml_opens_them(tmp_path, before, label):
+def test_quotes_and_brackets_are_read_as_yaml_or_refused(tmp_path, before, refused):
     steps = "" if "steps:" in before else "    steps:\n"
-    targets, refused, found = read(tmp_path, SETUP.split("    steps:\n")[0] + before + steps + X86)
-    assert targets == [("win32", CI, 3)], label
-    assert [f.value for f in found.pythons] == ["3.13"]
-    assert refused == []
-
-
-@pytest.mark.parametrize(
-    ("text", "flow", "expected"),
-    [
-        ("'a", False, True),
-        ("key: 'a", False, True),
-        ("- 'a", False, True),
-        ("x:'y", False, False),
-        ("it's", False, False),
-        ("a 'b", False, False),
-        ("a- 'b", False, False),  # a dash inside a word isn't a list item
-        ("[a, 'b", True, True),
-        ("[a,'b", True, True),
-        ("['b", True, True),
-        ("{a: 'b", True, True),
-        ("[a 'b", True, False),
-        ("[a,'b", False, False),  # outside a flow collection a comma is an ordinary character
-    ],
-)
-def test_where_a_quote_starts(text, flow, expected):
-    assert _starts(text, text.rindex("'"), flow) is expected
+    targets, got, found = read(tmp_path, SETUP.split("    steps:\n")[0] + before + steps + X86)
+    if refused is None:
+        assert targets == [("win32", CI, 3)]
+        assert [f.value for f in found.pythons] == ["3.13"]
+        assert got == []
+    else:
+        assert targets == [] and found.pythons == []
+        assert got == [(refused[0], f"uses YAML this scanner doesn't read: {refused[1]}")]
 
 
 @pytest.mark.parametrize(
     ("line", "refused"),
     [
-        ("    env:\n      A: &a |\n        jobs: x\n", (5, "a block scalar with an anchor or tag (&a |) isn't read")),
-        (
-            "    env:\n      A: !!str >-\n        jobs: x\n",
-            (5, "a block scalar with an anchor or tag (!!str >-) isn't read"),
-        ),
-        (
-            "    steps:\n      - &s !!str |\n        x\n",
-            (5, "a block scalar with an anchor or tag (&s !!str |) isn't read"),
-        ),
-        ("    env:\n      A:\n        |\n        x\n", (6, "a block scalar (|) on the line after A: isn't read")),
+        ("    env:\n      A: &a |\n        jobs: x\n", (5, "uses YAML this scanner doesn't read: A: &a |")),
+        ("    env:\n      A: !!str >-\n        jobs: x\n", (5, "uses YAML this scanner doesn't read: A: !!str >-")),
+        ("    steps:\n      - &s !!str |\n        x\n", (5, "uses YAML this scanner doesn't read: - &s !!str |")),
+        ("    env:\n      A:\n        |\n        x\n", (6, "uses YAML this scanner doesn't read: |")),
     ],
 )
 def test_block_scalars_with_properties_refuse_the_file(tmp_path, line, refused):
@@ -1621,7 +1695,10 @@ def test_block_scalars_with_properties_refuse_the_file(tmp_path, line, refused):
             [(3, "job test: runs-on: ${{\u00a0matrix.os }} is an expression")],
         ),
         # A line starting with NBSP is at column 0: a top-level key, so the job has no runs-on, as YAML reads it.
-        ("jobs:\n  test:\n\u00a0   runs-on: windows-latest\n", [(2, "job test: no runs-on line")]),
+        (
+            "jobs:\n  test:\n\u00a0   runs-on: windows-latest\n",
+            [(3, "uses YAML this scanner doesn't read: \u00a0   runs-on: windows-latest")],
+        ),
     ],
 )
 def test_unicode_spaces_are_ordinary_characters(tmp_path, text, refused):
@@ -1638,7 +1715,7 @@ def test_other_line_breaks_refuse_the_file(tmp_path, brk):
     )
     found = suggest(tmp_path)
     assert found.targets == []
-    assert unreadable(found) == [(CI, 3, f"a line break YAML may read differently ({brk!r})")]
+    assert unreadable(found) == [(CI, 3, f"uses YAML this scanner doesn't read: a line break other than \\n ({brk!r})")]
 
 
 def test_crlf_and_tab_indented_comments_are_fine(tmp_path):
@@ -1694,52 +1771,74 @@ def test_a_refusal_partway_through_the_matrix_keeps_no_targets(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("matrix", "targets", "refused"),
+    ("matrix", "refused"),
     [
+        # Outside the grammar: the file isn't read.
+        ("        os:\n          [ubuntu-latest, windows-latest]\n", (7, NOT_READ + "[ubuntu-latest, windows-latest]")),
+        ("        os: ['ubuntu-latest,\n          windows-latest']\n", (6, NOT_READ + "os: ['ubuntu-latest,")),
+        ("        os: [ubuntu-latest,\n          windows-latest]]\n", (6, NOT_READ + "os: [ubuntu-latest,")),
+        ("        os:\n          - ubuntu-latest\n          arch: x64\n", (8, NOT_READ + "arch: x64")),
+        ("        os: [{a : b}]\n", (6, NOT_READ + "os: [{a : b}]")),
+        ('        os: [{a: "b" c}]\n', (6, NOT_READ + 'os: [{a: "b" c}]')),
+        # Read, but not a matrix the scan can be sure of, so the job might run nothing: the job isn't read.
         (
-            "        os:\n          [ubuntu-latest, windows-latest]\n",
-            [("linux-x86_64", CI, 6), ("win-amd64", CI, 6)],
-            [],
+            "        os: ubuntu-latest\n          windows-latest\n",
+            (6, "job test: os: a value over several lines isn't read" + JOB_NOT_READ),
         ),
-        (
-            "        os: [ubuntu-latest]\n        include: ${{ fromJson(inputs.extra) }}\n",
-            [],
-            [(7, "the matrix's include is computed (${{ fromJson(inputs.extra) }})")],
-        ),
-        (
-            "        os: ['ubuntu-latest,\n          windows-latest']\n",
-            [],
-            [(6, "can't read ['ubuntu-latest, windows-latest'] (a quoted value over several lines)")],
-        ),
-        ("        os: [ubuntu-latest,\n          windows-latest]]\n", None, (7, "can't read windows-latest]]")),
-        ("        os: ubuntu-latest\n          windows-latest\n", [], [(6, "can't read the value of os")]),
-        ("        os:\n", [], [(6, "os has no value")]),
-        ("        os:\n          - ubuntu-latest\n          arch: x64\n", [], [(6, "can't read os")]),
+        ("        os:\n", (6, "job test: os has no value" + JOB_NOT_READ)),
+        ("        os: []\n", (5, "job test: matrix.os is an empty list" + JOB_NOT_READ)),
         (
             "        include:\n          - os: ubuntu-latest\n            os: windows-latest\n",
-            [],
-            [(8, "os is set twice")],
+            (8, "job test: os is set twice" + JOB_NOT_READ),
         ),
-        ("        os: [ubuntu-latest]\n        os: [windows-latest]\n", [], [(7, "os is set twice")]),
-        ("        os: {a: b}\n", [], [(5, "the matrix has values that aren't a plain list")]),
-        ("        os: [{a : b}]\n", [], [(5, "the matrix has values that aren't a plain list")]),
-        ('        os: [{a: "b" c}]\n', [], [(6, 'can\'t read [{a: "b" c}]')]),
+        (
+            "        os: [ubuntu-latest]\n        os: [windows-latest]\n",
+            (7, "job test: os is set twice" + JOB_NOT_READ),
+        ),
+        ("        os: {a: b}\n", (5, "job test: the matrix has values that aren't a plain list" + JOB_NOT_READ)),
+        (
+            "        os: [ubuntu-latest, windows-latest]\n        exclude:\n"
+            "          - os: ubuntu-latest\n            arch: x64\n",
+            (5, "job test: the matrix excludes a key it doesn't have" + JOB_NOT_READ),
+        ),
+        # Computed: refused where it's used (here, by runs-on).
+        (
+            "        os: [ubuntu-latest]\n        include: ${{ fromJson(inputs.extra) }}\n",
+            (7, "job test: the matrix's include is computed (${{ fromJson(inputs.extra) }})"),
+        ),
     ],
 )
-def test_matrix_values(tmp_path, matrix, targets, refused):
+def test_matrix_values(tmp_path, matrix, refused):
     text = "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n" + matrix
-    got_targets, got_refused, _ = read(tmp_path, text)
-    if targets is None:  # the whole file
-        assert got_targets == [] and got_refused == [refused]
-        return
-    assert got_targets == targets
-    assert got_refused == [(line, f"job test: {reason}") for line, reason in refused]
+    targets, got, _ = read(tmp_path, text)
+    assert targets == []
+    assert got == [refused]
+
+
+def test_a_matrix_that_may_be_empty_refuses_a_literal_job(tmp_path):
+    # runs-on doesn't use the matrix, but if its exclude empties it GitHub runs no job; it can't tell here.
+    targets, refused, _ = read(
+        tmp_path,
+        "jobs:\n  test:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        py: [3.13]\n"
+        "        exclude:\n          - py: '3.13'\n",
+    )
+    assert targets == []
+    assert refused == [
+        (8, "job test: can't tell whether GitHub counts '3.13' and '3.13' as the same value" + JOB_NOT_READ)
+    ]
+    # Values that aren't plain still give a combination for sure when nothing is excluded.
+    targets, refused, _ = read(
+        tmp_path,
+        "jobs:\n  test:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        py: [{v: '3.13'}]\n",
+    )
+    assert targets == [("linux-x86_64", CI, 3)]
+    assert refused == []
 
 
 def test_a_stray_line_deep_in_a_job_refuses_the_file(tmp_path):
     _, refused, found = read(tmp_path, SETUP + "      - uses: actions/checkout@v5\n        with:\n          ? weird\n")
     assert found.targets == []
-    assert refused == [(7, "can't read ? weird")]
+    assert refused == [(7, "uses YAML this scanner doesn't read: ? weird")]
 
 
 def test_python_from_a_matrix_key_some_combinations_lack(tmp_path):
@@ -1752,3 +1851,123 @@ def test_python_from_a_matrix_key_some_combinations_lack(tmp_path):
     )
     assert found.pythons == []
     assert refused == [(12, "job test: matrix.python isn't set in every matrix combination")]
+
+
+def test_prettier_lists_on_the_next_line(tmp_path):
+    # The review's case: Prettier puts a long flow list on the lines after its key.
+    targets, refused, found = read(
+        tmp_path,
+        """\
+on: push
+jobs:
+  b:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          [
+            windows-latest,
+            ubuntu-24.04-arm, # c
+            macos-latest,
+          ]
+        include:
+          [
+            { os: windows-latest, arch: x86 },
+            { os: macos-latest, arch: x64 },
+          ]
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.arch }}
+""",
+    )
+    assert refused == []
+    assert sorted(t for t, _, _ in targets) == ["linux-aarch64", "macos-x86_64", "win32"]
+    assert [f.value for f in found.pythons] == ["3.12"]
+
+
+def test_the_same_line_is_listed_once_per_value(tmp_path):
+    # '3.10' and 3.10 on one line are different values: the quoted one is read, the plain one (3.1) refused.
+    _, refused, found = read(
+        tmp_path,
+        "jobs:\n  b:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n"
+        "        include: [{py: '3.10'}, {py: 3.10}]\n    steps:\n      - uses: actions/setup-python@v5\n"
+        "        with:\n          python-version: ${{ matrix.py }}\n",
+    )
+    assert [f.value for f in found.pythons] == ["3.10"]
+    assert refused == [(6, "job b: unquoted 3.10 is the number 3.1 in YAML (quote it)")]
+
+
+def test_anchors_aliases_and_escapes_are_accepted_but_never_read(tmp_path):
+    targets, refused, found = read(
+        tmp_path,
+        """\
+on:
+  push:
+    paths: &paths
+      - src/**
+  pull_request:
+    paths: *paths
+env:
+  WINDOWS_PATH: "C:\\\\tools\\\\bin"
+jobs:
+  test:
+    runs-on: windows-latest
+    env: {MATRIX: {a: [b, c]}, "QUOTED": 'x'}
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+  aliased:
+    runs-on: *runner
+  strategy:
+    runs-on: windows-latest
+    strategy: *strategy
+  escaped:
+    runs-on: "windows\\u002dlatest"
+""",
+    )
+    assert targets == [("win-amd64", CI, 11)]
+    assert [f.value for f in found.pythons] == ["3.13"]
+    assert refused == [
+        (18, "job aliased: runs-on: an alias isn't read"),
+        (
+            21,
+            "job strategy: strategy: *strategy is an alias, which isn't read" + JOB_NOT_READ,
+        ),
+        (23, "job escaped: runs-on: a quoted value with escapes isn't read"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "line"),
+    [
+        # A line under a key or item that already has its value would be invalid YAML; it could also hide a key.
+        ('jobs:\n  test:\n    runs-on: "windows-latest"\n      container: x\n', 4),
+        ("jobs:\n  test:\n    runs-on: [windows-latest]\n      container: x\n", 4),
+        ("jobs:\n  test:\n    runs-on: windows-latest\n    steps:\n      - 'x'\n        uses: y\n", 6),
+        # Keys and items under one parent, or keys that don't line up.
+        ("jobs:\n  test:\n    runs-on: windows-latest\n    - x\n", 4),
+        ("jobs:\n  test:\n      runs-on: windows-latest\n    steps: []\n", 4),
+    ],
+)
+def test_lines_that_dont_fit_the_tree_refuse_the_file(tmp_path, text, line):
+    targets, refused, _ = read(tmp_path, text)
+    assert targets == []
+    assert [r[0] for r in refused] == [line]
+    assert refused[0][1].startswith(NOT_READ)
+
+
+def test_every_comparison_in_an_exclude_is_made(tmp_path):
+    # The os already differs, but whether py matches can't be told (3.13 vs '3.13'): refused, not skipped.
+    targets, refused, _ = read(
+        tmp_path,
+        "jobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n"
+        "        os: [ubuntu-latest]\n        py: [3.13]\n"
+        "        exclude:\n          - {os: macos-latest, py: '3.13'}\n",
+    )
+    assert targets == []
+    assert refused == [
+        (9, "job test: can't tell whether GitHub counts '3.13' and '3.13' as the same value" + JOB_NOT_READ)
+    ]
