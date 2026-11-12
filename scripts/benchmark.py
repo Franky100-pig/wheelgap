@@ -2,11 +2,11 @@
 
     uv run python scripts/benchmark.py                    # N = 100, 500, 2000 x -t everything x 3.12, 3.13, 3.14t
     uv run python scripts/benchmark.py --sizes 500 --explain
-    uv run python scripts/benchmark.py --profile 2000     # cProfile one in-process run, top functions
+    uv run python scripts/benchmark.py --profile 2000 --explain  # cProfile one in-process run, top functions
 
-Each timing is a fresh `python -m wheelgap LOCK --offline --json` process (so nothing is cached between runs),
-best of --repeat. The lockfile is a uv.lock with a root project that depends on every package, some through
-markers, and realistic wheel lists: pure-Python wheels, sdist-only packages, abi3 wheels and numpy-style
+Each timing is a fresh `python -m wheelgap LOCK --offline --no-cache --json` process (so nothing is cached
+between runs), best of --repeat. The lockfile is a uv.lock with a root project that depends on every package,
+some through markers, and realistic wheel lists: pure-Python wheels, sdist-only packages, abi3 wheels and numpy-style
 packages with a wheel per Python and platform. It's generated from a fixed seed, so runs are comparable.
 """
 
@@ -141,13 +141,18 @@ def time_subprocess(lock: Path, pythons: list[str], explain: bool, repeat: int) 
     best = float("inf")
     for _ in range(repeat):
         start = time.perf_counter()
-        subprocess.run(
+        done = subprocess.run(
             [sys.executable, "-m", "wheelgap", *argv(lock, pythons, explain)],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            encoding="utf-8",
+            errors="replace",
         )
-        best = min(best, time.perf_counter() - start)
+        elapsed = time.perf_counter() - start
+        if done.returncode not in (0, 1):  # 1 just means gaps; anything else didn't check the lockfile
+            raise RuntimeError(f"wheelgap exited {done.returncode}:\n{done.stderr}")
+        best = min(best, elapsed)
     return best
 
 
@@ -155,7 +160,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--sizes", type=int, nargs="+", default=[100, 500, 2000], help="package counts")
     parser.add_argument("-p", "--python", action="append", help=f"Pythons to check (default: {' '.join(PYTHONS)})")
-    parser.add_argument("--repeat", type=int, default=3, help="runs per size; the fastest counts (default: 3)")
+    parser.add_argument("--repeat", type=int, default=5, help="runs per size; the fastest counts (default: 5)")
     parser.add_argument("--explain", action="store_true", help="also pass --explain")
     parser.add_argument("--profile", type=int, metavar="N", help="cProfile one in-process run with N packages")
     parser.add_argument("--keep", type=Path, metavar="DIR", help="write the lockfiles here instead of a temp folder")

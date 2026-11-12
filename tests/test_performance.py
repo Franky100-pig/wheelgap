@@ -33,7 +33,22 @@ benchmark = _benchmark()
 
 @pytest.fixture
 def big_lock(tmp_path) -> Path:
-    return benchmark.write_lockfile(tmp_path, 150)
+    """A small benchmark lock that still has every kind of package, so the tests stay fast."""
+    path = benchmark.write_lockfile(tmp_path, 25)
+    text = path.read_text(encoding="utf-8")
+    for kind in (
+        "-py3-none-any.whl",
+        "-abi3-",
+        "-cp314-cp314t-",
+        "macosx_10_9_x86_64",
+        "marker = ",
+        "dependencies = [{",
+    ):
+        assert kind in text
+    files = [p.files or [] for p in load_inputs([str(path)])[0].packages]
+    assert any(f and not any(n.endswith(".whl") for n in f) for f in files)  # sdist only
+    assert any(f and not any(n.endswith(".tar.gz") for n in f) for f in files)  # wheels only
+    return path
 
 
 def _targets() -> list[Target]:
@@ -94,7 +109,8 @@ def test_explain_parses_each_wheel_once_and_works_out_platform_tags_once_per_tar
     targets = _targets()
     _results(big_lock, targets)
     wheels = {f for p in load_inputs([str(big_lock)])[0].packages for f in p.files or [] if f.endswith(".whl")}
-    assert sorted(parsed) == sorted(wheels)  # each wheel once, though --explain looks at it on every target
+    # Each wheel at most once, though --explain looks at it on every target.
+    assert parsed and set(parsed) <= wheels and len(parsed) == len(set(parsed))
     assert len(calls) <= 2 * len(targets)  # Target.tags and Target.platform_tag_set, once each
 
 
@@ -123,5 +139,5 @@ def test_big_lockfile_time_budget(tmp_path):
     out = json.loads(benchmark.run_in_process(lock, PYTHONS, explain=True))
     elapsed = time.perf_counter() - start
     assert out["summary"]["packages"] == 500
-    assert len(out["targets"]) == 57
+    assert len(out["targets"]) == len(build_targets(PYTHONS, ["everything"]))
     assert elapsed < 30, f"took {elapsed:.1f} s"

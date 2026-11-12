@@ -89,8 +89,9 @@ class Row:
 
 
 # A wheel's tags, or None if its filename doesn't parse. --explain asks again for every file on every target,
-# so parse each name once. lru_cache is thread-safe (also on free-threaded Python), and the bound keeps a
-# long-running process (wheelgap-mcp) from growing without limit; one release's wheels fit many times over.
+# so parse each name once. lru_cache is thread-safe (also on free-threaded Python). The bound counts entries,
+# a few MB with realistic names (about 4 MB, keys included), and keeps a long-running process (wheelgap-mcp)
+# from growing without limit; one release's wheels fit many times over.
 @lru_cache(maxsize=16384)
 def _parsed_tags(filename: str) -> frozenset[Tag] | None:
     try:
