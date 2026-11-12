@@ -951,6 +951,14 @@ def main(argv: list[str] | None = None) -> int:
             "wheelgap: note: reading ./diff as an input; for the comparison, run python -m wheelgap.diff",
             file=sys.stderr,
         )
+    # `wheelgap mcp`: the MCP server (as `wheelgap-mcp`), so MCP registries can start it from the `wheelgap` package
+    # (`uvx wheelgap@VERSION mcp`). Unlike diff, a file or folder named mcp here doesn't make it an input: the MCP
+    # client picks the working directory, often a project with an mcp/ folder. `wheelgap ./mcp` checks such a folder,
+    # and `wheelgap mcp==1.0` the PyPI package.
+    if argv[:1] == ["mcp"]:
+        from .mcp import main as mcp_main
+
+        return mcp_main(argv[1:], prog="wheelgap mcp")
     parser = make_parser()
     args = parser.parse_args(argv)
     if args.json and args.markdown:

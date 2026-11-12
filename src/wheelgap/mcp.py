@@ -839,18 +839,28 @@ def serve(stdin: BinaryIO, stdout: BinaryIO) -> None:
         server.close(wait=finished)  # on Ctrl-C, don't start the calls still queued
 
 
-def main(argv: list[str] | None = None) -> int:
+# For `wheelgap mcp`, which always starts the server: how to check what `wheelgap mcp` used to mean.
+_SUBCOMMAND_HINT = (
+    "To check a folder named mcp, run `wheelgap ./mcp`; to check the PyPI package mcp, pin it: `wheelgap mcp==VERSION`."
+)
+
+
+def main(argv: list[str] | None = None, prog: str = "wheelgap-mcp") -> int:
     args = sys.argv[1:] if argv is None else argv
+    subcommand = prog == "wheelgap mcp"
     if args in (["--version"], ["-V"]):
         print(f"wheelgap-mcp {__version__}")
         return 0
     if args:
         print(
-            "usage: wheelgap-mcp\n\nAn MCP server for wheelgap over stdio. Add it to your agent's MCP settings with "
-            "the command `uvx --from wheelgap wheelgap-mcp`.",
+            f"usage: {prog}\n\nAn MCP server for wheelgap over stdio. Add it to your agent's MCP settings with "
+            "the command `uvx --from wheelgap wheelgap-mcp` (or `uvx wheelgap mcp`)."
+            + (f"\n\n{_SUBCOMMAND_HINT}" if subcommand else ""),
             file=sys.stderr,
         )
         return 0 if args in (["-h"], ["--help"]) else 2
+    if subcommand and sys.stdin is not None and sys.stdin.isatty():
+        print(f"wheelgap mcp: waiting for an MCP client on stdin (Ctrl-C to quit). {_SUBCOMMAND_HINT}", file=sys.stderr)
     try:
         serve(sys.stdin.buffer, sys.stdout.buffer)
     except KeyboardInterrupt:
