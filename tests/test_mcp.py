@@ -1512,3 +1512,171 @@ def test_modern_call_inline_in_a_batch_and_without_send(fake_pypi):
     assert isinstance(reply, dict)
     assert reply["result"]["resultType"] == "complete"
     assert reply["result"]["structuredContent"]["ok"] is True
+
+
+def roots_answer_for(*paths: Path) -> dict:
+    return {"roots": [{"uri": p.as_uri()} for p in paths]}
+
+
+def with_roots(message: dict, roots: object = None) -> dict:
+    """A 2026 call from a client with the roots capability (answering with roots, if given)."""
+    message["params"]["_meta"] = roots_meta()
+    if roots is not None:
+        message["params"]["inputResponses"] = {"roots": roots}
+    return message
+
+
+@pytest.mark.parametrize("uri", ["file://", "file:", "file:.", "file://localhost", "file:../projB"])
+def test_a_root_with_no_absolute_path_is_left_out(fake_pypi, tmp_path, monkeypatch, uri):
+    # Each would be the server's working directory (or near it), and so another project's file.
+    assert mcp._root_paths([{"uri": uri}]) == ()
+    two_projects(tmp_path, monkeypatch)
+    (reply,) = run(roots_call(1, {"roots": [{"uri": uri}]}, path="requirements.txt", python="3.13"))
+    assert reply["result"]["isError"] is True
+    assert "none of them is a local folder" in reply["result"]["content"][0]["text"]
+    assert not fake_pypi
+
+
+def test_a_relative_path_cant_leave_its_root(fake_pypi, tmp_path, monkeypatch):
+    root, cwd = two_projects(tmp_path, monkeypatch)
+    (root / "sub").mkdir()
+    (escape, inside, absolute) = run(
+        roots_call(1, roots_answer_for(root), path="../projB/requirements.txt", python="3.13"),
+        roots_call(2, roots_answer_for(root), path="sub/../requirements.txt", python="3.13"),
+        roots_call(3, roots_answer_for(root), path=str(cwd / "requirements.txt"), python="3.13"),
+    )
+    assert escape["result"]["isError"] is True
+    assert "not in any of the client's roots" in escape["result"]["content"][0]["text"]
+    assert inside["result"]["structuredContent"]["path"] == str((root / "requirements.txt").resolve())
+    assert absolute["result"]["structuredContent"]["path"] == str((cwd / "requirements.txt").resolve())
+
+
+def test_windows_paths_with_a_drive_or_a_root_alone_are_anchored():
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    assert mcp._anchored(PureWindowsPath("/foo/uv.lock"))
+    assert mcp._anchored(PureWindowsPath("C:uv.lock"))
+    assert not mcp._anchored(PureWindowsPath("C:/foo/uv.lock"))
+    assert not mcp._anchored(PureWindowsPath("foo/uv.lock"))
+    assert not mcp._anchored(PurePosixPath("/foo/uv.lock"))
+    assert not mcp._anchored(PurePosixPath("foo/uv.lock"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="drive- and root-relative paths exist on Windows only")
+@pytest.mark.parametrize("path", ["\\requirements.txt", "C:requirements.txt"])
+def test_anchored_windows_paths_are_refused_on_a_roots_call(fake_pypi, tmp_path, monkeypatch, path):
+    root, _ = two_projects(tmp_path, monkeypatch)
+    (reply,) = run(roots_call(1, roots_answer_for(root), path=path))
+    assert reply["result"]["isError"] is True
+    assert "neither relative nor absolute" in reply["result"]["content"][0]["text"]
+
+
+def test_a_relative_pyodide_lock_is_found_in_the_roots(fake_pypi, fixtures, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # no pyodide-lock.json here
+    arguments = {"name": "fastlib", "python": "3.13", "targets": ["pyodide"], "pyodide_lock": "pyodide-lock.json"}
+    (asked, answered, elsewhere) = run(
+        with_roots(modern_call("check_package", 1, **arguments)),
+        with_roots(modern_call("check_package", 2, **arguments), roots_answer_for(fixtures)),
+        with_roots(modern_call("check_package", 3, **arguments), roots_answer_for(tmp_path)),
+    )
+    assert asked["result"]["resultType"] == "input_required"
+    assert answered["result"]["structuredContent"]["results"] == {"3.13 pyodide": "bundled"}
+    assert elsewhere["result"]["isError"] is True
+    assert "not in any of the client's roots" in elsewhere["result"]["content"][0]["text"]
+
+
+def test_the_first_root_with_the_file_wins(fake_pypi, tmp_path, monkeypatch):
+    root, cwd = two_projects(tmp_path, monkeypatch)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    (reply,) = run(roots_call(1, roots_answer_for(empty, cwd, root), path="requirements.txt", python="3.13"))
+    assert reply["result"]["structuredContent"]["path"] == str((cwd / "requirements.txt").resolve())
+
+
+def test_diff_lockfiles_finds_old_and_new_in_the_roots(fake_pypi, tmp_path, monkeypatch):
+    lockfile_pair(tmp_path, uv_package("purewheel", "3.1"), uv_package("purewheel", "3.1", "sdist"))
+    monkeypatch.chdir(tmp_path / "old")  # the working directory has old/uv.lock only as ./uv.lock
+    message = modern_call("diff_lockfiles", old="old/uv.lock", new="new/uv.lock", python="3.13")
+    (asked, answered) = run(
+        with_roots(message), with_roots(json.loads(json.dumps(message)), roots_answer_for(tmp_path))
+    )
+    assert asked["result"]["resultType"] == "input_required"
+    data = answered["result"]["structuredContent"]
+    assert data["paths"] == {k: str((tmp_path / k / "uv.lock").resolve()) for k in ("old", "new")}
+    assert [p["name"] for p in data["worse"]] == ["purewheel"]
+
+
+def test_a_roots_call_sends_progress(fake_pypi, tmp_path, monkeypatch):
+    root, _ = two_projects(tmp_path, monkeypatch)
+    message = roots_call(1, roots_answer_for(root), path="requirements.txt", python="3.13")
+    message["params"]["_meta"]["progressToken"] = "r"
+    replies = run(message)
+    assert [r["params"]["progressToken"] for r in replies if is_progress(r)] == ["r", "r"]
+    assert replies[-1]["result"]["structuredContent"]["path"] == str((root / "requirements.txt").resolve())
+
+
+def test_a_roots_call_inline_in_a_batch_and_without_send(fake_pypi, tmp_path, monkeypatch):
+    root, _ = two_projects(tmp_path, monkeypatch)
+    expected = str((root / "requirements.txt").resolve())
+    (batch,) = run([roots_call(1, roots_answer_for(root), path="requirements.txt", python="3.13")])
+    assert batch[0]["result"]["structuredContent"]["path"] == expected
+    reply = mcp.Server().handle(roots_call(2, roots_answer_for(root), path="requirements.txt", python="3.13"))
+    assert isinstance(reply, dict)
+    assert reply["result"]["structuredContent"]["path"] == expected
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "io.modelcontextprotocol/protocolVersion",
+        "io.modelcontextprotocol/clientCapabilities",
+        "io.modelcontextprotocol/clientInfo",
+        "io.modelcontextprotocol/logLevel",
+    ],
+)
+def test_each_envelope_key_alone_marks_a_2026_request(key):
+    value = {"io.modelcontextprotocol/clientInfo": {"name": "x", "version": "1"}}.get(key, {})
+    if key.endswith(("protocolVersion", "logLevel")):
+        value = MODERN if key.endswith("protocolVersion") else "info"
+    (reply,) = run({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": {key: value}}})
+    assert reply["error"]["code"] == mcp.INVALID_PARAMS
+
+
+def test_a_2025_related_task_key_stays_handshake():
+    meta = {"io.modelcontextprotocol/related-task": {"taskId": "t"}}
+    (reply,) = run({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": meta}})
+    assert reply["result"] == {"tools": mcp.TOOLS}
+
+
+def test_the_roots_error_clips_long_paths_and_roots(fake_pypi, tmp_path, monkeypatch):
+    two_projects(tmp_path, monkeypatch)
+    deep = tmp_path / ("d" * 150) / ("e" * 150)
+    deep.mkdir(parents=True)
+    (reply,) = run(roots_call(1, roots_answer_for(deep, deep), path="x" * 1000))
+    text = reply["result"]["content"][0]["text"]
+    assert reply["result"]["isError"] is True and len(text) < 500 and "..." in text
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"path": "uv.lock", "platforms": ["win-arm64"]}, "unknown argument(s): platforms"),
+        ({"path": "uv.lock", "python": 3.13}, "'python' must be a string"),
+        ({"path": "uv.lock", "offline": "yes"}, "'offline' must be true or false"),
+        ({"path": "uv.lock", "targets": "linux-x86_64"}, "'targets' must be an array of strings"),
+    ],
+)
+def test_bad_arguments_fail_before_asking_for_roots(fake_pypi, arguments, message):
+    (reply,) = run(with_roots(modern_call("check_lockfile", **arguments)))
+    assert reply["result"]["resultType"] == "complete"
+    assert reply["result"]["isError"] is True
+    assert message in reply["result"]["content"][0]["text"]
+
+
+@pytest.mark.parametrize(("declared", "asks"), [(True, True), ([], True), ("yes", True), (False, False), (None, False)])
+def test_a_malformed_roots_capability_still_counts(declared, asks, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    message = modern_call("check_lockfile", path="uv.lock")
+    message["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] = {"roots": declared}
+    (reply,) = run(message)
+    assert (reply["result"]["resultType"] == "input_required") == asks

@@ -43,7 +43,7 @@ import urllib.request
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, BinaryIO
 
 from packaging.version import InvalidVersion, Version
@@ -148,7 +148,8 @@ _PYODIDE_LOCK_PROP = {
     "description": (
         "Absolute path or https URL of a Pyodide release's pyodide-lock.json, so packages that release ships itself "
         "count as 'bundled' on pyodide targets for its Python. Its Python must be one a pyodide target uses. "
-        "Relative paths are resolved against the server's working directory."
+        "A relative path is looked for in the client's roots if it shares them, else in the server's working "
+        "directory."
     ),
 }
 _READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
@@ -214,7 +215,7 @@ TOOLS: list[dict[str, Any]] = [
                 "path": {
                     "type": "string",
                     "description": "Absolute path or file:// URI of the lockfile or project directory (a relative "
-                    "path is resolved against the client's roots, if it shares them, then the server's working "
+                    "path is looked for in the client's roots if it shares them, else in the server's working "
                     "directory).",
                 },
                 "python": _PYTHON_PROP
@@ -253,8 +254,8 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "dockerfile": {
                     "type": "string",
-                    "description": "Absolute path or file:// URI of the Dockerfile (a relative path is resolved "
-                    "against the client's roots, if it shares them, then the server's working directory).",
+                    "description": "Absolute path or file:// URI of the Dockerfile (a relative path is looked "
+                    "for in the client's roots if it shares them, else in the server's working directory).",
                 },
                 "path": {
                     "type": "string",
@@ -373,7 +374,11 @@ def _versions(args: dict[str, Any]) -> dict[str, str]:
 
 def _lock_spec(args: dict[str, Any]) -> str:
     spec = (_string(args, "pyodide_lock") or "").strip()
-    return spec if not spec or "://" in spec else str(Path(spec).expanduser())
+    if not spec or "://" in spec:
+        return spec
+    if _ROOTS_ONLY.get() and _is_relative(spec):  # a 2026 client named its roots: it must be in one of them
+        return str(_existing(spec))
+    return str(Path(spec).expanduser())
 
 
 def _check_package(args: dict[str, Any]) -> dict[str, Any]:
@@ -538,15 +543,40 @@ def _existing(raw: str) -> Path:
         path = uri_path
     else:
         path = Path(raw).expanduser()
-        if not path.is_absolute():
-            found = next((root / path for root in _ROOTS.get() if (root / path).exists()), None)
-            if found is None and _ROOTS_ONLY.get():
-                searched = ", ".join(str(root) for root in _ROOTS.get()) or "none of them is a local folder"
-                raise ToolError(f"{raw}: not in any of the client's roots ({searched}); pass an absolute path")
-            path = path if found is None else found
+        if not path.is_absolute() and _ROOTS_ONLY.get():
+            path = _in_roots(raw, path)
+        elif not path.is_absolute():
+            path = next((root / path for root in _ROOTS.get() if (root / path).exists()), path)
     if not path.exists():
         raise ToolError(f"{raw}: no such file or directory (pass an absolute path)")
     return path
+
+
+def _in_roots(raw: str, path: PurePath) -> Path:
+    """A relative path on a 2026 call whose client named its roots: the first root that contains it, never the
+    working directory, and never outside the root (no ../ out of it)."""
+    if _anchored(path):  # \\foo or C:foo on Windows: joining it to a root would drop the root, or its folder
+        raise ToolError(f"{_clip(raw)}: neither relative nor absolute; pass an absolute path")
+    for root in _ROOTS.get():
+        candidate = root / path
+        try:
+            inside = candidate.resolve().is_relative_to(root.resolve())
+        except (OSError, RuntimeError):  # a symlink loop, say
+            inside = False
+        if inside and candidate.exists():
+            return candidate
+    searched = _clip(", ".join(str(root) for root in _ROOTS.get()) or "none of them is a local folder")
+    raise ToolError(f"{_clip(raw)}: not in any of the client's roots ({searched}); pass an absolute path")
+
+
+def _anchored(path: PurePath) -> bool:
+    """A Windows path with a drive or a root but not both (C:uv.lock, \\uv.lock): not absolute, but not relative
+    to a folder either. Never true on POSIX."""
+    return not path.is_absolute() and bool(path.drive or path.root)
+
+
+def _clip(text: str, limit: int = 200) -> str:
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 def _run_cli(argv: list[str], path: Path) -> dict[str, Any]:
@@ -804,9 +834,12 @@ class Server:
                     return _error(msg_id, INVALID_PARAMS, f"inputResponses.{_ROOTS_INPUT} must be a roots/list result")
                 roots = _root_paths(answer["roots"])
                 roots_only = bool(answer["roots"])  # an empty list: the client has none, so the working directory
-            elif isinstance(meta[_CAPABILITIES_KEY].get("roots"), dict) and _relative_paths(params):
-                # The client has roots, and a relative path may name a file in them rather than in the working
-                # directory: ask for them (a 2026 server can't send roots/list itself), then the client retries.
+            elif meta[_CAPABILITIES_KEY].get("roots") not in (None, False) and _relative_paths(params):
+                # The client has roots (even a malformed declaration means it meant to), and a relative path may name
+                # a file in them rather than in the working directory: ask for them (a 2026 server can't send
+                # roots/list itself), then the client retries. Arguments that would fail anyway fail now instead.
+                if problem := _argument_problem(params):
+                    return _reply(msg_id, _complete({"content": [{"type": "text", "text": problem}], "isError": True}))
                 return _reply(
                     msg_id,
                     _complete({"inputRequests": {_ROOTS_INPUT: {"method": "roots/list"}}}, "input_required"),
@@ -976,9 +1009,11 @@ def _complete(result: dict[str, Any], result_type: str = "complete") -> dict[str
     return {"resultType": result_type, **result, "_meta": {_SERVER_INFO_KEY: SERVER_INFO}}
 
 
-# The arguments each tool resolves with _existing, so against the client's roots when relative.
+# The arguments each tool resolves with _existing (pyodide_lock: on 2026 roots calls), so against the client's
+# roots when relative.
 _PATH_ARGUMENTS = {
-    "check_lockfile": ("path",),
+    "check_package": ("pyodide_lock",),
+    "check_lockfile": ("path", "pyodide_lock"),
     "check_dockerfile": ("dockerfile", "path"),
     "diff_lockfiles": ("old", "new"),
 }
@@ -994,6 +1029,30 @@ def _relative_paths(params: dict[str, Any]) -> bool:
     return any(isinstance(v, str) and v.strip() and not _URI_RE.match(v) and _is_relative(v) for v in values)
 
 
+def _argument_problem(params: dict[str, Any]) -> str | None:
+    """What a tool would reject in its arguments' names and types (the checks that need no files or lookups), so a
+    call that can't succeed isn't sent round for roots first."""
+    name, arguments = params.get("name"), params.get("arguments")
+    if not isinstance(name, str) or name not in _HANDLERS or not isinstance(arguments, dict):
+        return None  # _tools_call's protocol errors
+    try:
+        _check_keys(name, arguments)
+        schema = next(t for t in TOOLS if t["name"] == name)["inputSchema"]
+        for key in schema.get("required", []):
+            _string(arguments, key, required=True)
+        for key, prop in schema["properties"].items():
+            if prop["type"] == "string":
+                _string(arguments, key)
+            elif prop["type"] == "boolean" and arguments.get(key) is not None:
+                if not isinstance(arguments[key], bool):
+                    raise ToolError(f"'{key}' must be true or false")
+            elif prop["type"] == "array":
+                _platforms(arguments)
+    except ToolError as e:
+        return str(e)
+    return None
+
+
 def _is_relative(raw: str) -> bool:
     try:
         return not Path(raw).expanduser().is_absolute()
@@ -1007,7 +1066,7 @@ def _root_paths(roots: object) -> tuple[Path, ...]:
     for root in roots if isinstance(roots, list) else ():
         uri = root.get("uri") if isinstance(root, dict) else None
         path = _file_uri_path(uri) if isinstance(uri, str) else None
-        if path is not None:
+        if path is not None and path.is_absolute():  # file:, file://localhost or file:../x would be the cwd's
             paths.append(path)
     return tuple(paths)
 
