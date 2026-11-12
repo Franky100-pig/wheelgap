@@ -48,6 +48,9 @@ wheelgap -p 3.13 -t alpine-arm64
 # Is my stack ready for free-threaded Python 3.14?
 wheelgap -p 3.14t -t all
 
+# What blocks the move to the newest CPython? (next is 3.15 in this release)
+wheelgap -p 3.14 -p next -t all
+
 # Several Pythons at once, Linux on both architectures
 wheelgap uv.lock -p 3.12,3.13,3.14 -t linux-x86_64,linux-aarch64
 
@@ -303,6 +306,24 @@ Docker platform names also work with `-t`, for example `-t linux/amd64,linux/arm
 
 `-t all` checks the eight common native platforms, and `-t everything` adds the armv7l, ppc64le, s390x, riscv64 and i686 Linux targets (glibc and musl) and `win32`. Pyodide, iOS and Android are only checked when you name them. Python versions take a trailing `t` for free-threaded builds (`3.14t`), which correctly rejects `abi3` wheels. Without `-p`, wheelgap reads a `.python-version` file next to the lockfile (or `pyproject.toml`) if there is one, and otherwise uses the Python it is running on.
 
+### Free-threading and new Python readiness
+
+A new CPython comes out each October, and for months many packages have no wheels for it yet. To see what would build from source if you upgraded, check the Python you use now next to the new one. `-p next` is the newest CPython this wheelgap release knows (3.15), and `-p next-t` is its free-threaded build, so you don't have to look the version up; a note on stderr says which version it is (`-q` drops it). Upgrade wheelgap to move `next` on. `next` works anywhere a Python version does: `-p`, `python = ["3.14", "next"]` in `[tool.wheelgap]`, `wheelgap diff -p`, `make_targets(python="next")` and the MCP tools' `python` argument, but not in `.python-version`, which uv and pyenv read too.
+
+```bash
+wheelgap uv.lock -p 3.14 -p next -t linux-x86_64,linux-aarch64
+wheelgap uv.lock -p 3.14 -p next-t -t all   # the upgrade and free-threading together
+```
+
+When exactly two Python versions are checked and one is newer, the summary names the packages that block the upgrade: those with a gap (`● source` or `✗ missing`) on the newer Python on a platform where the older one has a wheel (or doesn't install the package). Gaps both Pythons share, and targets ignored with `--ignore NAME:TARGET`, don't count. Packages that couldn't be checked aren't listed, only counted (`blocking 3.15: none known (1 package couldn't be checked)`), so an empty list isn't a pass on its own: the summary and the exit code still decide.
+
+```
+3 of 41 packages have gaps: 3 will build from source.
+blocking 3.15: numpy, pydantic-core
+```
+
+`--markdown` and `-q` print the same line, and `--json` has the list as `blocking_newer_python` (`[]` when no package is known to block the upgrade; the key is left out unless two Pythons, one newer, are checked). The MCP server's `check_lockfile` returns it too. Two builds of the same version, such as `-p 3.14 -p 3.14t`, have no newer one, so they get no such line; the [free-threading recipe](https://github.com/wheelgap/wheelgap/blob/main/docs/recipes.md#free-threading-readiness) lists a free-threaded build's gaps for scripts.
+
 ### In CI (GitHub Action)
 
 ```yaml
@@ -392,7 +413,9 @@ On Claude Code 2.1.275 or later, `/plugin install wheelgap --marketplace wheelga
 claude mcp add wheelgap -- uvx --from wheelgap wheelgap-mcp
 ```
 
-Other clients take the same command (`uvx`) and arguments in their MCP settings; the [MCP setup guide](https://github.com/wheelgap/wheelgap/blob/main/docs/mcp.md) has a copy-paste snippet for Claude Code, Cursor, VS Code, Codex and Claude Desktop. Pass `check_lockfile`, `check_dockerfile` and `diff_lockfiles` an absolute path or a `file://` URI, since the server's working directory may not be your project. If the client shares its [roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots), a relative path such as `uv.lock` is resolved against the first root that contains it.
+In releases after 0.9.0, `uvx wheelgap mcp` starts the same server. Other clients take the same command (`uvx`) and arguments in their MCP settings; the [MCP setup guide](https://github.com/wheelgap/wheelgap/blob/main/docs/mcp.md) has a copy-paste snippet for Claude Code, Cursor, VS Code, Codex and Claude Desktop. Pass `check_lockfile`, `check_dockerfile` and `diff_lockfiles` an absolute path or a `file://` URI, since the server's working directory may not be your project. If the client shares its [roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots), a relative path such as `uv.lock` is resolved against the first root that contains it.
+
+<!-- mcp-name: io.github.wheelgap/wheelgap -->
 
 Contributing to wheelgap with an agent? See [AGENTS.md](https://github.com/wheelgap/wheelgap/blob/main/AGENTS.md).
 

@@ -38,7 +38,7 @@ uv run --group dev pytest
 | `pyodide.py` | `--pyodide-lock`: packages Pyodide ships itself |
 | `scan.py` | `python -m wheelgap.scan`: the data behind the [coverage tracker](https://wheelgap.github.io/tracker/) |
 | `diff.py` | `python -m wheelgap.diff OLD NEW`: packages that got worse between two lockfiles, and new packages with gaps |
-| `mcp.py` | `wheelgap-mcp` / `python -m wheelgap.mcp`: an MCP server over stdio (stdlib JSON-RPC, no MCP SDK) with `check_package`, `check_lockfile`, `check_dockerfile`, `diff_lockfiles` and `list_targets` tools |
+| `mcp.py` | `wheelgap-mcp` / `python -m wheelgap.mcp` / `wheelgap mcp` (dispatched from `cli.py`): an MCP server over stdio (stdlib JSON-RPC, no MCP SDK) with `check_package`, `check_lockfile`, `check_dockerfile`, `diff_lockfiles` and `list_targets` tools |
 
 ## Tests
 
@@ -58,6 +58,7 @@ uv run --group dev pytest
 - **Style:** match the surrounding code; ruff's line length is 120. Don't reformat or refactor code your change doesn't need.
 - **`CHANGELOG.md`:** if users would notice the change, add one bullet at the top of `## Unreleased`, written for users, ending with the **PR** number and your handle: `(#123, thanks [@you](https://github.com/you))`. Add it once the PR is open and you know the number. Docs-only changes get no entry, and released sections are never edited.
 - **Agent integrations:** when a flag, JSON key, status or exit code changes, update `integrations/claude-code/skills/check-wheels/SKILL.md` and `integrations/cursor/wheelgap.mdc` too, and only describe what's already released on PyPI.
+- **New CPython releases:** when a CPython comes out (each October), move `NEWEST_PYTHON` in `targets.py` on to it so `-p next` checks it, and update `test_newest_python_is_the_latest_release`, the README's "Free-threading and new Python readiness" section and the `-p next` example, which name the version. Add its `PYODIDE_PLATFORMS` entry (`targets.py`) and `PYODIDE_ABI` entry (`pyodide.py`) separately, once Pyodide has a build for it.
 - **README:** update it when users would notice the change (a new flag, target, input format or config key). A new input format also needs the `files` pattern in `.pre-commit-hooks.yaml`.
 
 ## Picking work and opening a PR
