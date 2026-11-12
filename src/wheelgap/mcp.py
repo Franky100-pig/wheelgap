@@ -1,9 +1,13 @@
 """An MCP server, so coding agents can ask wheelgap whether a package has a wheel for a platform.
 
 Run it with `python -m wheelgap.mcp` (or the `wheelgap-mcp` command). It speaks the Model Context Protocol over
-stdio: one JSON-RPC 2.0 message per line on stdin and stdout, using the initialize handshake of the 2024-11-05 to
-2025-11-25 protocol revisions. Newer clients that first probe with server/discover get "method not found" and fall
-back to that handshake. Like the rest of wheelgap it needs only the standard library and packaging.
+stdio: one JSON-RPC 2.0 message per line on stdin and stdout. It serves both eras of the protocol, request by request:
+- 2024-11-05, 2025-03-26, 2025-06-18 and 2025-11-25, through the initialize handshake;
+- 2026-07-28, which has no handshake: each request names its protocol version and the client's capabilities in
+  params._meta, server/discover says which versions and capabilities the server has, and each result carries
+  resultType and the server's name and version. A request for a version the server doesn't serve gets error -32022,
+  listing the versions it does.
+Like the rest of wheelgap it needs only the standard library and packaging.
 
 Tool calls run on one worker thread, one at a time, while the main thread keeps reading stdin: it answers ping and
 handles notifications/cancelled during a long check_lockfile. One worker, because check_lockfile redirects the
@@ -19,7 +23,8 @@ Tools (all read-only; they look packages up on PyPI, or the index in WHEELGAP_IN
 
 Paths may be file:// URIs. If the client has the roots capability, the server asks it for roots/list after
 notifications/initialized (and again on notifications/roots/list_changed), and a relative path is resolved against the
-first root that contains it, then against the working directory.
+first root that contains it, then against the working directory. 2026-07-28 requests are stateless and the server may
+not send requests of its own, so for them a relative path is resolved against the working directory only.
 """
 
 from __future__ import annotations
@@ -63,6 +68,8 @@ from .targets import (
 # The handshake-era revisions, oldest first. A client asking for one of these gets it back; any other version gets the
 # newest, and the client decides whether it can use that (as the MCP lifecycle spec says).
 PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
+# The revisions without a handshake, oldest first: each request carries its version in params._meta.
+MODERN_VERSIONS = ("2026-07-28",)
 _STRUCTURED_FROM = "2025-06-18"  # the first revision with structuredContent in tool results
 _PROGRESS_MESSAGE_FROM = "2025-03-26"  # the first revision with a message in notifications/progress
 
@@ -71,6 +78,17 @@ INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
+UNSUPPORTED_PROTOCOL_VERSION = -32022  # from 2026-07-28
+
+# The per-request _meta keys of 2026-07-28 (the first two are required on every request), and the result's.
+_VERSION_KEY = "io.modelcontextprotocol/protocolVersion"
+_CAPABILITIES_KEY = "io.modelcontextprotocol/clientCapabilities"
+_SERVER_INFO_KEY = "io.modelcontextprotocol/serverInfo"
+SERVER_INFO = {"name": "wheelgap", "version": __version__}
+CAPABILITIES = {"tools": {"listChanged": False}}
+# 2026-07-28's caching hints, required on server/discover and tools/list. Both are fixed for the server's lifetime
+# and the same for every user: an hour, then the client asks again.
+_CACHE_HINTS = {"ttlMs": 3_600_000, "cacheScope": "public"}
 
 INSTRUCTIONS = (
     "wheelgap tells you whether pip or uv can install a package from a prebuilt wheel on a platform, or will have to "
@@ -490,7 +508,7 @@ def _diff_lockfiles(args: dict[str, Any]) -> dict[str, Any]:
         sides.append(packages)
     report = diff.compare(sides[0], sides[1], targets)
     data: dict[str, Any] = json.loads(diff.json_report(report, targets))
-    del data["version"]  # the server's version is in initialize's serverInfo
+    del data["version"]  # the server's version is in its serverInfo (initialize's, or the result's _meta)
     data["ok"] = not report.worse and not report.new
     data["paths"] = {"old": str(paths[0].resolve()), "new": str(paths[1].resolve())}
     return data
@@ -603,8 +621,9 @@ _HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
 class _Call:
     """A tools/call that is queued or running on the worker."""
 
-    def __init__(self, token: str | int | None) -> None:
+    def __init__(self, token: str | int | None, version: str | None = None) -> None:
         self.token = token
+        self.version = version  # a 2026 request's own protocol version; None for the handshake's
         self.cancelled = False
         self.base = 0  # lookups in fill_all runs that have finished (check_lockfile may run more than one)
         self.total = 0  # lookups in the current fill_all run
@@ -691,6 +710,11 @@ class Server:
             params = {}
         if not isinstance(params, dict):
             return _error(msg_id, INVALID_PARAMS, "params must be an object")
+        meta = params.get("_meta")
+        # The version key in _meta is what marks a 2026 request; legacy ones may carry _meta too (a progressToken).
+        # initialize is always the handshake, even with that key, since 2026 has no initialize.
+        if method == "server/discover" or (method != "initialize" and isinstance(meta, dict) and _VERSION_KEY in meta):
+            return self._modern(msg_id, method, params, inline)
         if method == "initialize":
             return _reply(msg_id, self._initialize(params))
         if method == "ping":
@@ -698,26 +722,76 @@ class Server:
         if method == "tools/list":
             return _reply(msg_id, {"tools": TOOLS})
         if method == "tools/call":
-            name = params.get("name")
-            if not isinstance(name, str) or name not in _HANDLERS:
-                return _error(msg_id, INVALID_PARAMS, f"unknown tool: {name!r}")
-            arguments = params.get("arguments")
-            if arguments is None:
-                arguments = {}
-            if not isinstance(arguments, dict):
-                return _error(msg_id, INVALID_PARAMS, "arguments must be an object")
-            if inline or self._worker is None:
-                return _reply(msg_id, self._call(name, arguments))
-            meta = params.get("_meta")
-            token = meta.get("progressToken") if isinstance(meta, dict) else None
-            if not isinstance(token, (str, int)) or isinstance(token, bool):
-                token = None
-            call = _Call(token)
-            with self._lock:
-                self._calls[msg_id] = call
-            self._worker.submit(self._run, msg_id, call, name, arguments)
-            return None
+            return self._tools_call(msg_id, params, None, inline)
         return _error(msg_id, METHOD_NOT_FOUND, f"method not found: {method}")
+
+    def _modern(self, msg_id: str | int, method: str, params: dict[str, Any], inline: bool) -> dict[str, Any] | None:
+        """A 2026-07-28 request: served from its own _meta, with none of the handshake's state (not its version, nor
+        the roots it asked the client for)."""
+        meta = params.get("_meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        if missing := [key for key in (_VERSION_KEY, _CAPABILITIES_KEY) if key not in meta]:
+            return _error(msg_id, INVALID_PARAMS, f"params._meta must have {' and '.join(missing)}")
+        version = meta[_VERSION_KEY]
+        if not isinstance(version, str):
+            return _error(msg_id, INVALID_PARAMS, f"{_VERSION_KEY} must be a string")
+        if not isinstance(meta[_CAPABILITIES_KEY], dict):
+            return _error(msg_id, INVALID_PARAMS, f"{_CAPABILITIES_KEY} must be an object")
+        if version not in MODERN_VERSIONS:
+            # Every version served, newest first: a client that also speaks a handshake-era one can fall back to
+            # initialize with it, rather than give up.
+            supported = [*reversed(MODERN_VERSIONS), *reversed(PROTOCOL_VERSIONS)]
+            hint = " (send initialize for the handshake-era ones)" if version in PROTOCOL_VERSIONS else ""
+            return _error(
+                msg_id,
+                UNSUPPORTED_PROTOCOL_VERSION,
+                f"Unsupported protocol version {version!r}: this server speaks {', '.join(supported)}{hint}",
+                {"supported": supported, "requested": version},
+            )
+        if method == "server/discover":
+            # Only the versions a request can name in _meta: the handshake-era ones need initialize.
+            return _reply(
+                msg_id,
+                _complete(
+                    {
+                        "supportedVersions": list(reversed(MODERN_VERSIONS)),
+                        "capabilities": CAPABILITIES,
+                        "instructions": INSTRUCTIONS,
+                    }
+                    | _CACHE_HINTS
+                ),
+            )
+        if method == "tools/list":
+            return _reply(msg_id, _complete({"tools": TOOLS} | _CACHE_HINTS))
+        if method == "tools/call":
+            return self._tools_call(msg_id, params, version, inline)
+        # ping, logging/setLevel and the rest are gone in 2026, and this server has no prompts or resources.
+        return _error(msg_id, METHOD_NOT_FOUND, f"method not found: {method}")
+
+    def _tools_call(
+        self, msg_id: str | int, params: dict[str, Any], version: str | None, inline: bool
+    ) -> dict[str, Any] | None:
+        """tools/call, on the worker unless inline. version is a 2026 request's own, or None for the handshake's."""
+        name = params.get("name")
+        if not isinstance(name, str) or name not in _HANDLERS:
+            return _error(msg_id, INVALID_PARAMS, f"unknown tool: {name!r}")
+        arguments = params.get("arguments")
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            return _error(msg_id, INVALID_PARAMS, "arguments must be an object")
+        if inline or self._worker is None:
+            return _reply(msg_id, self._call(name, arguments, version))
+        meta = params.get("_meta")
+        token = meta.get("progressToken") if isinstance(meta, dict) else None
+        if not isinstance(token, (str, int)) or isinstance(token, bool):
+            token = None
+        call = _Call(token, version)
+        with self._lock:
+            self._calls[msg_id] = call
+        self._worker.submit(self._run, msg_id, call, name, arguments)
+        return None
 
     def _cancel(self, msg_id: object) -> None:
         """notifications/cancelled: an unknown or finished request is ignored, as the spec says."""
@@ -735,10 +809,10 @@ class Server:
             return
         try:
             if call.token is None:
-                result = self._call(name, arguments)
+                result = self._call(name, arguments, call.version)
             else:
                 with pypi.reporting_progress(lambda done, total: self._progress(call, done, total)):
-                    result = self._call(name, arguments)
+                    result = self._call(name, arguments, call.version)
             reply = _reply(msg_id, result)
         except Exception as e:  # a bug: the client still gets an answer rather than waiting forever
             reply = _error(msg_id, INTERNAL_ERROR, f"internal error: {type(e).__name__}: {e}")
@@ -760,7 +834,7 @@ class Server:
         if progress <= call.sent:
             return
         params: dict[str, Any] = {"progressToken": call.token, "progress": progress, "total": overall}
-        if self.protocol_version >= _PROGRESS_MESSAGE_FROM:
+        if (call.version or self.protocol_version) >= _PROGRESS_MESSAGE_FROM:
             params["message"] = f"{progress} of {overall} index lookups done"
         with self._lock:
             if call.cancelled or self._send is None:
@@ -798,13 +872,21 @@ class Server:
         self.protocol_version = asked if asked in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[-1]
         return {
             "protocolVersion": self.protocol_version,
-            "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "wheelgap", "version": __version__},
+            "capabilities": CAPABILITIES,
+            "serverInfo": SERVER_INFO,
             "instructions": INSTRUCTIONS,
         }
 
-    def _call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        roots = _ROOTS.set(self._roots)
+    def _call(self, name: str, arguments: dict[str, Any], version: str | None = None) -> dict[str, Any]:
+        """A tool's result. version is a 2026 request's own (no roots; resultType and serverInfo in the result), or
+        None for the handshake's."""
+        result = self._tool_result(name, arguments, version or self.protocol_version, () if version else self._roots)
+        return _complete(result) if version else result
+
+    def _tool_result(
+        self, name: str, arguments: dict[str, Any], version: str, roots: tuple[Path, ...]
+    ) -> dict[str, Any]:
+        token = _ROOTS.set(roots)
         try:
             # wheelgap's own messages go to stderr already; this keeps any stray print off the protocol stream.
             with contextlib.redirect_stdout(sys.stderr):
@@ -815,9 +897,9 @@ class Server:
         except Exception as e:  # a bug: report it to the model rather than end the connection
             return {"content": [{"type": "text", "text": f"internal error: {type(e).__name__}: {e}"}], "isError": True}
         finally:
-            _ROOTS.reset(roots)
+            _ROOTS.reset(token)
         result: dict[str, Any] = {"content": [{"type": "text", "text": text}], "isError": False}
-        if self.protocol_version >= _STRUCTURED_FROM:
+        if version >= _STRUCTURED_FROM:
             result["structuredContent"] = data
         return result
 
@@ -831,8 +913,16 @@ def _reply(msg_id: Any, result: dict[str, Any]) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
 
-def _error(msg_id: Any, code: int, message: str) -> dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
+def _complete(result: dict[str, Any]) -> dict[str, Any]:
+    """A 2026-07-28 result: every one says its resultType, and the server names itself in each one's _meta."""
+    return {"resultType": "complete", **result, "_meta": {_SERVER_INFO_KEY: SERVER_INFO}}
+
+
+def _error(msg_id: Any, code: int, message: str, data: object = None) -> dict[str, Any]:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": msg_id, "error": error}
 
 
 def serve(stdin: BinaryIO, stdout: BinaryIO) -> None:

@@ -148,7 +148,8 @@ The agent should call `check_lockfile` with the lockfile's path, `python`
 it. The server's working directory may not be your project, so the agent should
 pass an absolute path or a `file://` URI. A relative path such as `uv.lock`
 works only when the client shares its
-[roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots).
+[roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots),
+which it can do only on the handshake-era protocol versions (see below).
 
 `check_lockfile` and `check_dockerfile` apply the project's `[tool.wheelgap]`
 settings. Their `ok` is true only when no package has a gap on any target;
@@ -168,3 +169,21 @@ package's wheels that target can't use, closest misses first, each with the
 reason (such as `abi3 wheels can't be used on free-threaded Python (only
 abi3t ones can)`), and `rejected_omitted` counting any it left out. Without
 `explain`, the result has only the statuses, which keeps it small.
+
+## Protocol versions
+
+The server speaks every MCP revision from 2024-11-05 to 2026-07-28, so it works
+with older and newer clients alike:
+
+- **2024-11-05, 2025-03-26, 2025-06-18 and 2025-11-25** start with the
+  `initialize` handshake. Results include `structuredContent` from 2025-06-18 on.
+- **2026-07-28** has no handshake: each request carries its protocol version and
+  the client's capabilities in `_meta`, and a client may first ask
+  `server/discover` which versions the server speaks. A client that supports both
+  probes with `server/discover` and gets an answer, so it stays on 2026-07-28. A
+  request for a version the server doesn't speak gets error `-32022` listing the
+  ones it does. These requests are stateless, so the server can't ask the client
+  for its roots: pass absolute paths or `file://` URIs.
+
+The server picks the version for each request, so clients of both kinds can
+share one server process.

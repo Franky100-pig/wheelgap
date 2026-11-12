@@ -47,8 +47,7 @@ def test_notifications_get_no_reply_and_unknown_methods_are_errors():
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
         {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 9}},
         {"jsonrpc": "2.0", "id": 2, "method": "ping"},
-        # Clients on the 2026 revisions probe with server/discover and fall back to initialize on any error.
-        {"jsonrpc": "2.0", "id": 3, "method": "server/discover", "params": {}},
+        {"jsonrpc": "2.0", "id": 3, "method": "resources/list"},
     )
     assert [r["id"] for r in replies] == [0, 2, 3]
     assert replies[1]["result"] == {}
@@ -885,7 +884,7 @@ def test_a_result_that_isnt_json_is_still_answered(monkeypatch):
 
 
 def test_a_crash_on_the_worker_is_still_answered(monkeypatch):
-    def broken(self, name, arguments):
+    def broken(self, name, arguments, version=None):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(mcp.Server, "_call", broken)
@@ -1174,3 +1173,187 @@ def test_mcp_docs_name_every_tool():
     text = (Path(__file__).resolve().parent.parent / "docs" / "mcp.md").read_text(encoding="utf-8")
     for tool in mcp.TOOLS:
         assert f"`{tool['name']}`" in text
+
+
+# The 2026-07-28 revision: no handshake; every request carries its version and the client's capabilities in _meta.
+
+MODERN = "2026-07-28"
+SERVED = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
+SERVER_META = {"io.modelcontextprotocol/serverInfo": {"name": "wheelgap", "version": __version__}}
+
+
+def envelope(version: object = MODERN, **extra: object) -> dict:
+    return {
+        "io.modelcontextprotocol/protocolVersion": version,
+        "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+        **extra,
+    }
+
+
+def modern(method: str, msg_id: int = 1, version: object = MODERN, **params: object) -> dict:
+    return {"jsonrpc": "2.0", "id": msg_id, "method": method, "params": {"_meta": envelope(version), **params}}
+
+
+def modern_call(tool: str, msg_id: int = 1, **arguments: object) -> dict:
+    return modern("tools/call", msg_id, name=tool, arguments=arguments)
+
+
+def test_server_discover():
+    (reply,) = run(modern("server/discover"))  # no initialize first
+    assert reply == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "resultType": "complete",
+            "supportedVersions": [MODERN],
+            "capabilities": {"tools": {"listChanged": False}},
+            "instructions": mcp.INSTRUCTIONS,
+            "ttlMs": 3_600_000,
+            "cacheScope": "public",
+            "_meta": SERVER_META,
+        },
+    }
+
+
+def test_modern_tools_list():
+    (reply,) = run(modern("tools/list"))
+    result = reply["result"]
+    assert result["resultType"] == "complete"
+    assert result["tools"] == mcp.TOOLS
+    assert (result["ttlMs"], result["cacheScope"]) == (3_600_000, "public")
+    assert result["_meta"] == SERVER_META
+
+
+def test_modern_tools_call(fake_pypi):
+    (reply, error) = run(
+        modern_call("check_package", name="winonly", python="3.13", targets=["win-amd64", "linux/arm64"]),
+        modern_call("check_package", 2, name="numpy==2.0"),
+    )
+    result = reply["result"]
+    assert result["resultType"] == "complete"
+    assert result["_meta"] == SERVER_META
+    assert result["isError"] is False
+    assert result["structuredContent"] == json.loads(result["content"][0]["text"])
+    assert result["structuredContent"]["results"] == {"3.13 win-amd64": "wheel", "3.13 linux-aarch64": "missing"}
+    # A tool error is a complete result too.
+    assert (error["result"]["resultType"], error["result"]["isError"]) == ("complete", True)
+    assert error["result"]["_meta"] == SERVER_META
+
+
+@pytest.mark.parametrize("requested", ["1900-01-01", "2027-01-01", "2025-11-25"])
+def test_unsupported_protocol_version_lists_the_supported_ones(fake_pypi, requested):
+    replies = run(
+        modern("server/discover", version=requested),
+        modern_call("list_targets", 2) | {"params": {"_meta": envelope(requested), "name": "list_targets"}},
+    )
+    for msg_id, reply in zip([1, 2], replies, strict=True):
+        assert reply["id"] == msg_id
+        assert reply["error"]["code"] == mcp.UNSUPPORTED_PROTOCOL_VERSION == -32022
+        assert reply["error"]["data"] == {"supported": SERVED, "requested": requested}
+    assert ("initialize" in replies[0]["error"]["message"]) == (requested == "2025-11-25")
+
+
+@pytest.mark.parametrize(
+    ("meta", "missing"),
+    [
+        (None, "protocolVersion"),
+        ({}, "protocolVersion"),
+        ({"io.modelcontextprotocol/protocolVersion": MODERN}, "clientCapabilities"),
+        ({"io.modelcontextprotocol/protocolVersion": 2026, "io.modelcontextprotocol/clientCapabilities": {}}, "string"),
+        (
+            {"io.modelcontextprotocol/protocolVersion": MODERN, "io.modelcontextprotocol/clientCapabilities": []},
+            "object",
+        ),
+    ],
+)
+def test_malformed_envelope_is_invalid_params(meta, missing):
+    # A legacy client never sends server/discover, and a 2026 client that probes with it falls back on any error but
+    # -32022: so a malformed probe must not get -32022.
+    message: dict = {"jsonrpc": "2.0", "id": 1, "method": "server/discover"}
+    if meta is not None:
+        message["params"] = {"_meta": meta}
+    replies = run(message, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"_meta": meta or {}}})
+    assert replies[0]["error"]["code"] == mcp.INVALID_PARAMS
+    assert missing in replies[0]["error"]["message"]
+    # On other methods, the version key is what makes a request a 2026 one: without it, it's the handshake's.
+    if "io.modelcontextprotocol/protocolVersion" in (meta or {}):
+        assert replies[1]["error"]["code"] == mcp.INVALID_PARAMS
+    else:
+        assert replies[1]["result"] == {"tools": mcp.TOOLS}
+
+
+def test_ping_is_gone_in_2026_but_not_in_the_handshake():
+    replies = run(modern("ping"), ping(2), init(), ping(3))
+    assert replies[0]["error"]["code"] == mcp.METHOD_NOT_FOUND
+    assert (replies[1]["result"], replies[3]["result"]) == ({}, {})
+
+
+def test_initialize_is_the_handshake_even_with_the_2026_meta():
+    message = init("2025-11-25")
+    message["params"]["_meta"] = envelope()
+    (reply,) = run(message)
+    assert reply["result"]["protocolVersion"] == "2025-11-25"
+    assert "resultType" not in reply["result"]
+
+
+def test_both_eras_in_one_process_keep_their_own_version(fake_pypi):
+    # A 2024-11-05 handshake has no structuredContent; a 2026 request alongside it gets its own revision's result,
+    # and the handshake's calls are unchanged by it.
+    (_, legacy, new, legacy_again) = run(
+        init("2024-11-05"),
+        call("check_package", 1, name="purewheel", python="3.13"),
+        modern_call("check_package", 2, name="purewheel", python="3.13"),
+        call("check_package", 3, name="purewheel", python="3.13"),
+    )
+    assert [r["id"] for r in (legacy, new, legacy_again)] == [1, 2, 3]
+    for reply in (legacy, legacy_again):
+        assert set(reply["result"]) == {"content", "isError"}
+    assert new["result"]["resultType"] == "complete"
+    assert new["result"]["structuredContent"]["ok"] is True
+
+
+def test_modern_calls_dont_use_the_handshake_roots(fake_pypi, fixtures, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # the working directory has no uvproj; the legacy client's root does
+    replies = run(
+        init_with_roots(),
+        INITIALIZED,
+        roots_answer(fixtures),
+        call("check_lockfile", 1, path="uvproj", python="3.13", targets=["linux-x86_64"]),
+        modern_call("check_lockfile", 2, path="uvproj", python="3.13", targets=["linux-x86_64"]),
+    )
+    legacy, new = replies[-2:]
+    assert legacy["result"]["isError"] is False
+    assert new["result"]["isError"] is True
+    assert "no such file or directory" in new["result"]["content"][0]["text"]
+
+
+def test_modern_call_sends_progress(fake_pypi, three_pins):
+    message = modern_call("check_lockfile", path=three_pins, python="3.13")
+    message["params"]["_meta"]["progressToken"] = "tok"
+    replies = run(message)
+    progress = [r["params"] for r in replies if is_progress(r)]
+    assert [(p["progressToken"], p["progress"], p["total"]) for p in progress] == [("tok", n, 3) for n in range(4)]
+    assert all("message" in p for p in progress)
+    assert replies[-1]["id"] == 1 and replies[-1]["result"]["resultType"] == "complete"
+
+
+def test_modern_call_cancelled_sends_no_result(slow_pypi, three_pins):
+    out = Recorder()
+    message = modern_call("check_lockfile", path=three_pins, python="3.13")
+    message["params"]["_meta"]["progressToken"] = "t"
+    mcp.serve(
+        live(
+            message,
+            out.wait_for(is_progress),
+            {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}},
+            modern("tools/list", 5),  # answered while the call runs
+            out.wait_for(lambda m: m.get("id") == 5),
+            slow_pypi.set,
+            modern_call("list_targets", 2),
+        ),
+        out,
+    )
+    assert [m["id"] for m in out.messages if "id" in m] == [5, 2]
+    assert all(m["result"]["resultType"] == "complete" for m in out.messages if "id" in m)
+    assert [m["params"]["progress"] for m in out.messages if is_progress(m)] == [0]
