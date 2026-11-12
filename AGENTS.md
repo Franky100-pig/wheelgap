@@ -28,7 +28,7 @@ uv run --group dev pytest
 | --- | --- |
 | `cli.py` | Command line: arguments, `[tool.wheelgap]` config, text / `--json` / `--markdown` output, exit codes |
 | `api.py` | Python API (`make_targets`, `check_package(s)`, `check_lockfile`) |
-| `sources.py` | Reads inputs: `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, requirements files |
+| `sources.py` | Reads inputs: `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `pixi.lock` (with a strict reader for the YAML subset pixi writes), requirements files |
 | `targets.py` | Targets (Python × platform) and the wheel tags each accepts |
 | `check.py` | The status per package and target (`wheel`, `source`, `missing`, `unknown`, `n/a`, `bundled`) and `--explain` reasons |
 | `pypi.py` | The only HTTP client (`fetch_json`: retries, https-only redirects) and the PyPI lookups (`fill`, `fill_all`, `recheck_lock`) |
@@ -37,6 +37,7 @@ uv run --group dev pytest
 | `offline.py` | `--offline`, `offline = true` and `check_lockfile(..., offline=True)`: refuse inputs that would need an index lookup |
 | `pyodide.py` | `--pyodide-lock`: packages Pyodide ships itself |
 | `github.py` | `--github-annotations`: GitHub Actions `::error`/`::warning` lines, and each package's line in its input file |
+| `logsafe.py` | Keeps input text from running as a GitHub Actions workflow command: the CLI's and `diff`'s stdout and stderr go through `CommandGuard` |
 | `scan.py` | `python -m wheelgap.scan`: the data behind the [coverage tracker](https://wheelgap.github.io/tracker/) |
 | `diff.py` | `python -m wheelgap.diff OLD NEW`: packages that got worse between two lockfiles, and new packages with gaps |
 | `mcp.py` | `wheelgap-mcp` / `python -m wheelgap.mcp` / `wheelgap mcp` (dispatched from `cli.py`): an MCP server over stdio (stdlib JSON-RPC, no MCP SDK) with `check_package`, `check_lockfile`, `check_dockerfile`, `diff_lockfiles` and `list_targets` tools |
