@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import gzip
 import http.client
-import io
 import json
 import math
 import os
@@ -108,17 +107,18 @@ def _request(req: urllib.request.Request, timeout: float, attempts: int, read):
 
 
 class ResponseTooLarge(ValueError):
-    """A capped fetch_json response (or its gzip-decoded body) was over the cap."""
+    """A capped fetch_json response (after gzip decoding, if it was gzipped) was over the cap."""
 
 
 def _read_capped(resp, max_bytes: int) -> bytes:
     encoding = (resp.headers.get("Content-Encoding") or "identity").strip().lower()
     if encoding not in ("identity", "gzip"):
         raise ValueError(f"unexpected Content-Encoding {encoding}")  # only gzip was offered
-    body = resp.read(max_bytes + 1)
-    if encoding == "gzip" and len(body) <= max_bytes:
-        with gzip.GzipFile(fileobj=io.BytesIO(body)) as f:
-            body = f.read(max_bytes + 1)  # decode no further than the cap, whatever the body claims
+    if encoding == "gzip":
+        with gzip.GzipFile(fileobj=resp) as f:  # decoded as it's read, and no further than the cap
+            body = f.read(max_bytes + 1)
+    else:
+        body = resp.read(max_bytes + 1)
     if len(body) > max_bytes:
         raise ResponseTooLarge(f"response over {max_bytes} bytes")
     return body
@@ -127,8 +127,8 @@ def _read_capped(resp, max_bytes: int) -> bytes:
 def fetch_json(url: str, timeout: float = 20.0, attempts: int = 4, max_bytes: int | None = None) -> dict:
     """GET a JSON document (see _request for what is retried).
 
-    With max_bytes, for documents that can be large: the server may send it gzipped, and a response over max_bytes,
-    before or after decoding, raises ResponseTooLarge (not retried) instead of being read into memory."""
+    With max_bytes, for documents that can be large: the server may send it gzipped (decoded as it's read), and a body
+    over max_bytes raises ResponseTooLarge (not retried) after reading no more than max_bytes + 1 bytes of it."""
     headers = {"User-Agent": f"wheelgap/{__version__}", "Accept": "application/json"}
     if max_bytes is None:
         return _request(urllib.request.Request(url, headers=headers), timeout, attempts, json.load)
@@ -371,6 +371,7 @@ def fill(pkg: Package, python: str | None = None, read_cache: bool = False, writ
         else:
             names = [u["filename"] for u in urls if not u.get("yanked")]
         pkg.files = names
+        pkg.found_on_pypi = base == DEFAULT_INDEX
         # Only a fresh answer that parsed and listed its files: a body with no "urls" ({}) reads as no files,
         # and caching that would turn a bad response into a day of false "missing" answers.
         if key and write_cache and cached is None and isinstance(data.get("urls"), list):

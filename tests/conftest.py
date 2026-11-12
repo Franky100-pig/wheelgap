@@ -35,13 +35,28 @@ FAKE_INDEX = {
     "halfyanked": {"2.0": [{"filename": "halfyanked-2.0-py3-none-any.whl", "yanked": True}, "halfyanked-2.0.tar.gz"]},
 }
 
-# Fake anaconda.org API for --conda-forge (https://api.anaconda.org/package/conda-forge/<name>): name -> each file's
-# (subdir, labels), or an exception the lookup raises. A name not listed is a 404.
-FAKE_CONDA_FORGE: dict[str, list[tuple[str, list[str]]] | Exception] = {
-    # linux-64 and linux-aarch64 on the main label; osx-arm64 only as a build marked broken.
-    "nowheels": [("linux-64", ["main", "cf202003"]), ("linux-aarch64", ["main"]), ("osx-arm64", ["broken"])],
-    "winonly": [("noarch", ["main"])],
-    "fastlib": TimeoutError("timed out"),
+
+# Fake anaconda.org API for --conda-forge (https://api.anaconda.org/package/conda-forge/<name>): name -> its files
+# (see conda_file), or an exception the lookup raises. A name not listed is a 404. Tests change it with
+# monkeypatch.setitem.
+def conda_file(version, subdir, *depends, labels=("main",)):
+    return {"version": version, "labels": list(labels), "attrs": {"subdir": subdir, "depends": list(depends)}}
+
+
+def cp(minor, ft=""):
+    """The depends of a compiled CPython 3.<minor> build: python_abi names the ABI."""
+    return ("python", f"python_abi 3.{minor}.* *_cp3{minor}{ft}")
+
+
+FAKE_CONDA_FORGE: dict[str, list[dict] | Exception] = {
+    "nowheels": [
+        conda_file("0.9", "linux-64", *cp(13)),
+        conda_file("0.9", "linux-aarch64", *cp(13)),
+        conda_file("0.9", "osx-arm64", *cp(13), labels=("main", "broken")),  # marked broken: never counts
+        conda_file("0.9", "win-64", *cp(12)),  # another Python
+        conda_file("0.8", "linux-ppc64le", *cp(13)),  # another version
+    ],
+    "winonly": [conda_file("311", "noarch", "python >=3.10", "python")],
 }
 
 
@@ -88,7 +103,7 @@ def fake_pypi(monkeypatch):
                 raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
             if isinstance(conda, Exception):
                 raise conda
-            return {"files": [{"attrs": {"subdir": subdir}, "labels": labels} for subdir, labels in conda]}
+            return {"files": conda}
         # Served at whatever WHEELGAP_INDEX_URL points at, so tests can assert which index was asked.
         parts = url.removeprefix(pypi.index_url() + "/").removesuffix("/json").split("/")
         name = parts[0]

@@ -55,6 +55,8 @@ class Package:
     registry: str | None = None
     # The index picked `version` (an unpinned or ranged requirement): it isn't a pin from the input.
     version_from_index: bool = False
+    # This run found the package on pypi.org's JSON API (pypi.fill), so its name is public there.
+    found_on_pypi: bool = False
 
     @property
     def key(self) -> str:
@@ -123,6 +125,9 @@ class Source:
     # (a key of READERS), for --github-annotations.
     path: Path | None = None
     kind: str | None = None
+    # The input names no index but PyPI, so a package this run found on pypi.org is a PyPI package (for --conda-forge,
+    # which sends only such names). False when unsure: lockfiles rely on each package's registry instead.
+    pypi_only: bool = False
 
 
 def pythons_outside_lock(source: Source, targets: Iterable[Target], *, bounds_only: bool = True) -> list[str]:
@@ -702,7 +707,10 @@ def parse_pipfile_lock(path: Path) -> Source:
                 elif not _is_public_pypi(url):
                     pkg.registry = url  # pypi.fill_all skips it, unless WHEELGAP_INDEX_URL is that index
             _add_once(pkgs, seen, pkg)
-    return Source(path.name, pkgs)
+    # A package with no "index" comes from the Pipfile's default source, which may be private: only a lock whose
+    # sources are all PyPI says where every package came from.
+    urls = [s.get("url") if isinstance(s, dict) else None for s in (sources if isinstance(sources, list) else [])]
+    return Source(path.name, pkgs, pypi_only=bool(urls) and all(_is_public_pypi(u) for u in urls))
 
 
 def _is_public_pypi(url: str | None) -> bool:
@@ -717,6 +725,21 @@ def _pinned_version(req: Requirement) -> str | None:
     if len(specs) == 1 and specs[0].operator in ("==", "===") and "*" not in specs[0].version:
         return specs[0].version
     return None
+
+
+def _names_an_index(pyproject: dict) -> bool:
+    """Whether a pyproject.toml configures an index or source for an installer (uv, Poetry, PDM), so its
+    dependencies may come from somewhere other than PyPI."""
+    tool = pyproject.get("tool")
+    if not isinstance(tool, dict):
+        return False
+
+    def table(name: str) -> dict:
+        value = tool.get(name)
+        return value if isinstance(value, dict) else {}
+
+    uv_keys = ("index", "sources", "index-url", "extra-index-url", "find-links", "no-index")
+    return any(k in table("uv") for k in uv_keys) or "source" in table("poetry") or "source" in table("pdm")
 
 
 def parse_pyproject(path: Path) -> Source:
@@ -765,7 +788,12 @@ def parse_pyproject(path: Path) -> Source:
                 "(PEP 685)"
             )
         extras[key] = list(lines)
-    source = Source(path.name, pyproject_extras=extras, pyproject_dynamic_extras="optional-dependencies" in dynamic)
+    source = Source(
+        path.name,
+        pyproject_extras=extras,
+        pyproject_dynamic_extras="optional-dependencies" in dynamic,
+        pypi_only=not _names_an_index(data),
+    )
     if isinstance(requires_python := project.get("requires-python"), str):
         source.requires_python = requires_python
     if isinstance(name := project.get("name"), str):
@@ -862,10 +890,15 @@ _INCLUDE_RE = re.compile(r"^(?:-r|--requirement)(?:\s+|=)?(\S.*)$")
 _CONSTRAINT_RE = re.compile(r"^(?:-c(?:\s+|=)?|--constraint(?:\s+|=))(\S.*)$")
 
 
+# pip options that point at an index or a folder of distributions other than PyPI's (or turn PyPI off).
+_INDEX_OPTION_RE = re.compile(r"(-i|--index-url|--extra-index-url|-f|--find-links|--no-index)(?![A-Za-z-])")
+
+
 def parse_requirements(path: Path) -> Source:
     constraints: list[Package] = []
     seen: dict[bool, set[Path]] = {False: set(), True: set()}  # requirement files, constraint files
-    pkgs = _read_requirements(path, seen, constraints)
+    index_options: list[str] = []
+    pkgs = _read_requirements(path, seen, constraints, index_options=index_options)
     by_name: dict[str, list[Package]] = {}
     for entry in constraints:
         by_name.setdefault(entry.key, []).append(entry)
@@ -886,12 +919,17 @@ def parse_requirements(path: Path) -> Source:
             for entry in entries:
                 spec &= SpecifierSet(entry.spec or "")
             pkg.spec = str(spec) or None
-    return Source(path.name, pkgs, requirements=True)
+    return Source(path.name, pkgs, requirements=True, pypi_only=not index_options)
 
 
 def _read_requirements(
-    path: Path, seen: dict[bool, set[Path]], constraints: list[Package], constraint: bool = False
+    path: Path,
+    seen: dict[bool, set[Path]],
+    constraints: list[Package],
+    constraint: bool = False,
+    index_options: list[str] | None = None,
 ) -> list[Package]:
+    """`index_options` collects the index lines (--index-url, --extra-index-url, --find-links, --no-index)."""
     path = path.resolve()
     if path in seen[constraint]:
         return []
@@ -907,16 +945,20 @@ def _read_requirements(
             target = m.group(1).strip()
             # A URL (-c https://releases.openstack.org/...) or ${VAR} is left to pip: it's skipped, as before.
             if "://" not in target and "${" not in target:
-                _read_requirements(path.parent / target, seen, constraints, True)
+                _read_requirements(path.parent / target, seen, constraints, True, index_options)
             continue
         if m := _INCLUDE_RE.match(line):  # -r file, -rfile, --requirement file, --requirement=file
-            pkgs.extend(_read_requirements(path.parent / m.group(1).strip(), seen, constraints, constraint))
+            pkgs.extend(
+                _read_requirements(path.parent / m.group(1).strip(), seen, constraints, constraint, index_options)
+            )
             continue
         if line.startswith("-e ") or line.startswith("--editable"):
             name = line.split("#egg=", 1)[1] if "#egg=" in line else line.split(None, 1)[-1]
             append(Package(name, None, skip="editable", origin=path.name))
             continue
         if line.startswith("-"):
+            if index_options is not None and _INDEX_OPTION_RE.match(line):
+                index_options.append(line)
             continue  # pip options: --index-url, --hash continuation, ...
         tokens = line.split()
         # Drop --hash=sha256:... and "--hash sha256:..." (option and value as two tokens).
@@ -1007,7 +1049,7 @@ def _has_project_table(pyproject: Path) -> bool:
 def load_inputs(inputs: list[str]) -> list[Source]:
     """Each input is a file, a directory (lockfile auto-detected) or a requirement like 'numpy==2.3.4'."""
     sources: list[Source] = []
-    adhoc = Source("command line")
+    adhoc = Source("command line", pypi_only=True)  # names to look up on PyPI
     for item in inputs:
         p = Path(item)
         if p.is_dir():

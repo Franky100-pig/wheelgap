@@ -545,8 +545,9 @@ def gap_targets(row: Row, targets: list[Target]) -> list[Target]:
 
 
 def render_explain(
-    rows: list[Row], targets: list[Target], style: Style, conda_forge: dict[str, list[str]] | None = None
+    rows: list[Row], targets: list[Target], style: Style, conda_forge: dict[int, condaforge.Hint] | None = None
 ) -> list[str]:
+    """`conda_forge`: --conda-forge hints, by id() of the row's package."""
     multi_py = len({t.python for t in targets}) > 1
     out = []
     for r in rows:
@@ -561,8 +562,8 @@ def render_explain(
             lines = explain_lines(files, t, yanked=r.package.yanked, limit=EXPLAIN_LIMIT, dim=style.dim, align=True)
             out += [f"  {line}" for line in lines]
             out.append("")
-        if conda_forge and (matched := condaforge.matches(r.package, gap_targets(r, targets), conda_forge)):
-            out += [condaforge.hint(r.package, matched), ""]
+        if conda_forge and (h := conda_forge.get(id(r.package))):
+            out += [condaforge.hint_text(r.package, h, multi_py), ""]
     return out
 
 
@@ -648,7 +649,7 @@ def report_json(
     explained: bool,
     pyodide_lock: PyodideLock | None = None,
     advisory: frozenset[Target] = frozenset(),
-    conda_forge: dict[str, list[str]] | None = None,
+    conda_forge: dict[int, condaforge.Hint] | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     gaps = [r for r in rows if not r.ok]
@@ -673,10 +674,11 @@ def report_json(
             }
             # Same targets as `rejected`, minus any without a path (inputs with no dependency graph).
             out["via"] = {t.label(multi_py): r.via[t] for t in gap_targets(r, targets) if t in r.via}
-            if conda_forge and (matched := condaforge.matches(r.package, gap_targets(r, targets), conda_forge)):
+            if conda_forge and (h := conda_forge.get(id(r.package))):
                 out["conda_forge"] = {
-                    "name": r.package.key,
-                    "builds": {t.label(multi_py): subdirs for t, subdirs in matched.items()},
+                    "name": h.name,
+                    "version": h.version,
+                    "builds": {t.label(multi_py): subdirs for t, subdirs in h.builds.items()},
                 }
         return out
 
@@ -871,7 +873,7 @@ def render_markdown(
     pyodide_lock: PyodideLock | None,
     source_allowed: bool = False,
     advisory: frozenset[Target] = frozenset(),
-    conda_forge: dict[str, list[str]] | None = None,
+    conda_forge: dict[int, condaforge.Hint] | None = None,
 ) -> list[str]:
     """The same report as the text output, as GitHub-flavoured Markdown (for a job summary or a PR comment)."""
     plain = Style(False)
@@ -1029,6 +1031,54 @@ def note_unpinned_requirements(sources: list[Source]) -> None:
             "to check what you install",
             file=sys.stderr,
         )
+
+
+def _names(names: list[str]) -> str:
+    return ", ".join(names[:3]) + (", …" if len(names) > 3 else "")
+
+
+def conda_forge_hints(
+    gaps: list[Row], targets: list[Target], sources: list[Source], index_url: str | None, quiet: bool, cached: dict
+) -> dict[int, condaforge.Hint]:
+    """--conda-forge: look the gap packages up on anaconda.org and return their hints, by id() of the package. Only
+    names that are positively PyPI's are sent; notes on stderr say which packages weren't looked up, and why."""
+    if not condaforge.index_allows(index_url):
+        if not quiet:
+            print(
+                "wheelgap: note: --conda-forge looks nothing up when packages come from another index "
+                "(--index-url, index-url or WHEELGAP_INDEX_URL), so no package names leave it",
+                file=sys.stderr,
+            )
+        return {}
+    source_of = {id(p): s for s in sources for p in s.packages}
+    asked, private = [], []
+    for r in gaps:
+        if r.package.version and condaforge.wanted(gap_targets(r, targets)):
+            if condaforge.may_send(r.package, source_of[id(r.package)]):
+                asked.append(r)
+            else:
+                private.append(r.package.name)
+    if private and not quiet:
+        private = list(dict.fromkeys(private))
+        print(
+            f"wheelgap: note: --conda-forge didn't look up {len(private)} package{'s' * (len(private) != 1)} "
+            f"whose index isn't known to be PyPI ({_names(private)}), so their names stay private",
+            file=sys.stderr,
+        )
+    lookups = condaforge.look_up_all([(r.package.key, r.package.version or "") for r in asked], **cached)
+    if lookups.unchecked and not quiet:
+        why = "anaconda.org stopped answering, or was too slow" if lookups.stopped else "no usable answer"
+        n = len(lookups.unchecked)
+        print(
+            f"wheelgap: note: --conda-forge couldn't check {n} package{'s' * (n != 1)} ({_names(lookups.unchecked)}): "
+            f"{why}, so no hint doesn't mean conda-forge has no build",
+            file=sys.stderr,
+        )
+    hints = {}
+    for r in asked:
+        if h := condaforge.hint(r.package, gap_targets(r, targets), lookups.found):
+            hints[id(r.package)] = h
+    return hints
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1361,22 +1411,7 @@ def main(argv: list[str] | None = None) -> int:
         if r.package.key in ignore_on:
             r.ignored = frozenset(t for t in targets if t.platform in ignore_on[r.package.key])
     gaps = [r for r in rows if not r.ok]
-    conda_forge: dict[str, list[str]] = {}
-    if args.conda_forge:
-        if not condaforge.index_allows(index_url):
-            if not quiet:
-                print(
-                    "wheelgap: note: --conda-forge looks nothing up when packages come from another index "
-                    "(--index-url, index-url or WHEELGAP_INDEX_URL), so no package names leave it",
-                    file=sys.stderr,
-                )
-        else:
-            keys = [
-                r.package.key
-                for r in gaps
-                if condaforge.may_send(r.package) and condaforge.wanted(gap_targets(r, targets))
-            ]
-            conda_forge = condaforge.look_up_all(keys, **cached)
+    conda_forge = conda_forge_hints(gaps, targets, sources, index_url, quiet, cached) if args.conda_forge else {}
     source_labels = [s.label for s in sources]
     # With --fail-on missing, source builds are accepted; missing and unknown packages still fail. Gaps on
     # --advisory targets never fail the run.

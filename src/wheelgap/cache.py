@@ -1,5 +1,5 @@
 """A small on-disk cache of pinned index lookups (/<name>/<version>/json), so a repeat run needn't ask again,
-and of --conda-forge lookups (the conda subdirs a package has builds for).
+and of --conda-forge lookups (a version's conda-forge builds, cut down to what matching needs).
 
 A cache that can't be read or written is only ever a miss: it never fails a run.
 """
@@ -79,16 +79,37 @@ def save_files(index: str, name: str, version: str, files: list[dict]) -> None:
     _save(index, name, version, "files", kept)
 
 
-def load_subdirs(api: str, name: str) -> list[str] | None:
-    """--conda-forge: the cached subdirs `name` has builds for on the channel behind `api` (empty: no such package)."""
-    subdirs = _load(api, name, "", "subdirs")
-    if isinstance(subdirs, list) and all(isinstance(s, str) for s in subdirs):
-        return subdirs
-    return None
+# --conda-forge entries: keyed apart from PyPI's, and versioned, since what's kept may change.
+CONDA_FORGE_KEY = "condaforge-v1 https://api.anaconda.org/package/conda-forge"
+TOO_LARGE = "too large"  # the answer was over condaforge.MAX_BYTES
 
 
-def save_subdirs(api: str, name: str, subdirs: list[str]) -> None:
-    _save(api, name, "", "subdirs", subdirs)
+def load_builds(name: str, version: str) -> list[dict] | str | None:
+    """--conda-forge: the cached builds of a version ([] for none), TOO_LARGE, or None: not cached, older than
+    MAX_AGE, or unreadable."""
+    builds = _load(CONDA_FORGE_KEY, name, version, "builds")
+    if builds == TOO_LARGE:
+        return TOO_LARGE
+    if not isinstance(builds, list):
+        return None
+    for b in builds:
+        if not (
+            isinstance(b, dict)
+            and set(b) == {"subdir", "abi", "python", "os"}
+            and isinstance(b["subdir"], str)
+            and (b["abi"] is None or isinstance(b["abi"], str))
+            and (
+                b["python"] is None or (isinstance(b["python"], list) and all(isinstance(x, str) for x in b["python"]))
+            )
+            and isinstance(b["os"], list)
+            and all(isinstance(x, str) for x in b["os"])
+        ):
+            return None
+    return builds
+
+
+def save_builds(name: str, version: str, builds: list[dict] | str) -> None:
+    _save(CONDA_FORGE_KEY, name, version, "builds", builds)
 
 
 def _save(index: str, name: str, version: str, key: str, value: object) -> None:
