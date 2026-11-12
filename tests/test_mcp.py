@@ -1251,7 +1251,17 @@ def test_unsupported_protocol_version_lists_the_supported_ones(fake_pypi, reques
         assert reply["id"] == msg_id
         assert reply["error"]["code"] == mcp.UNSUPPORTED_PROTOCOL_VERSION == -32022
         assert reply["error"]["data"] == {"supported": SERVED, "requested": requested}
-    assert ("initialize" in replies[0]["error"]["message"]) == (requested == "2025-11-25")
+    message = replies[0]["error"]["message"]
+    if requested == "2025-11-25":  # supported, but not this way
+        assert message == "Protocol version 2025-11-25 is served only through the initialize handshake."
+    else:
+        assert message == f"Unsupported protocol version {requested!r}."
+
+
+def test_unsupported_protocol_version_is_echoed_shortened():
+    (reply,) = run(modern("server/discover", version="9" * 10_000))
+    assert reply["error"]["data"]["requested"] == "9" * 100
+    assert len(reply["error"]["message"]) < 150
 
 
 @pytest.mark.parametrize(
@@ -1260,6 +1270,7 @@ def test_unsupported_protocol_version_lists_the_supported_ones(fake_pypi, reques
         (None, "protocolVersion"),
         ({}, "protocolVersion"),
         ({"io.modelcontextprotocol/protocolVersion": MODERN}, "clientCapabilities"),
+        ({"io.modelcontextprotocol/clientCapabilities": {}}, "protocolVersion"),
         ({"io.modelcontextprotocol/protocolVersion": 2026, "io.modelcontextprotocol/clientCapabilities": {}}, "string"),
         (
             {"io.modelcontextprotocol/protocolVersion": MODERN, "io.modelcontextprotocol/clientCapabilities": []},
@@ -1276,8 +1287,8 @@ def test_malformed_envelope_is_invalid_params(meta, missing):
     replies = run(message, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"_meta": meta or {}}})
     assert replies[0]["error"]["code"] == mcp.INVALID_PARAMS
     assert missing in replies[0]["error"]["message"]
-    # On other methods, the version key is what makes a request a 2026 one: without it, it's the handshake's.
-    if "io.modelcontextprotocol/protocolVersion" in (meta or {}):
+    # On other methods, 2026's per-request keys make a request a 2026 one: without any, it's the handshake's.
+    if meta:
         assert replies[1]["error"]["code"] == mcp.INVALID_PARAMS
     else:
         assert replies[1]["result"] == {"tools": mcp.TOOLS}
@@ -1357,3 +1368,126 @@ def test_modern_call_cancelled_sends_no_result(slow_pypi, three_pins):
     assert [m["id"] for m in out.messages if "id" in m] == [5, 2]
     assert all(m["result"]["resultType"] == "complete" for m in out.messages if "id" in m)
     assert [m["params"]["progress"] for m in out.messages if is_progress(m)] == [0]
+
+
+def roots_meta(*, roots: bool = True) -> dict:
+    return envelope(**{"io.modelcontextprotocol/clientCapabilities": {"roots": {}} if roots else {}})
+
+
+def roots_call(msg_id: int, roots: object = None, **arguments: object) -> dict:
+    message = modern_call("check_lockfile", msg_id, **arguments)
+    message["params"]["_meta"] = roots_meta()
+    if roots is not None:
+        message["params"]["inputResponses"] = {"roots": roots}
+    return message
+
+
+def two_projects(tmp_path, monkeypatch) -> tuple[Path, Path]:
+    """projA (the client's root) and projB (the server's working directory), each with a requirements.txt."""
+    root, cwd = tmp_path / "projA", tmp_path / "projB"
+    for folder, pin in [(root, "winonly==311"), (cwd, "purewheel==3.1")]:
+        folder.mkdir()
+        (folder / "requirements.txt").write_text(pin + "\n", encoding="utf-8")
+    monkeypatch.chdir(cwd)
+    return root, cwd
+
+
+def test_modern_relative_path_asks_the_client_for_its_roots(fake_pypi, tmp_path, monkeypatch):
+    # A client with roots may mean a file in them: checking the working directory's file instead would be a wrong
+    # answer, so the server asks for roots/list (2026 servers can't send requests) and the client retries with them.
+    root, _ = two_projects(tmp_path, monkeypatch)
+    arguments = {"path": "requirements.txt", "python": "3.13", "targets": ["linux-x86_64"]}
+    (asked, answered) = run(
+        roots_call(1, **arguments),
+        roots_call(2, {"roots": [{"uri": "https://example.com/"}, {"uri": root.as_uri(), "name": "A"}]}, **arguments),
+    )
+    assert asked == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "resultType": "input_required",
+            "inputRequests": {"roots": {"method": "roots/list"}},
+            "_meta": SERVER_META,
+        },
+    }
+    data = answered["result"]["structuredContent"]
+    assert answered["result"]["resultType"] == "complete"
+    assert data["path"] == str((root / "requirements.txt").resolve())
+    assert [g["name"] for g in data["gaps"]] == ["winonly"]
+    assert fake_pypi == ["https://pypi.org/pypi/winonly/311/json"]  # nothing looked up for the first try
+
+
+def test_modern_roots_answer_without_the_file_falls_back_to_the_working_directory(fake_pypi, tmp_path, monkeypatch):
+    _, cwd = two_projects(tmp_path, monkeypatch)
+    other = tmp_path / "other"
+    other.mkdir()
+    (reply,) = run(roots_call(1, {"roots": [{"uri": other.as_uri()}]}, path="requirements.txt", python="3.13"))
+    assert reply["result"]["structuredContent"]["path"] == str((cwd / "requirements.txt").resolve())
+
+
+@pytest.mark.parametrize(
+    ("roots", "absolute"),
+    [(False, False), (True, True)],
+    ids=["no roots capability", "absolute path"],
+)
+def test_modern_call_without_roots_or_relative_paths_needs_no_roots(fake_pypi, tmp_path, monkeypatch, roots, absolute):
+    _, cwd = two_projects(tmp_path, monkeypatch)
+    path = str(cwd / "requirements.txt") if absolute else "requirements.txt"
+    message = modern_call("check_lockfile", path=path, python="3.13")
+    message["params"]["_meta"] = roots_meta(roots=roots)
+    (reply,) = run(message)
+    assert reply["result"]["resultType"] == "complete"
+    assert reply["result"]["structuredContent"]["path"] == str((cwd / "requirements.txt").resolve())
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("check_dockerfile", {"dockerfile": "/abs/Dockerfile", "path": "proj"}),
+        ("check_dockerfile", {"dockerfile": "Dockerfile"}),
+        ("diff_lockfiles", {"old": "/abs/uv.lock", "new": "uv.lock"}),
+    ],
+)
+def test_every_path_argument_asks_for_roots(tool, arguments):
+    message = modern_call(tool, **arguments)
+    message["params"]["_meta"] = roots_meta()
+    (reply,) = run(message)
+    assert reply["result"]["resultType"] == "input_required"
+
+
+def test_a_home_path_for_no_such_user_is_a_tool_error_not_a_roots_request(fake_pypi):
+    message = roots_call(1, path="~no-such-user-wheelgap/uv.lock")
+    (reply,) = run(message)
+    assert reply["result"]["resultType"] == "complete"
+    assert reply["result"]["isError"] is True
+
+
+@pytest.mark.parametrize("responses", [[], {"roots": None}, {"roots": {"roots": "nope"}}, {"roots": []}])
+def test_a_malformed_roots_answer_is_invalid_params(fake_pypi, responses):
+    message = roots_call(1, path="requirements.txt")
+    message["params"]["inputResponses"] = responses
+    (reply,) = run(message)
+    if responses == {"roots": None}:  # no answer: ask again
+        assert reply["result"]["resultType"] == "input_required"
+    else:
+        assert reply["error"]["code"] == mcp.INVALID_PARAMS
+    assert not fake_pypi
+
+
+def test_progress_message_follows_each_calls_version(fake_pypi):
+    # 2024-11-05 progress has no message; a 2026 call in the same process gets one.
+    new = modern_call("check_package", 2, name="purewheel", python="3.13")
+    new["params"]["_meta"]["progressToken"] = "new"
+    replies = run(init("2024-11-05"), with_token(call("check_package", 1, name="purewheel", python="3.13"), "old"), new)
+    progress = [r["params"] for r in replies if is_progress(r)]
+    assert {p["progressToken"]: "message" in p for p in progress} == {"old": False, "new": True}
+
+
+def test_modern_call_inline_in_a_batch_and_without_send(fake_pypi):
+    (batch,) = run([modern_call("list_targets", 1), ping(2)])
+    assert batch[0]["result"]["resultType"] == "complete"
+    assert batch[0]["result"]["_meta"] == SERVER_META
+    reply = mcp.Server().handle(modern_call("check_package", 3, name="purewheel", python="3.13"))
+    assert isinstance(reply, dict)
+    assert reply["result"]["resultType"] == "complete"
+    assert reply["result"]["structuredContent"]["ok"] is True

@@ -148,8 +148,7 @@ The agent should call `check_lockfile` with the lockfile's path, `python`
 it. The server's working directory may not be your project, so the agent should
 pass an absolute path or a `file://` URI. A relative path such as `uv.lock`
 works only when the client shares its
-[roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots),
-which it can do only on the handshake-era protocol versions (see below).
+[roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots).
 
 `check_lockfile` and `check_dockerfile` apply the project's `[tool.wheelgap]`
 settings. Their `ok` is true only when no package has a gap on any target;
@@ -182,8 +181,11 @@ with older and newer clients alike:
   `server/discover` which versions the server speaks. A client that supports both
   probes with `server/discover` and gets an answer, so it stays on 2026-07-28. A
   request for a version the server doesn't speak gets error `-32022` listing the
-  ones it does. These requests are stateless, so the server can't ask the client
-  for its roots: pass absolute paths or `file://` URIs.
+  ones it does. These requests are stateless, and the server can't send requests
+  of its own. So when a client that shares roots passes a relative path, the server
+  answers with `resultType: "input_required"` asking for `roots/list`, and the
+  client retries the call with its roots in `inputResponses`. The official
+  Python SDK's client does this for you.
 
 The server picks the version for each request, so clients of both kinds can
 share one server process.
