@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import http.client
 import json
 import math
@@ -105,10 +106,35 @@ def _request(req: urllib.request.Request, timeout: float, attempts: int, read):
     raise last  # type: ignore[misc]
 
 
-def fetch_json(url: str, timeout: float = 20.0, attempts: int = 4) -> dict:
-    """GET a JSON document (see _request for what is retried)."""
-    req = urllib.request.Request(url, headers={"User-Agent": f"wheelgap/{__version__}", "Accept": "application/json"})
-    return _request(req, timeout, attempts, json.load)
+class ResponseTooLarge(ValueError):
+    """A capped fetch_json response (after gzip decoding, if it was gzipped) was over the cap."""
+
+
+def _read_capped(resp, max_bytes: int) -> bytes:
+    encoding = (resp.headers.get("Content-Encoding") or "identity").strip().lower()
+    if encoding not in ("identity", "gzip"):
+        raise ValueError(f"unexpected Content-Encoding {encoding}")  # only gzip was offered
+    if encoding == "gzip":
+        with gzip.GzipFile(fileobj=resp) as f:  # decoded as it's read, and no further than the cap
+            body = f.read(max_bytes + 1)
+    else:
+        body = resp.read(max_bytes + 1)
+    if len(body) > max_bytes:
+        raise ResponseTooLarge(f"response over {max_bytes} bytes")
+    return body
+
+
+def fetch_json(url: str, timeout: float = 20.0, attempts: int = 4, max_bytes: int | None = None) -> dict:
+    """GET a JSON document (see _request for what is retried).
+
+    With max_bytes, for documents that can be large: the server may send it gzipped (decoded as it's read), and a body
+    over max_bytes raises ResponseTooLarge (not retried) after reading no more than max_bytes + 1 bytes of it."""
+    headers = {"User-Agent": f"wheelgap/{__version__}", "Accept": "application/json"}
+    if max_bytes is None:
+        return _request(urllib.request.Request(url, headers=headers), timeout, attempts, json.load)
+    headers["Accept-Encoding"] = "gzip"
+    req = urllib.request.Request(url, headers=headers)
+    return _request(req, timeout, attempts, lambda resp: json.loads(_read_capped(resp, max_bytes)))
 
 
 SIMPLE_JSON = "application/vnd.pypi.simple.v1+json"
@@ -345,6 +371,7 @@ def fill(pkg: Package, python: str | None = None, read_cache: bool = False, writ
         else:
             names = [u["filename"] for u in urls if not u.get("yanked")]
         pkg.files = names
+        pkg.found_on_pypi = base == DEFAULT_INDEX
         # Only a fresh answer that parsed and listed its files: a body with no "urls" ({}) reads as no files,
         # and caching that would turn a bad response into a day of false "missing" answers.
         if key and write_cache and cached is None and isinstance(data.get("urls"), list):
@@ -358,8 +385,9 @@ PYPI_SIMPLE = "https://pypi.org/simple"
 
 
 def is_pypi(registry: str | None) -> bool:
-    """Whether a package pinned to `registry` comes from PyPI: unset (the default index) or exactly PYPI_SIMPLE."""
-    return (registry or PYPI_SIMPLE).rstrip("/") == PYPI_SIMPLE
+    """Whether a package pinned to `registry` comes from PyPI: unset (None: the default index) or exactly PYPI_SIMPLE.
+    An empty registry ("") isn't PyPI: it says nothing about where the package came from."""
+    return registry is None or (isinstance(registry, str) and registry.rstrip("/") == PYPI_SIMPLE)
 
 
 def _index(url: str, suffix: str) -> tuple[str, str, int | None, str] | None:

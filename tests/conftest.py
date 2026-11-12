@@ -36,6 +36,30 @@ FAKE_INDEX = {
 }
 
 
+# Fake anaconda.org API for --conda-forge (https://api.anaconda.org/package/conda-forge/<name>): name -> its files
+# (see conda_file), or an exception the lookup raises. A name not listed is a 404. Tests change it with
+# monkeypatch.setitem.
+def conda_file(version, subdir, *depends, labels=("main",)):
+    return {"version": version, "labels": list(labels), "attrs": {"subdir": subdir, "depends": list(depends)}}
+
+
+def cp(minor, ft=""):
+    """The depends of a compiled CPython 3.<minor> build: python_abi names the ABI."""
+    return ("python", f"python_abi 3.{minor}.* *_cp3{minor}{ft}")
+
+
+FAKE_CONDA_FORGE: dict[str, list[dict] | Exception] = {
+    "nowheels": [
+        conda_file("0.9", "linux-64", *cp(13)),
+        conda_file("0.9", "linux-aarch64", *cp(13)),
+        conda_file("0.9", "osx-arm64", *cp(13), labels=("main", "broken")),  # marked broken: never counts
+        conda_file("0.9", "win-64", *cp(12)),  # another Python
+        conda_file("0.8", "linux-ppc64le", *cp(13)),  # another version
+    ],
+    "winonly": [conda_file("311", "noarch", "python >=3.10", "python")],
+}
+
+
 def pytest_configure(config):
     config.addinivalue_line("markers", "slow: a timing test (skip it locally with -m 'not slow')")
 
@@ -43,8 +67,15 @@ def pytest_configure(config):
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     """Tests shouldn't depend on the developer's colour or index settings, or on running in GitHub Actions."""
+    import os
+
+    from wheelgap.origin import index_env
+
     for name in ("NO_COLOR", "FORCE_COLOR", "WHEELGAP_INDEX_URL", "GITHUB_WORKSPACE"):
         monkeypatch.delenv(name, raising=False)
+    for name, value in list(os.environ.items()):  # pip and uv index settings (see origin.index_env)
+        if index_env({name: value}):
+            monkeypatch.delenv(name)
 
 
 @pytest.fixture(autouse=True)
@@ -70,8 +101,16 @@ def fake_pypi(monkeypatch):
 
     calls = []
 
-    def fetch_json(url, timeout=20.0):
+    def fetch_json(url, timeout=20.0, attempts=4, max_bytes=None):
         calls.append(url)
+        if url.startswith("https://api.anaconda.org/package/conda-forge/"):
+            assert max_bytes is not None, "anaconda.org answers can be large: cap them"
+            conda = FAKE_CONDA_FORGE.get(url.rsplit("/", 1)[-1])
+            if conda is None:
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+            if isinstance(conda, Exception):
+                raise conda
+            return {"files": conda}
         # Served at whatever WHEELGAP_INDEX_URL points at, so tests can assert which index was asked.
         parts = url.removeprefix(pypi.index_url() + "/").removesuffix("/json").split("/")
         name = parts[0]
