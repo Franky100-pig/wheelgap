@@ -53,6 +53,16 @@ uv run --group dev pytest
 - **Every behaviour change gets a test that fails without the change.** Check this by reverting your source change and running the test.
 - **Write test files that contain non-ASCII text with `encoding="utf-8"`** (or use `write_bytes`). Windows CI otherwise writes cp1252.
 - Put new cases in the existing parametrized tables where one fits, e.g. `test_dockerfiles_docker_rejects` and `test_parse_from` in `tests/test_dockerfile.py`.
+- **Real lockfiles:** `tests/fixtures/real/` holds unchanged copies of open-source projects' lockfiles, each with the project's `LICENSE` from the same commit, and `sources.toml` there records each one's repo, path, commit and licence (MIT, BSD or Apache only). `tests/test_real_lockfiles.py` reads them offline and pins what wheelgap reads from each (`EXPECTED`: packages, files, `n/a` cells, markers). The weekly [Lockfile corpus](.github/workflows/lockfile-corpus.yml) workflow runs `scripts/check_real_lockfiles.py` on each project's current file; it's a dev script, so it downloads with `urllib` directly rather than through `pypi.fetch_json`. Each failure says whether wheelgap **misread** the file (a bug to fix in `sources.py`) or the project **changed** it upstream (a new format version, a git dependency, a moved file: refresh the copy, add the version to `KNOWN_FORMATS` in the script once wheelgap reads it, or pick another project). To refresh a copy, download it and its licence at a pinned commit, update `commit` in `sources.toml` and the copy's line in `EXPECTED`, then check it:
+
+  ```bash
+  sha=$(gh api repos/pytest-dev/pluggy/commits/HEAD --jq .sha)
+  gh api -H "Accept: application/vnd.github.raw" "repos/pytest-dev/pluggy/contents/uv.lock?ref=$sha" > tests/fixtures/real/pluggy/uv.lock
+  gh api -H "Accept: application/vnd.github.raw" "repos/pytest-dev/pluggy/contents/LICENSE?ref=$sha" > tests/fixtures/real/pluggy/LICENSE
+  uv run python scripts/check_real_lockfiles.py --pinned pluggy
+  ```
+
+  Keep each copy under 100 KB, and leave the Poetry 1.x one (`cleo`) at its old commit.
 
 ## House rules
 
