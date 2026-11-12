@@ -17,7 +17,7 @@ import pytest
 from wheelgap import build, cache, pypi
 from wheelgap.build import describe, parse
 from wheelgap.cli import main
-from wheelgap.sources import Package, load_inputs
+from wheelgap.sources import Package, Source, load_inputs
 from wheelgap.targets import build_targets
 
 PYPI = "https://pypi.org/simple"
@@ -498,8 +498,15 @@ def test_a_cached_answer_is_checked_again():
 # Which releases are looked up (build.where)
 
 
+LOCK = Source("uv.lock")  # a lockfile: each package's registry says where it's from
+NAMES = Source("command line", pypi_only=True)  # names wheelgap looks up on PyPI itself
+
+
 def pkg(registry=PYPI, url=f"{FILES}/x-1.0.tar.gz", files=("x-1.0.tar.gz",), sha256=None, **kwargs):
     return Package("x", "1.0", files=list(files), registry=registry, sdist_url=url, sdist_sha256=sha256, **kwargs)
+
+
+FOUND = pkg(registry=None, url=None, found_on_pypi=True)  # looked up on pypi.org this run
 
 
 @pytest.mark.parametrize(
@@ -520,32 +527,24 @@ def pkg(registry=PYPI, url=f"{FILES}/x-1.0.tar.gz", files=("x-1.0.tar.gz",), sha
         (pkg(files=["x-1.0.zip"], url=f"{FILES}/x-1.0.zip"), None),
         (pkg(files=["x-1.0.tar.gz", "x-1.0.zip"]), None),  # which one pip takes isn't certain
         (pkg(files=["x-1.0-py3-none-any.whl"]), None),
-        (
-            pkg(registry=None, url=None, looked_up_on="https://pypi.org/pypi"),
-            (("https://pypi.org/pypi", "x", "1.0", ""), None),
-        ),
-        (pkg(registry=None, url=None, looked_up_on="https://mirror.example/pypi"), None),  # not this run's index
     ],
 )
 def test_where(package, expected):
-    assert build.where(package) == expected
+    assert build.where(package, LOCK) == expected
 
 
-def test_where_on_the_mirror_this_run_uses(monkeypatch):
-    mirror = "https://mirror.example/simple"
-    assert build.where(pkg(registry=mirror)) is None
-    assert build.where(pkg(url="https://mirror.example/f/x-1.0.tar.gz")) is None
+def test_where_follows_known_pypi(monkeypatch):
+    # The rule --conda-forge follows (origin.known_pypi): a name looked up on pypi.org counts only if its input names
+    # no other index, and nothing counts with another index in the run.
+    assert build.where(FOUND, NAMES) == (("https://pypi.org/pypi", "x", "1.0", ""), None)
+    assert build.where(FOUND, LOCK) is None  # a pdm.lock or pylock.toml re-checked with --online
+    assert build.where(pkg(), LOCK, simple_index="https://i.example/simple") is None
+    assert build.where(pkg(skip="private index"), LOCK) is None
+    monkeypatch.setenv("PIP_INDEX_URL", "https://i.example/simple")
+    assert build.where(FOUND, NAMES) is None
+    assert build.where(pkg(), LOCK) is not None  # the lock says where it came from
     monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://mirror.example/pypi")
-    assert build.where(pkg(registry=mirror))[0] == (mirror, "x", "1.0", "")
-    assert build.where(pkg(url="https://mirror.example/f/x-1.0.tar.gz")) is not None
-
-
-def test_only_packages_the_input_had_no_files_for_count_as_looked_up(fake_pypi):
-    listed = Package("nowheels", "0.9", files=["nowheels-0.9.tar.gz"])
-    unlisted = Package("nowheels", "0.9")
-    pypi.fill_all([listed, unlisted], refresh=True)
-    assert listed.files == unlisted.files == ["nowheels-0.9.tar.gz"]
-    assert (listed.looked_up_on, unlisted.looked_up_on) == (None, "https://pypi.org/pypi")
+    assert build.where(pkg(), LOCK) is None
 
 
 @pytest.mark.parametrize(
@@ -591,15 +590,15 @@ def x_sdist(tmp_path, *members):
 def test_only_verified_answers_are_cached(tmp_path, fake_files):
     data = x_sdist(tmp_path, member("x-1.0/README", b""))  # no pyproject.toml: that won't change
     fake_files.files["x-1.0.tar.gz"] = data
-    assert build.lookup(pkg(), phase(), read_cache=True, write_cache=True) is None
+    assert build.lookup(pkg(), LOCK, phase(), read_cache=True, write_cache=True) is None
     assert cache.load_build(PYPI, "x", "1.0", "") is None  # a lock's URL without a sha256: never cached
     p = pkg(sha256=sha(data))
-    assert build.lookup(p, phase(), read_cache=True, write_cache=True) is None
+    assert build.lookup(p, LOCK, phase(), read_cache=True, write_cache=True) is None
     assert cache.load_build(PYPI, "x", "1.0", sha(data)) == {"answer": None}
     calls = len(fake_files.calls)
-    assert build.lookup(p, phase(), read_cache=True, write_cache=True) is None
+    assert build.lookup(p, LOCK, phase(), read_cache=True, write_cache=True) is None
     assert len(fake_files.calls) == calls  # from the cache
-    assert build.lookup(p, phase(), read_cache=False, write_cache=True) is None
+    assert build.lookup(p, LOCK, phase(), read_cache=False, write_cache=True) is None
     assert len(fake_files.calls) == calls + 1
 
 
@@ -607,19 +606,19 @@ def test_failures_are_not_cached(tmp_path, fake_files):
     data = x_sdist(tmp_path)
     p = pkg(sha256=sha(data))
     fake_files.files["x-1.0.tar.gz"] = urllib.error.URLError("down")
-    assert build.lookup(p, phase(), write_cache=True) is None
+    assert build.lookup(p, LOCK, phase(), write_cache=True) is None
     fake_files.files["x-1.0.tar.gz"] = b"<html>corrupted</html>"  # not the file the lock names
-    assert build.lookup(p, phase(), write_cache=True) is None
+    assert build.lookup(p, LOCK, phase(), write_cache=True) is None
     assert cache.load_build(PYPI, "x", "1.0", sha(data)) is None
     fake_files.files["x-1.0.tar.gz"] = data
-    assert build.lookup(p, phase(), write_cache=True) is not None
+    assert build.lookup(p, LOCK, phase(), write_cache=True) is not None
     assert cache.load_build(PYPI, "x", "1.0", sha(data))["answer"]["requires"] == ["maturin>=1,<2"]
 
 
 def test_refused_sdists_are_cached(fake_files):
     data = b"not a tarball"
     fake_files.files["x-1.0.tar.gz"] = data
-    assert build.lookup(pkg(sha256=sha(data)), phase(), write_cache=True) is None
+    assert build.lookup(pkg(sha256=sha(data)), LOCK, phase(), write_cache=True) is None
     assert cache.load_build(PYPI, "x", "1.0", sha(data)) == {"answer": None}
 
 
@@ -628,16 +627,19 @@ def test_one_lock_cant_answer_for_another(tmp_path, fake_files):
     flit = x_sdist(tmp_path, member("x-1.0/pyproject.toml", b'[build-system]\nrequires = ["flit_core"]\n'))
     honest = pkg(sha256="ab" * 32)
     cache.save_build(PYPI, "x", "1.0", sha(flit), parse({"build-system": {"requires": ["flit_core"]}}))
-    assert cache.load_build(*build.release_of(honest)) is None
+    assert cache.load_build(*build.where(honest, LOCK)[0]) is None
     fake_files.files["x-1.0.tar.gz"] = x_sdist(tmp_path)
-    found, _ = build.lookup_all([pkg(sha256=sha(fake_files.files["x-1.0.tar.gz"])), honest, pkg()])
+    good, unhashed = pkg(sha256=sha(fake_files.files["x-1.0.tar.gz"])), pkg()
+    found, _ = build.lookup_all([(good, LOCK), (honest, LOCK), (unhashed, LOCK)])
     assert len(fake_files.calls) == 3  # one lookup each
+    assert set(found) == {id(good), id(unhashed)}  # the download isn't the file the honest lock names
 
 
 def test_one_lookup_per_release(tmp_path, fake_files):
     fake_files.files["x-1.0.tar.gz"] = x_sdist(tmp_path)
-    found, _ = build.lookup_all([pkg(), pkg(), pkg(registry=PYPI + "/")])
-    assert list(found) == [(PYPI, "x", "1.0", "")] and len(fake_files.calls) == 1
+    same = [pkg(), pkg(), pkg(registry=PYPI + "/")]
+    found, _ = build.lookup_all([(p, LOCK) for p in same])
+    assert set(found) == {id(p) for p in same} and len(fake_files.calls) == 1
 
 
 def test_sha256_from_the_json_api(tmp_path, fake_files, monkeypatch):
@@ -651,15 +653,15 @@ def test_sha256_from_the_json_api(tmp_path, fake_files, monkeypatch):
         return {"urls": [entry]}
 
     monkeypatch.setattr(pypi, "fetch_json", fetch_json)
-    looked_up = Package("x", "1.0", files=["x-1.0.tar.gz"], looked_up_on="https://pypi.org/pypi")
+    looked_up = Package("x", "1.0", files=["x-1.0.tar.gz"], found_on_pypi=True)
     digest = "0" * 64
-    assert build.lookup(looked_up, phase(), write_cache=True) is None
+    assert build.lookup(looked_up, NAMES, phase(), write_cache=True) is None
     assert cache.load_build("https://pypi.org/pypi", "x", "1.0", "") is None
     digest = None  # an index without digests: an answer, but not one to keep
-    assert build.lookup(looked_up, phase(), write_cache=True) is not None
+    assert build.lookup(looked_up, NAMES, phase(), write_cache=True) is not None
     assert cache.load_build("https://pypi.org/pypi", "x", "1.0", "") is None
     digest = sha(data)
-    assert build.lookup(looked_up, phase(), write_cache=True) is not None
+    assert build.lookup(looked_up, NAMES, phase(), write_cache=True) is not None
     assert cache.load_build("https://pypi.org/pypi", "x", "1.0", "") is not None
     assert asked == [(1, build.TIMEOUT, 1e9)] * 3
 
@@ -696,14 +698,14 @@ def test_load_build_age_and_keys(monkeypatch):
 def test_a_bad_backend_in_the_cache_is_no_answer(fake_files):
     bad = {"requires": ["flit_core"], "backend": "x\n::error::y", "backend_path": False, "build_script": False}
     cache.save_build(PYPI, "x", "1.0", "ab" * 32, bad)
-    assert build.lookup(pkg(sha256="ab" * 32), phase(), read_cache=True) is None
+    assert build.lookup(pkg(sha256="ab" * 32), LOCK, phase(), read_cache=True) is None
     assert fake_files.calls == []
 
 
 def test_no_request_after_the_deadline(fake_files, clock):
     p = phase(deadline=10.0)
     clock[0] = 10.0
-    assert build.lookup(pkg(), p) is None
+    assert build.lookup(pkg(), LOCK, p) is None
     assert (p.stopped, fake_files.calls) == ("time", [])
 
 
@@ -712,7 +714,7 @@ def test_the_first_connection_failure_stops_the_rest(fake_files, monkeypatch):
     fake_files.files["a-1.0.tar.gz"] = urllib.error.URLError("down")
     a = Package("a", "1.0", files=["a-1.0.tar.gz"], registry=PYPI, sdist_url=f"{FILES}/a-1.0.tar.gz")
     b = Package("b", "1.0", files=["b-1.0.tar.gz"], registry=PYPI, sdist_url=f"{FILES}/b-1.0.tar.gz")
-    found, note = build.lookup_all([a, b])
+    found, note = build.lookup_all([(a, LOCK), (b, LOCK)])
     assert found == {} and note == "build info: stopped after a connection failure; 2 packages not read"
     assert fake_files.calls == [f"{FILES}/a-1.0.tar.gz"]
 
@@ -720,7 +722,10 @@ def test_the_first_connection_failure_stops_the_rest(fake_files, monkeypatch):
 def test_lookup_all_stops_at_the_deadline(tmp_path, fake_files, clock):
     data = x_sdist(tmp_path)
     fake_files.files["x-1.0.tar.gz"] = lambda: Dribble(data, clock)
-    assert build.lookup_all([pkg(sha256=sha(data))]) == ({}, "build info: stopped after 35 s; 1 package not read")
+    assert build.lookup_all([(pkg(sha256=sha(data)), LOCK)]) == (
+        {},
+        "build info: stopped after 35 s; 1 package not read",
+    )
     assert cache.load_build(PYPI, "x", "1.0", sha(data)) is None
 
 
@@ -838,9 +843,9 @@ def test_offline_and_private_index_names_download_nothing(capsys, tmp_path, fake
     _, out, _ = run(capsys, "nowheels==0.9", *TARGETS, "--explain", "--build-info", *index)
     assert "nowheels 0.9 on linux-x86_64: ● source" in out
     assert "build needs" not in out and fake_pypi == [] and fake_files.calls == []
-    # ...while a lock's PyPI package still is.
+    # ...and with another index in the run, nothing counts as PyPI's (origin.known_pypi).
     _, out, _ = run(capsys, uv_lock(tmp_path), *TARGETS, "--explain", "--build-info", *index)
-    assert "build needs" in out and fake_pypi == []
+    assert "build needs" not in out and fake_files.calls == []
 
 
 def test_only_source_cells(capsys, tmp_path, fake_pypi, fake_files):
