@@ -124,6 +124,6 @@ why), a result explains the gap the way `--explain` does:
   `check_lockfile()` fills it for `uv.lock`, and for `poetry.lock` files older than lock-version 2.1; it's empty for
   other inputs and for `check_package()`.
 
-All three are worked out when first read. `to_dict()` leaves them out, and `to_dict(explain=True)` adds `"rejected"`
-and `"via"` in the same shapes as `wheelgap --json --explain`: each keyed by target label, `rejected` as
-`{"file", "reason"}` objects.
+`rejected` and `reasons` are worked out when first read; `via` is filled in when the result is made. `to_dict()` leaves
+all three out, and `to_dict(explain=True)` adds `"rejected"` and `"via"` in the same shapes as
+`wheelgap --json --explain`: each keyed by target label, `rejected` as `{"file", "reason"}` objects.

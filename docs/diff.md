@@ -21,7 +21,7 @@ It exits `1` if there are any, `0` if not, and `2` on bad input. `python -m whee
 | `--json` | print one JSON object instead of the text report |
 
 The same `-p` and `-t` apply to both lockfiles. `[tool.wheelgap]` and `.python-version` aren't read yet, so pass them
-explicitly. `wheelgap diff` has no `--advisory` yet.
+explicitly. `--advisory` (after 0.9.0) doesn't work with `wheelgap diff` yet.
 
 ## What counts as worse
 
@@ -53,12 +53,20 @@ it at that ref, if any), so its format is detected and read as usual. `PATH` is 
 
 `--json` prints one object with:
 
-- `worse`: each package's `old_versions` and `new_versions` lists and, per target, `old_status` and `new_status`;
-- `new`: each new package's `versions` and per-target `status`;
-- `unchecked`;
-- `summary` counts.
+- `version`: the wheelgap version;
+- `targets`: each target's `label`, `python` and `platform`, as in the main command's `--json`; the per-target keys
+  below are these labels;
+- `worse`: each package's `name`, its `old_versions` and `new_versions` lists, and `targets`, with `old_status` and
+  `new_status` for each target where it got worse;
+- `new`: each new package's `name`, its `versions` list, and `targets`, with the `status` for each target where it
+  has a gap;
+- `unchecked`: the names of packages that were `unknown` on both sides of a target at the same version, so neither
+  side could be checked there;
+- `summary`: the `worse` and `new` counts.
 
-A skipped cell has the status `skipped` and a `skip_reason` (`git`, `url`, `private index`, ...).
+A skipped cell has the status `skipped` and a reason: `skip_reason` in `new`, and `old_skip_reason` or
+`new_skip_reason` in `worse` (`git`, `url`, `private index`, ...). Versions are lists: empty when the input gives no
+version, and several for a `uv.lock` fork.
 
 ## The `diff` name
 

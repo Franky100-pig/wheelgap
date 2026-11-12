@@ -195,11 +195,11 @@ works only when the client shares its
 
 `check_lockfile` and `check_dockerfile` apply the project's `[tool.wheelgap]`
 settings. Their `ok` is true only when no package has a gap on any target. In
-releases after 0.9.0, `passes` is the command line's verdict (exit code 0), which also accepts gaps on
-the project's advisory targets (`advisory = [...]`) and, with
-`fail-on = "missing"`, source builds. The result lists the advisory targets
-under `advisory`, and each entry in `gaps` has `advisory_gaps`: which of its
-`gaps` are on advisory targets.
+releases after 0.9.0, `passes` is the command line's verdict (exit code 0),
+which also accepts gaps on the project's advisory targets (`advisory = [...]`)
+and, with `fail-on = "missing"`, source builds. In releases after 0.9.0, the
+result also lists the advisory targets under `advisory`, and each entry in
+`gaps` has `advisory_gaps`: which of its `gaps` are on advisory targets.
 
 In releases after 0.9.0, you can also ask why a package has no wheel for a
 target:

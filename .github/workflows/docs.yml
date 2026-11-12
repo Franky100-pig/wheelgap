@@ -13,6 +13,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same branch or pull request cancels the older build. Deploys queue instead (see deploy).
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -22,7 +27,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       # --strict fails the build on a broken link or #anchor, a page missing from the nav, or a bad config.
-      - run: uv run --only-group docs mkdocs build --strict --site-dir _site
+      - run: uv run --locked --only-group docs mkdocs build --strict --site-dir _site
         env:
           NO_MKDOCS_2_WARNING: "1"
       - if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
@@ -45,8 +50,8 @@ jobs:
         run: |
           if out=$(gh api "repos/$GITHUB_REPOSITORY/pages" --jq .build_type 2>&1); then
             build_type=$out
-          elif [[ $out == *"HTTP 404"* ]]; then
-            build_type="not enabled"
+          elif [[ $out == *"HTTP 404"* || $out == *"HTTP 403"* ]]; then
+            build_type="not enabled, or not readable with this token"
           else
             echo "::error title=Couldn't read the GitHub Pages settings::$out"
             exit 1

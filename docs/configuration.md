@@ -73,7 +73,9 @@ Same as [`--android-api`](cli.md#android-api).
 ### `pyodide-lock` {#pyodide-lock}
 
 A Pyodide release's `pyodide-lock.json`, as a path or `https://` URL: packages Pyodide ships itself count as
-`bundled` on `pyodide` targets. Same as [`--pyodide-lock`](cli.md#pyodide-lock); see [Pyodide](targets.md#pyodide).
+`bundled` on `pyodide` targets. A relative path is relative to the `pyproject.toml`. The lock is only read (or
+downloaded) on runs that check a `pyodide` target, so it doesn't affect `wheelgap -t linux` in the same project. Same
+as [`--pyodide-lock`](cli.md#pyodide-lock); see [Pyodide](targets.md#pyodide).
 
 ## Dependencies
 

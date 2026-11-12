@@ -6,11 +6,14 @@ These read the Markdown sources directly, so they don't need MkDocs installed.
 import importlib.util
 import json
 import re
+from collections import Counter
 from pathlib import Path
 
 import pytest
 
-from wheelgap import cli
+import wheelgap
+from wheelgap import cli, targets
+from wheelgap.check import EXPLAIN_LIMIT
 
 ROOT = Path(__file__).resolve().parent.parent
 DOCS = ROOT / "docs"
@@ -92,10 +95,10 @@ def load_schema_hook():
 
 
 def test_output_page_renders_every_schema_key():
-    """docs/output.md gets the --json reference from docs/wheelgap-output.schema.json, with every key in it."""
+    """docs/output.md gets the --json reference from docs/wheelgap-output.schema.json, with every key in it: as many
+    rows ending in a key's name as the schema has properties of that name (`name` is in several objects)."""
     hook = load_schema_hook()
     assert hook.PLACEHOLDER in (DOCS / "output.md").read_text(encoding="utf-8")
-    table = hook.render()
     schema = json.loads((DOCS / "wheelgap-output.schema.json").read_text(encoding="utf-8"))
 
     def names(node):
@@ -107,8 +110,13 @@ def test_output_page_renders_every_schema_key():
             for value in node:
                 yield from names(value)
 
-    for name in set(names(schema)):
-        assert re.search(rf"[`.\]]{re.escape(name)}`", table), name
+    # Each $defs entry is rendered once per $ref to it, so this assumes every definition is referenced once.
+    refs = re.findall(r'"\$ref": "#/\$defs/(\w+)"', json.dumps(schema))
+    assert sorted(refs) == sorted(schema.get("$defs", {}))
+    expected = Counter(names(schema))
+    rendered = Counter(key.strip("`").rsplit(".", 1)[-1] for key, _, _, _ in hook.rows(schema))
+    rendered = Counter({name: n for name, n in rendered.items() if not name.endswith(("]", ">"))})
+    assert rendered == expected
 
 
 def github_anchor(heading: str) -> str:
@@ -147,3 +155,64 @@ def test_readme_keeps_the_mcp_registry_marker():
     """The MCP Registry checks that the PyPI package's README names the server."""
     name = json.loads((ROOT / "server.json").read_text(encoding="utf-8"))["name"]
     assert f"<!-- mcp-name: {name} -->" in (ROOT / "README.md").read_text(encoding="utf-8")
+
+
+def test_version_markers_name_the_current_release():
+    """Docs mark what isn't released yet as "after X.Y.Z" (or "not in X.Y.Z"), X.Y.Z being the version on main. When
+    a release bumps the version, this fails until those markers are removed or updated."""
+    stale = []
+    for path in [ROOT / "README.md", *sorted(DOCS.glob("*.md"))]:
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            for version in re.findall(r"(?i)\b(?:after|not in) (\d+\.\d+\.\d+)\b", line):
+                if version != wheelgap.__version__:
+                    stale.append(f"{path.relative_to(ROOT)}:{n}: {version}")
+    assert stale == [], f"wheelgap is {wheelgap.__version__}"
+
+
+def documented_defaults():
+    glibc, musl, macos, ios, api = (
+        targets.DEFAULT_GLIBC,
+        targets.DEFAULT_MUSL,
+        targets.DEFAULT_MACOS,
+        targets.DEFAULT_IOS,
+        targets.DEFAULT_ANDROID_API,
+    )
+    platforms = targets.DEFAULT_PLATFORMS
+    spelled = ", ".join(f"`{p}`" for p in platforms[:-1]) + f" and `{platforms[-1]}`"
+    native = ", ".join(f"`{p}`" for p in targets.NATIVE_PLATFORMS[:-1]) + f" and `{targets.NATIVE_PLATFORMS[-1]}`"
+    return [
+        ("cli.md", f"`{','.join(platforms)}`"),
+        ("cli.md", f"`linux-*` targets (default {glibc})"),
+        ("cli.md", f"`musl-*` targets (default {musl})"),
+        ("cli.md", f"`macos-*` targets (default {macos})"),
+        ("cli.md", f"`ios-*` targets (default {ios})"),
+        ("cli.md", f"`android-*` targets (default {api})"),
+        ("configuration.md", f"Default {glibc}."),
+        ("configuration.md", f"Default {musl}."),
+        ("configuration.md", f"Default {macos}."),
+        ("configuration.md", f"Default {ios}."),
+        ("configuration.md", f"Default {api}."),
+        ("targets.md", f"| `--glibc X.Y` | `glibc` | {glibc} |"),
+        ("targets.md", f"| `--musl X.Y` | `musl` | {musl} |"),
+        ("targets.md", f"| `--macos X.Y` | `macos` | {macos} |"),
+        ("targets.md", f"| `--ios X.Y` | `ios` | {ios} |"),
+        ("targets.md", f"| `--android-api N` | `android-api` | {api} |"),
+        ("targets.md", f"up to `--glibc` (default {glibc})"),
+        ("targets.md", f"up to `--musl` (default {musl})"),
+        ("targets.md", f"up to `--macos` (default {macos})"),
+        ("targets.md", f"up to `--ios` (default {ios})"),
+        ("targets.md", f"up to `--android-api` (default {api})"),
+        ("targets.md", f"the built-in defaults: {spelled}."),
+        ("targets.md", f"the eight common native platforms: {native}."),
+        ("getting-started.md", f"on {spelled}."),
+        ("faq.md", f"glibc {glibc}, musl {musl}, macOS {macos}, iOS {ios} and Android API {api}"),
+        ("output.md", f"(up to {EXPLAIN_LIMIT} per target"),
+        ("python-api.md", f"(the command line shows {EXPLAIN_LIMIT})"),
+    ]
+
+
+@pytest.mark.parametrize(("page", "text"), documented_defaults())
+def test_docs_state_the_current_defaults(page, text):
+    """Where a page states a default (targets, libc and OS floors, the --explain limit), it's the one in the code.
+    Whitespace is normalized, since the Markdown is wrapped."""
+    assert text in " ".join((DOCS / page).read_text(encoding="utf-8").split())

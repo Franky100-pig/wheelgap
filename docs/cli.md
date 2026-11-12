@@ -9,8 +9,8 @@ wheelgap mcp            (after 0.9.0; or wheelgap-mcp)
 `INPUT` is a lockfile, a requirements file, a `pyproject.toml`, a directory, or package specs such as `numpy==2.3.4`
 (default: the current directory). See [Inputs](inputs.md).
 
-Flags that take a list (`-p`, `-t`, `--extra`, `--group`, `--only-group`, `--ignore`, `--advisory`) can be repeated;
-`-p`, `-t`, `--ignore` and `--advisory` also take comma-separated values. Flags win over
+Flags that take a list (`-p`, `-t`, `--extra`, `--group`, `--only-group`, `--ignore`, and after 0.9.0 `--advisory`)
+can be repeated; `-p`, `-t`, `--ignore` and `--advisory` also take comma-separated values. Flags win over
 [`[tool.wheelgap]`](configuration.md).
 
 `wheelgap --help` lists the flags of the version you run. This page describes `main`; flags marked **after 0.9.0**
@@ -96,7 +96,7 @@ per advisory target, while the line above it counts packages), and `--json` list
   isn't counted as an advisory gap.
 - In `--junit` reports an advisory gap is a skipped testcase with the message `advisory: source` (or `missing`,
   `unknown`), not a failure.
-- `wheelgap diff` has no `--advisory` yet.
+- `--advisory` (after 0.9.0) doesn't work with `wheelgap diff` yet.
 
 ## Dependency selection
 
@@ -255,10 +255,13 @@ and `--json`. See [Comparing two lockfiles](diff.md).
 
 **After 0.9.0.** Start the MCP server, as `wheelgap-mcp` does. See [MCP server](mcp.md).
 
+## Other commands
+
 ### `python -m wheelgap.scan` {#scan}
 
-Check the latest release of the most-downloaded PyPI packages; the data behind the
-[coverage tracker](https://wheelgap.github.io/tracker/). See [How it works](how-it-works.md#scanning-the-top-pypi-packages).
+Not a `wheelgap` subcommand: a module that checks the latest release of the most-downloaded PyPI packages, the data
+behind the [coverage tracker](https://wheelgap.github.io/tracker/). See
+[How it works](how-it-works.md#scanning-the-top-pypi-packages).
 
 ## Environment variables
 

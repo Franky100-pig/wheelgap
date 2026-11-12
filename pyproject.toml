@@ -25,6 +25,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/wheelgap/wheelgap"
+Documentation = "https://wheelgap.github.io/wheelgap/"
 Issues = "https://github.com/wheelgap/wheelgap/issues"
 Changelog = "https://github.com/wheelgap/wheelgap/blob/main/CHANGELOG.md"
 

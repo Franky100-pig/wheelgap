@@ -18,16 +18,17 @@ Or install it: `pip install wheelgap`. wheelgap needs Python 3.11 or later, and 
 [`packaging`](https://packaging.pypa.io/).
 
 Run it in a project directory. It finds `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`,
-`requirements.txt` or `requirements.lock` on its own, and reads the first of those it finds. You can also pass a file, a directory, or
-package names. [Inputs](inputs.md) has the details.
+`requirements.txt` or `requirements.lock` on its own, and reads the first of those it finds. You can also pass a file,
+a directory, or package names. [Inputs](inputs.md) has the details.
 
 `uvx wheelgap` can reuse an older copy that uv installed or cached. Run `uvx wheelgap@latest` for the newest release,
 or pin one (`uvx wheelgap@0.9.0`) when the result must not change between runs.
 
 ## Pick your Python and platforms
 
-With no flags and no configuration, wheelgap checks the Python it runs on (or the one in a `.python-version` file next to the lockfile)
-on `linux-x86_64`, `linux-aarch64`, `macos-arm64` and `win-amd64`. Say what you ship to with `-p` and `-t`:
+With no flags and no configuration, wheelgap checks the Python it runs on (or the one in a `.python-version` file next
+to the lockfile) on `linux-x86_64`, `linux-aarch64`, `macos-arm64` and `win-amd64`. Say what you ship to with `-p` and
+`-t`:
 
 ```bash
 # Will my Alpine ARM image compile anything?

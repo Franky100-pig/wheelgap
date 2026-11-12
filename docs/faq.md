@@ -35,8 +35,9 @@ be used and a package without a matching wheel shows as `✗ missing`. `--explai
 
 ## What does unknown mean?
 
-wheelgap couldn't check the package, so it doesn't guess. The package's `error` in `--json` says why: a lookup that failed, a version that isn't on the index, or a constraint it can't apply. `unknown`
-counts as a gap and exits 1, even with `--fail-on missing`.
+wheelgap couldn't check the package, so it doesn't guess. The package's `error` in `--json` says why: a lookup that
+failed, a version that isn't on the index, or a constraint it can't apply. `unknown` counts as a gap and exits 1, even
+with `--fail-on missing`.
 
 ## Why is a package skipped?
 

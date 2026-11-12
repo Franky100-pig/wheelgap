@@ -22,8 +22,21 @@ drops ARM wheels. The gap table also goes to the run's summary page.
 | `summary` | `"true"` | also write the gap table to the job summary page (skipped when `args` include `--json`); `"false"` turns it off |
 
 The step's result is wheelgap's exit code: [`--fail-on missing`](cli.md#fail-on), [`--ignore`](cli.md#ignore) and
-[`--exit-zero`](cli.md#exit-zero) in `args` work as they do on the command line. To compare the lockfile with the base
-branch's instead, put a [`diff`](diff.md) command in `args`.
+[`--exit-zero`](cli.md#exit-zero) in `args` work as they do on the command line.
+
+To compare the lockfile with the base branch's instead, put a [`diff`](diff.md) command in `args` and set
+`summary: "false"`. The summary is a second run that puts `--markdown` and other flags before `args`, so with a `diff`
+command it would check a PyPI package named `diff` instead:
+
+```yaml
+- uses: actions/checkout@v7
+  with:
+    fetch-depth: 0  # so git can read the base branch's lockfile
+- uses: wheelgap/wheelgap@v0.9.0
+  with:
+    args: diff origin/${{ github.base_ref }}:uv.lock uv.lock -p 3.13 -t linux-x86_64,linux-aarch64
+    summary: "false"
+```
 
 ### Annotations {#annotations}
 
