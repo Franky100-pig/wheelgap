@@ -236,6 +236,7 @@ def check_lockfile(
     online: bool = False,
     offline: bool = False,
     pyodide_locks: Iterable[PyodideLock] = (),
+    environment: str | None = None,
 ) -> list[Result]:
     """Check every package a lockfile (or a project directory) installs on at least one target.
 
@@ -246,8 +247,12 @@ def check_lockfile(
     other-Python recheck is skipped. Locked files may therefore omit wheels for those Python versions.
     online=True and offline=True cannot be combined.
     pyodide_locks work as in check_packages(), and are checked before the lockfile is read.
+    environment picks a pixi.lock environment (default: `default`); in a project directory it makes pixi.lock the
+    lockfile read. Naming one for any other lockfile raises SourceError.
     """
-    return _check_lockfile(path, targets, online=online, offline=offline, pyodide_locks=pyodide_locks)[0]
+    return _check_lockfile(
+        path, targets, online=online, offline=offline, pyodide_locks=pyodide_locks, environment=environment
+    )[0]
 
 
 def _check_lockfile(
@@ -257,6 +262,7 @@ def _check_lockfile(
     online: bool,
     offline: bool,
     pyodide_locks: Iterable[PyodideLock] = (),
+    environment: str | None = None,
 ) -> tuple[list[Result], Source]:
     """check_lockfile(), also returning the loaded source (diff.py needs its skipped packages)."""
     targets = _package_targets(targets)
@@ -265,13 +271,15 @@ def _check_lockfile(
         raise ValueError("online=True and offline=True cannot be combined")
     check_locks(pyodide_locks, targets)
     p = Path(path)
-    lockfile = find_lockfile(p) if p.is_dir() else p
+    lockfile = find_lockfile(p, environment is not None) if p.is_dir() else p
     if lockfile.name == "pyproject.toml":  # direct dependencies only; the command line says so in a note
         raise SourceError(
             f"{lockfile}: a pyproject.toml lists direct dependencies only, so check_lockfile() and "
             "wheelgap.diff don't read it; pass a lockfile (the wheelgap command checks a pyproject.toml)"
         )
-    source: Source = load_file(lockfile)
+    source: Source = load_file(lockfile, environment)
+    if environment is not None and source.kind != "pixi":
+        raise SourceError(f"{lockfile}: environment applies to pixi.lock only")
     if offline:
         require_offline([source], "offline=True", undo="set offline=False")
     fill_all(source.packages, refresh=online, python=single_python(targets))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import http.client
 import json
 import math
@@ -105,10 +106,35 @@ def _request(req: urllib.request.Request, timeout: float, attempts: int, read):
     raise last  # type: ignore[misc]
 
 
-def fetch_json(url: str, timeout: float = 20.0, attempts: int = 4) -> dict:
-    """GET a JSON document (see _request for what is retried)."""
-    req = urllib.request.Request(url, headers={"User-Agent": f"wheelgap/{__version__}", "Accept": "application/json"})
-    return _request(req, timeout, attempts, json.load)
+class ResponseTooLarge(ValueError):
+    """A capped fetch_json response (after gzip decoding, if it was gzipped) was over the cap."""
+
+
+def _read_capped(resp, max_bytes: int) -> bytes:
+    encoding = (resp.headers.get("Content-Encoding") or "identity").strip().lower()
+    if encoding not in ("identity", "gzip"):
+        raise ValueError(f"unexpected Content-Encoding {encoding}")  # only gzip was offered
+    if encoding == "gzip":
+        with gzip.GzipFile(fileobj=resp) as f:  # decoded as it's read, and no further than the cap
+            body = f.read(max_bytes + 1)
+    else:
+        body = resp.read(max_bytes + 1)
+    if len(body) > max_bytes:
+        raise ResponseTooLarge(f"response over {max_bytes} bytes")
+    return body
+
+
+def fetch_json(url: str, timeout: float = 20.0, attempts: int = 4, max_bytes: int | None = None) -> dict:
+    """GET a JSON document (see _request for what is retried).
+
+    With max_bytes, for documents that can be large: the server may send it gzipped (decoded as it's read), and a body
+    over max_bytes raises ResponseTooLarge (not retried) after reading no more than max_bytes + 1 bytes of it."""
+    headers = {"User-Agent": f"wheelgap/{__version__}", "Accept": "application/json"}
+    if max_bytes is None:
+        return _request(urllib.request.Request(url, headers=headers), timeout, attempts, json.load)
+    headers["Accept-Encoding"] = "gzip"
+    req = urllib.request.Request(url, headers=headers)
+    return _request(req, timeout, attempts, lambda resp: json.loads(_read_capped(resp, max_bytes)))
 
 
 SIMPLE_JSON = "application/vnd.pypi.simple.v1+json"
@@ -345,6 +371,7 @@ def fill(pkg: Package, python: str | None = None, read_cache: bool = False, writ
         else:
             names = [u["filename"] for u in urls if not u.get("yanked")]
         pkg.files = names
+        pkg.found_on_pypi = base == DEFAULT_INDEX
         # Only a fresh answer that parsed and listed its files: a body with no "urls" ({}) reads as no files,
         # and caching that would turn a bad response into a day of false "missing" answers.
         if key and write_cache and cached is None and isinstance(data.get("urls"), list):
@@ -358,8 +385,9 @@ PYPI_SIMPLE = "https://pypi.org/simple"
 
 
 def is_pypi(registry: str | None) -> bool:
-    """Whether a package pinned to `registry` comes from PyPI: unset (the default index) or exactly PYPI_SIMPLE."""
-    return (registry or PYPI_SIMPLE).rstrip("/") == PYPI_SIMPLE
+    """Whether a package pinned to `registry` comes from PyPI: unset (None: the default index) or exactly PYPI_SIMPLE.
+    An empty registry ("") isn't PyPI: it says nothing about where the package came from."""
+    return registry is None or (isinstance(registry, str) and registry.rstrip("/") == PYPI_SIMPLE)
 
 
 def _index(url: str, suffix: str) -> tuple[str, str, int | None, str] | None:
@@ -395,8 +423,9 @@ def may_look_up(registry: str | None, simple_index: str | None = None) -> bool:
 
 
 def keeps_locked_files(p: Package) -> bool:
-    """Under --online, a package from another index keeps the files in the lock: PyPI doesn't know it."""
-    return not p.skip and p.files is not None and not is_pypi(p.registry)
+    """Under --online, a package from another index keeps the files in the lock: PyPI doesn't know it. Never one with
+    partial_files (pixi.lock), whose locked files can't answer most targets: it's looked up or skipped instead."""
+    return not p.skip and p.files is not None and not p.partial_files and not is_pypi(p.registry)
 
 
 def recheck_lock(
@@ -449,7 +478,8 @@ def fill_all(
 ) -> int:
     """Look packages up on PyPI. A package the lock says came from another index is never looked up: PyPI doesn't
     know it. With refresh (--online) it keeps its locked files; with no files (an old poetry.lock, a Pipfile.lock)
-    it is skipped as a private index, unless WHEELGAP_INDEX_URL is that same index (see may_look_up).
+    it is skipped as a private index, unless WHEELGAP_INDEX_URL is that same index (see may_look_up). A package with
+    partial_files (pixi.lock) is always looked up, and skipped as a private index where it can't be.
     `python` limits range resolution to releases supporting that interpreter.
     With `simple_index` (--index-url), lookups go to that PEP 691 simple index instead of PyPI's JSON API.
     `read_cache` and `write_cache` read pinned JSON API lookups from, and save them to, the on-disk cache (see
@@ -461,11 +491,15 @@ def fill_all(
         base, auth = split_credentials(simple_index)  # validate first: a bad URL fails before any lookup
         fn = partial(fill_simple, base=base, auth=auth, python=python)
     for p in packages:
-        if p.files is None and not p.skip and not may_look_up(p.registry, simple_index):
+        if (p.files is None or p.partial_files) and not p.skip and not may_look_up(p.registry, simple_index):
             p.skip = "private index"  # the name is internal; a namesake on PyPI is another package
     kept = {id(p) for p in packages if refresh and keeps_locked_files(p)}
     # An error from parsing (a constraint wheelgap can't apply) stays unknown: a lookup would hide it.
-    todo = [p for p in packages if not p.skip and not p.error and id(p) not in kept and (refresh or p.files is None)]
+    todo = [
+        p
+        for p in packages
+        if not p.skip and not p.error and id(p) not in kept and (refresh or p.files is None or p.partial_files)
+    ]
     report = _progress.get()
     if todo:
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -476,4 +510,7 @@ def fill_all(
                 for done, future in enumerate(as_completed([pool.submit(fn, p) for p in todo]), 1):
                     future.result()
                     report(done, len(todo))
+    for p in todo:
+        if p.partial_files and p.error:
+            p.files = None  # never judged on the lock's partial files, not even by --explain
     return len(kept)
