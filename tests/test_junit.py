@@ -235,9 +235,27 @@ def test_junit_advisory_gap_is_skipped_not_failed(capsys, fixtures, tmp_path):
 
 def test_junit_advisory_gap_beats_a_pass_from_another_input():
     (target,) = build_targets(["3.13"], ["win-arm64"])
-    for statuses in ([Status.WHEEL, Status.SOURCE], [Status.SOURCE, Status.WHEEL]):
+    for statuses, worst in (
+        ([Status.WHEEL, Status.SOURCE], "source"),
+        ([Status.SOURCE, Status.WHEEL], "source"),
+        # As on a required target, a package that can't install beats a source build, whichever input is first.
+        ([Status.SOURCE, Status.MISSING], "missing"),
+        ([Status.MISSING, Status.SOURCE], "missing"),
+        ([Status.UNKNOWN, Status.SOURCE], "unknown"),
+    ):
         rows = [Row(Package("armlib", "1.4.0"), {target: s}) for s in statuses]
         (suite,) = ET.fromstring(junit_xml(rows, [target], "source", frozenset({target}))).findall("testsuite")
         (case,) = suite.findall("testcase")
-        assert case.find("skipped").get("message") == "advisory: source"
+        assert case.find("skipped").get("message") == f"advisory: {worst}"
         assert (suite.get("failures"), suite.get("skipped")) == ("0", "1")
+
+
+def test_junit_ignored_beats_advisory(capsys, fixtures, tmp_path):
+    report = tmp_path / "report.xml"
+    args = [str(fixtures / "armgap"), "-p", "3.13", "-t", "linux-aarch64,musl-aarch64", "--junit", str(report)]
+    code, _, err = run(capsys, *args, "--advisory", "musl-aarch64", "--ignore", "armlib:musl-aarch64")
+    assert code == 1, err  # newglibc is missing on linux-aarch64
+    musl = _suites(report)["musl-aarch64"]
+    # An ignored gap is accepted outright, so it says so rather than reporting it as an advisory gap.
+    assert _case(musl, "armlib").find("skipped").get("message") == "ignored"
+    assert _case(musl, "newglibc").find("skipped").get("message") == "advisory: missing"

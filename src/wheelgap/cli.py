@@ -235,7 +235,7 @@ def make_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="TARGET",
         help="report gaps on TARGET (anything -t takes; repeatable, comma-separated) without letting them fail "
-        "the run; TARGET must be one of the checked targets",
+        "the run; TARGET must be a checked target, and a group like all means the checked ones among its members",
     )
     p.add_argument("--exit-zero", action="store_true", help="exit 0 even when gaps are found")
     p.add_argument(
@@ -447,19 +447,52 @@ def required_statuses(row: Row, advisory: frozenset[Target]) -> list[Status]:
 
 
 def advisory_line(rows: list[Row], targets: list[Target], advisory: frozenset[Target]) -> str:
-    """'3 gaps on advisory targets win-arm64, 3.14t linux-x86_64 don't fail the run.', or '' without any."""
+    """'4 gaps in 2 packages on advisory targets win-arm64, 3.14t linux-x86_64 don't fail the run.', or ''.
+
+    It counts cells (a package with gaps on two advisory targets has two), so it names the packages too: the gap
+    summary above it counts packages.
+    """
     multi_py = len({t.python for t in targets}) > 1
-    counts = {
-        t: sum(1 for r in rows if t not in r.ignored and r.results[t] in GAP_STATUSES) for t in targets if t in advisory
-    }
-    labels = [t.label(multi_py) for t, n in counts.items() if n]
-    n = sum(counts.values())
-    if not n:
+    cells = [
+        (r, t) for r in rows for t in targets if t in advisory and t not in r.ignored and r.results[t] in GAP_STATUSES
+    ]
+    if not cells:
         return ""
+    labels = [t.label(multi_py) for t in targets if any(t is cell_target for _, cell_target in cells)]
+    n, packages = len(cells), len({id(r) for r, _ in cells})
     return (
-        f"{n} gap{'s' * (n != 1)} on advisory target{'s' * (len(labels) != 1)} {', '.join(labels)} "
-        f"{'do' if n != 1 else 'does'}n't fail the run."
+        f"{n} gap{'s' * (n != 1)} in {packages} package{'s' * (packages != 1)} on advisory "
+        f"target{'s' * (len(labels) != 1)} {', '.join(labels)} {'do' if n != 1 else 'does'}n't fail the run."
     )
+
+
+# -t names that stand for several platforms (see resolve_platforms): as --advisory values they mean the checked ones.
+PLATFORM_GROUPS = ("all", "everything", "mobile")
+
+
+def resolve_advisory(values: list[str], how: str, docker_musl: bool, checked: list[str]) -> tuple[list[str], list[str]]:
+    """The checked platforms --advisory (or advisory = [...]) names, and the entries that name none of them.
+
+    A single target (a name, an alias, a Docker name) must be checked itself. A group such as all stands for the
+    checked targets among its members, so `-t linux-x86_64,win-arm64 --advisory all` marks both; it names none
+    only when no member is checked.
+    """
+    platforms: list[str] = []
+    unchecked: list[str] = []
+    for value in values:
+        for entry in (part.strip() for part in value.split(",")):
+            if not entry:
+                continue
+            try:
+                members = resolve_platforms([musl_docker_names(entry) if docker_musl else entry])
+            except TargetError as e:
+                raise TargetError(f"{how}: {e}") from None
+            hits = [p for p in members if p in checked]
+            if hits and (entry.lower() in PLATFORM_GROUPS or len(hits) == len(members)):
+                platforms += hits
+            else:
+                unchecked.append(entry)
+    return list(dict.fromkeys(platforms)), unchecked
 
 
 def render_table(
@@ -1007,17 +1040,14 @@ def main(argv: list[str] | None = None) -> int:
         ]
         # Like --ignore, --advisory replaces the configured list (and --advisory "" clears it).
         advisory_how = "--advisory" if args.advisory else "advisory in [tool.wheelgap]"
-        try:
-            advisory_platforms = resolve_platforms(
-                musl_docker_names(item) if docker_musl else item for item in args.advisory or config.get("advisory", [])
-            )
-        except TargetError as e:
-            raise TargetError(f"{advisory_how}: {e}") from None
         checked_platforms = list(dict.fromkeys(t.platform for t in targets))
-        if unchecked_advisory := [p for p in advisory_platforms if p not in checked_platforms]:
+        advisory_platforms, unchecked_advisory = resolve_advisory(
+            args.advisory or config.get("advisory", []), advisory_how, docker_musl, checked_platforms
+        )
+        if unchecked_advisory:
             if args.advisory:  # asked for on this run, so not checking it is a mistake
                 raise TargetError(
-                    f"--advisory {', '.join(unchecked_advisory)}: not a checked target "
+                    f"--advisory {', '.join(unchecked_advisory)}: matches no checked target "
                     f"(this run checks {', '.join(checked_platforms)}); add it to -t as well"
                 )
             if not quiet:  # a project default for runs that check other targets (-t, --dockerfile): say so
@@ -1027,6 +1057,13 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
         advisory = frozenset(t for t in targets if t.platform in advisory_platforms)
+        if advisory and len(advisory) == len(targets) and not quiet:
+            # Then nothing can fail the run, not even a failed lookup (unknown) during an index outage.
+            print(
+                f"wheelgap: note: every checked target is advisory ({advisory_how}), so this run won't fail, "
+                "not even when a lookup fails",
+                file=sys.stderr,
+            )
         index_url = args.index_url if args.index_url is not None else config.get("index-url")
         if index_url is not None:
             _, auth = split_credentials(index_url)

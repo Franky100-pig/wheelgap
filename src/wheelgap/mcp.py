@@ -164,7 +164,10 @@ TOOLS: list[dict[str, Any]] = [
             "Notes and errors name command-line flags (--offline is the offline argument here). "
             "Packages from git, paths, URLs or private indexes are listed under "
             "'skipped': they were NOT checked. 'notes' says when an answer may be incomplete. Requirements files are "
-            "looked up on the index. " + _STATUS_HELP
+            "looked up on the index. 'ok' is true only when no package has a gap; 'passes' is the command line's "
+            "verdict (exit code 0), which also accepts gaps on the project's advisory targets (listed in 'advisory'; "
+            "each gap's 'advisory_gaps' says which of its 'gaps' are on them) and, with fail-on = \"missing\", "
+            "source builds. " + _STATUS_HELP
         ),
         "inputSchema": {
             "type": "object",
@@ -507,6 +510,8 @@ def _run_cli(argv: list[str], path: Path) -> dict[str, Any]:
     label = {t["label"]: f"{t['python']} {t['platform']}" for t in data["targets"]}
     platform_of = {t["label"]: t["platform"] for t in data["targets"]}
     ignored_on = {i["name"]: set(i["platforms"]) for i in data["ignored_targets"]}
+    # Older wheelgap JSON has no "advisory" key; it's always there now, but stay readable either way.
+    advisory = [label[cell] for cell in data.get("advisory", [])]
     gaps = []
     for package in data["packages"]:
         cells = [
@@ -516,7 +521,8 @@ def _run_cli(argv: list[str], path: Path) -> dict[str, Any]:
         ]
         if cells:
             results = {label[cell]: status for cell, status in package["results"].items()}
-            gaps.append(package | {"results": results, "gaps": cells})
+            on_advisory = [cell for cell in cells if cell in advisory]
+            gaps.append(package | {"results": results, "gaps": cells, "advisory_gaps": on_advisory})
     # A bundled build at another version still passes, as in the CLI, but a pin micropip can't install must be said.
     differs = [p for p in data["packages"] if p.get("bundled_version_differs")]
     for p in differs:
@@ -532,6 +538,10 @@ def _run_cli(argv: list[str], path: Path) -> dict[str, Any]:
         "targets": list(label.values()),
         "packages": data["summary"]["packages"],
         "ok": not gaps,
+        # The command line's verdict: gaps on advisory targets (and, with fail-on = "missing", source builds) don't
+        # fail it, so this can be true while ok is false.
+        "passes": code == 0,
+        "advisory": advisory,
         "unknown": sum(1 for g in gaps if Status.UNKNOWN.value in g["results"].values()),
         "bundled_version_differs": [
             {"name": p["name"], "version": p["version"], "bundled": p["bundled"]} for p in differs

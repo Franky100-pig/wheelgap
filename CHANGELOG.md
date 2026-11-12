@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- `--advisory TARGET` (or `advisory = [...]` in `[tool.wheelgap]`) reports the gaps on a platform you're watching, such as `win-arm64`, without failing the run: the column is marked `(advisory)` in the table and the Markdown report, a summary line counts those gaps, `--json` lists the targets under a new `advisory` key (`summary.per_target` still counts them), and `--junit` reports them as skipped tests rather than failures. It takes anything `-t` does, and an `--advisory` target the run doesn't check exits 2 (a configured one gets a note). (#243)
+- `--advisory TARGET` (or `advisory = [...]` in `[tool.wheelgap]`) reports the gaps on a platform you're watching, such as `win-arm64`, without failing the run: the column is marked `(advisory)` in the table and the Markdown report, a summary line counts those gaps, `--json` lists the targets under a new `advisory` key (`summary.per_target` still counts them), and `--junit` reports them as skipped tests rather than failures. It takes anything `-t` does, and an `--advisory` target the run doesn't check exits 2 (a configured one gets a note); a group like `all` means the checked targets among its members. `wheelgap-mcp`'s `check_lockfile` lists the advisory targets, marks each gap's `advisory_gaps`, and adds `passes`, the command line's verdict, next to `ok`. (#243)
 
 ## 0.9.0 (2026-11-12)
 

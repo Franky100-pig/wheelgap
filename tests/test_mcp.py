@@ -221,6 +221,36 @@ def test_check_lockfile_ignores_from_config(fake_pypi, tmp_path, fixtures):
     assert [(g["name"], g["gaps"]) for g in data["gaps"]] == [("nativeext", ["3.13 win-amd64"])]
 
 
+def test_check_lockfile_advisory_from_config(fake_pypi, tmp_path):
+    # fastlib has a linux-x86_64 wheel and builds from source on musl-aarch64; nowheels builds from source on both.
+    (tmp_path / "requirements.txt").write_text("fastlib==2.0.0\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text('[tool.wheelgap]\nadvisory = ["musl-aarch64"]\n', encoding="utf-8")
+    path = str(tmp_path / "requirements.txt")
+    targets = ["linux-x86_64", "musl-aarch64"]
+    (_, reply) = run(init(), call("check_lockfile", path=path, python="3.13", targets=targets))
+    data = reply["result"]["structuredContent"]
+    assert data["advisory"] == ["3.13 musl-aarch64"]
+    assert data["ok"] is False  # a gap is a gap
+    assert data["passes"] is True  # but the command line exits 0, as the gap is advisory
+    assert [(g["name"], g["gaps"], g["advisory_gaps"]) for g in data["gaps"]] == [
+        ("fastlib", ["3.13 musl-aarch64"], ["3.13 musl-aarch64"])
+    ]
+    # A gap on a required target fails it; the advisory one is still marked.
+    (tmp_path / "requirements.txt").write_text("fastlib==2.0.0\nnowheels==0.9\n", encoding="utf-8")
+    (_, reply) = run(init(), call("check_lockfile", path=path, python="3.13", targets=targets))
+    data = reply["result"]["structuredContent"]
+    assert (data["ok"], data["passes"]) == (False, False)
+    assert {g["name"]: g["advisory_gaps"] for g in data["gaps"]} == {
+        "fastlib": ["3.13 musl-aarch64"],
+        "nowheels": ["3.13 musl-aarch64"],
+    }
+    # Targets that leave the advisory one out: a note, not an error; and passes and ok agree without advisory gaps.
+    (_, reply) = run(init(), call("check_lockfile", path=path, python="3.13", targets=["win-arm64"]))
+    data = reply["result"]["structuredContent"]
+    assert data["advisory"] == [] and data["passes"] is False
+    assert any("advisory in [tool.wheelgap] names targets this run doesn't check" in n for n in data["notes"])
+
+
 def test_check_lockfile_glibc_argument(fake_pypi, fixtures):
     path = str(fixtures / "uvproj")
     (_, default, old) = run(

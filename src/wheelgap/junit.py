@@ -21,9 +21,11 @@ def _cell_fails(status: Status, fail_on: str) -> bool:
 def _rank(cell: tuple[str | None, str | None]) -> int:
     fail, skip = cell
     if fail is not None:
-        return 3 if fail == Status.SOURCE.value else 4
-    if skip is not None and skip.startswith("advisory"):
-        return 2  # a gap, reported as a skip: it beats a pass, so another input's wheel can't hide it
+        return 4 if fail == Status.SOURCE.value else 5
+    if skip is not None and skip.startswith("advisory: "):
+        # A gap reported as a skip: it beats a pass, so another input's wheel can't hide it, and as on a
+        # required target, a package that can't install (or couldn't be checked) beats a source build.
+        return 2 if skip == f"advisory: {Status.SOURCE.value}" else 3
     return 0 if skip is not None else 1
 
 
@@ -74,7 +76,8 @@ def junit_xml(rows: list[Row], targets: list[Target], fail_on: str, advisory: fr
                 cell = (status.value, None)
             else:
                 cell = (None, None)
-            # The worst cell wins: missing or unknown, then source, then an advisory gap, then a pass, then skipped.
+            # The worst cell wins: missing or unknown, then source, then an advisory gap (missing or unknown, then
+            # source), then a pass, then skipped.
             if ident not in merged or _rank(cell) > _rank(merged[ident]):
                 merged[ident] = cell
         cases = [(names[ident], fail, skip) for ident, (fail, skip) in merged.items()]

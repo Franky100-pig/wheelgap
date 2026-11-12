@@ -45,26 +45,26 @@ def test_advisory_only_gap_exits_zero(capsys, fake_pypi):
     assert code == 0
     assert "win-arm64 (advisory)" in out  # the table's column and the per-target line
     assert "● source" in out  # still reported
-    assert "1 gap on advisory target win-arm64 doesn't fail the run." in out
+    assert "1 gap in 1 package on advisory target win-arm64 doesn't fail the run." in out
     assert "Source builds are allowed" not in out  # passing has nothing to do with --fail-on
     # Aliases and Docker names work as in -t; quiet output says why a run with gaps passes.
     for name in ("windows-arm64", "windows/arm64"):
         code, out, err = run(capsys, *FASTLIB, "--advisory", name, "-q")
         assert code == 0, err
-        assert "1 gap on advisory target win-arm64 doesn't fail the run." in out
+        assert "1 gap in 1 package on advisory target win-arm64 doesn't fail the run." in out
 
 
 def test_advisory_gap_on_a_required_target_still_fails(capsys, fake_pypi):
     # nowheels has only an sdist, so it builds from source on linux-x86_64 too.
     code, out, _ = run(capsys, "nowheels==0.9", *FASTLIB, "--advisory", "win-arm64")
     assert code == 1
-    assert "2 gaps on advisory target win-arm64 don't fail the run." in out
+    assert "2 gaps in 2 packages on advisory target win-arm64 don't fail the run." in out
     # Several advisory targets, given repeated or comma-separated, and a Docker name.
     code, _, err = run(capsys, "nowheels==0.9", *FASTLIB, "--advisory", "win-arm64", "--advisory", "linux/amd64")
     assert code == 0, err
     code, out, _ = run(capsys, "nowheels==0.9", *FASTLIB, "--advisory", "linux,win-arm64")
     assert code == 0
-    assert "3 gaps on advisory targets linux-x86_64, win-arm64 don't fail the run." in out
+    assert "3 gaps in 2 packages on advisory targets linux-x86_64, win-arm64 don't fail the run." in out
     assert run(capsys, "nowheels==0.9", *FASTLIB, "--advisory", "win-arm64", "--exit-zero")[0] == 0
 
 
@@ -89,18 +89,35 @@ def test_advisory_markdown(capsys, fake_pypi):
     assert code == 0
     assert "| package | version | linux-x86\\_64 | win-arm64 (advisory) |" in out
     assert "- win-arm64 (advisory): 1 from source" in out
-    assert "1 gap on advisory target win-arm64 doesn't fail the run." in out
+    assert "1 gap in 1 package on advisory target win-arm64 doesn't fail the run." in out
     assert "Source builds are allowed" not in out
 
 
 def test_advisory_target_must_be_checked(capsys, fake_pypi):
     code, _, err = run(capsys, *FASTLIB, "--advisory", "macos-arm64")
     assert code == 2
-    assert "--advisory macos-arm64: not a checked target (this run checks linux-x86_64, win-arm64)" in err
+    assert "--advisory macos-arm64: matches no checked target (this run checks linux-x86_64, win-arm64)" in err
+    code, out, _ = run(capsys, *FASTLIB, "--advisory", "win-arm64,macos", "--json")
+    assert code == 2 and "--advisory macos: matches no checked target" in json.loads(out)["error"]["message"]
+    # A group means the checked targets among its members, and is an error only when none of them is checked.
     code, out, _ = run(capsys, *FASTLIB, "--advisory", "all", "--json")
-    assert code == 2 and "not a checked target" in json.loads(out)["error"]["message"]
+    assert code == 0 and json.loads(out)["advisory"] == ["linux-x86_64", "win-arm64"]
+    code, out, _ = run(capsys, *FASTLIB, "--advisory", "everything", "--json")
+    assert code == 0 and json.loads(out)["advisory"] == ["linux-x86_64", "win-arm64"]
+    code, _, err = run(capsys, *FASTLIB, "--advisory", "mobile")
+    assert code == 2 and "--advisory mobile: matches no checked target" in err
     code, _, err = run(capsys, *FASTLIB, "--advisory", "win-arm46")
     assert code == 2 and "--advisory: " in err and "did you mean 'win-arm64'" in err
+
+
+def test_every_target_advisory_notes_that_the_run_cant_fail(capsys, fake_pypi):
+    note = "every checked target is advisory (--advisory), so this run won't fail"
+    code, _, err = run(capsys, "nowheels==0.9", *FASTLIB, "--advisory", "all")
+    assert code == 0 and note in err
+    code, _, err = run(capsys, "nowheels==0.9", *FASTLIB, "--advisory", "all", "-q")
+    assert code == 0 and note not in err
+    code, _, err = run(capsys, "nowheels==0.9", *FASTLIB, "--advisory", "win-arm64")
+    assert code == 1 and note not in err
 
 
 def test_advisory_from_pyproject(capsys, fake_pypi, tmp_path, monkeypatch):
@@ -137,7 +154,7 @@ def test_advisory_with_fail_on_missing(capsys, fake_pypi):
     code, out, _ = run(capsys, *args, "--advisory", "win-arm64")
     assert code == 0
     assert "Source builds are allowed (--fail-on missing), so this run passes." in out
-    assert "2 gaps on advisory target win-arm64 don't fail the run." in out
+    assert "2 gaps in 2 packages on advisory target win-arm64 don't fail the run." in out
     # Only a source build on an advisory target: the run passes because of --advisory, not --fail-on.
     code, out, _ = run(capsys, "winonly==311", *args[2:], "--advisory", "win-arm64")
     assert code == 0 and "Source builds are allowed" not in out
@@ -148,4 +165,10 @@ def test_advisory_and_ignore_name_target(capsys, fake_pypi):
     code, out, _ = run(capsys, *FASTLIB, "--advisory", "win-arm64", "--ignore", "fastlib:win-arm64", "--all")
     assert code == 0
     assert "● source (ignored)" in out and "win-arm64 (advisory)" in out
-    assert "gap on advisory target" not in out
+    assert "on advisory target" not in out
+    # With a second, not ignored, advisory gap, only that one is counted.
+    code, out, _ = run(
+        capsys, "nowheels==0.9", *FASTLIB, "--advisory", "win-arm64", "--ignore", "fastlib:win-arm64,nowheels:linux"
+    )
+    assert code == 0
+    assert "1 gap in 1 package on advisory target win-arm64 doesn't fail the run." in out
