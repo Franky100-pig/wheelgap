@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- `-p next` and `-p next-t` (also in `[tool.wheelgap] python`, `wheelgap diff -p`, `make_targets()` and the MCP tools) check the newest CPython wheelgap knows, 3.15 in this release, and its free-threaded build, with a note on stderr saying which version that is. When exactly two Pythons are checked and one is newer, the summary names the packages that block the upgrade, those with a gap on the newer Python where the older one has a wheel (`blocking 3.15: numpy, pydantic-core`), and `--json` lists them as `blocking_newer_python`. (#242)
+- `-p next` and `-p next-t` (also in `[tool.wheelgap] python`, `wheelgap diff -p`, `make_targets()` and the MCP tools) check the newest CPython wheelgap knows, 3.15 in this release, and its free-threaded build, with a note on stderr saying which version that is. When exactly two Pythons are checked and one is newer, the summary names the packages that block the upgrade, those with a gap on the newer Python where the older one has a wheel (`blocking 3.15: numpy, pydantic-core`), and `--json` and the MCP `check_lockfile` tool list them as `blocking_newer_python`. Packages that couldn't be checked aren't listed, only counted. (#242)
 
 ## 0.9.0 (2026-11-12)
 
