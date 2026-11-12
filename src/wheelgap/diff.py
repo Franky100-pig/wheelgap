@@ -44,6 +44,7 @@ from packaging.utils import canonicalize_name
 from . import __version__
 from .api import Result, _check_lockfile, make_targets
 from .check import CELL, Status, applies, reachable
+from .logsafe import guarded_output
 from .sources import Source
 from .targets import Target, next_python_note
 
@@ -292,6 +293,11 @@ def main(argv: list[str] | None = None, prog: str = "python -m wheelgap.diff") -
                 reconfigure(encoding="utf-8", errors="replace")
             else:
                 reconfigure(errors="replace")
+    with guarded_output():  # as in cli.main: lockfile text must never run as a workflow command in a CI log
+        return _main(argv, prog)
+
+
+def _main(argv: list[str] | None, prog: str) -> int:
     p = argparse.ArgumentParser(prog=prog, description=__doc__.splitlines()[0])
     p.add_argument(
         "old",

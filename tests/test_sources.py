@@ -1098,10 +1098,11 @@ def test_pixi_lock_refuses_what_it_cannot_read_for_sure(tmp_path, old, new, mess
 def test_pixi_lock_reads_quoted_scalars(tmp_path):
     lock = tmp_path / "pixi.lock"
     text = PIXI_V7.replace("  name: winonly\n", '  name: "win\\x6fnly"\n').replace(
-        "  name: purewheel\n", "  'name': 'pure''wheel'\n"
+        "  name: purewheel\n", "  'name': 'purewheel'\n"
     )
     lock.write_text(text, encoding="utf-8")
-    assert {"winonly", "pure'wheel"} <= set(by_name(parse_pixi_lock(lock)))
+    # (A name with '' in it, such as pure'wheel, isn't a valid package name; test_block_yaml_reads covers the escape.)
+    assert {"winonly", "purewheel"} <= set(by_name(parse_pixi_lock(lock)))
 
 
 @pytest.mark.parametrize(
