@@ -53,7 +53,10 @@ def make_targets(
     ios: str = DEFAULT_IOS,
     android_api: str | int = DEFAULT_ANDROID_API,
 ) -> list[Target]:
-    """Targets from the same names the CLI takes: python="3.13,3.14t", platforms=["all", "pyodide", "mobile"]."""
+    """Targets from the same names the CLI takes: python="3.13,3.14t", platforms=["all", "pyodide", "mobile"].
+
+    python="next" (or "next-t") is the newest CPython this wheelgap version knows, targets.NEWEST_PYTHON.
+    """
     pythons = [python] if isinstance(python, str) else list(python or [running_python()])
     plats = [platforms] if isinstance(platforms, str) else list(platforms or DEFAULT_PLATFORMS)
     if not any(p.strip() for item in pythons for p in item.split(",")):

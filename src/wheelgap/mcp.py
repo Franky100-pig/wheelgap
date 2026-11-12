@@ -95,7 +95,8 @@ _STATUS_HELP = (
 
 _PYTHON_PROP = {
     "type": "string",
-    "description": "Target Python version(s), comma-separated, e.g. '3.13' or '3.12,3.14t' (t = free-threaded).",
+    "description": "Target Python version(s), comma-separated, e.g. '3.13' or '3.12,3.14t' (t = free-threaded); "
+    "'next' and 'next-t' mean the newest CPython wheelgap knows.",
 }
 _TARGETS_PROP = {
     "type": "array",
@@ -167,7 +168,10 @@ TOOLS: list[dict[str, Any]] = [
             "looked up on the index. 'ok' is true only when no package has a gap; 'passes' is the command line's "
             "verdict (exit code 0), which also accepts gaps on the project's advisory targets (listed in 'advisory'; "
             "each gap's 'advisory_gaps' says which of its 'gaps' are on them) and, with fail-on = \"missing\", "
-            "source builds. " + _STATUS_HELP
+            "source builds. "
+            "With two Pythons checked, one newer (e.g. python '3.14,next'), "
+            "'blocking_newer_python' names the packages with a gap on the newer one only; it leaves out packages "
+            "that couldn't be checked. " + _STATUS_HELP
         ),
         "inputSchema": {
             "type": "object",
@@ -280,7 +284,7 @@ class ToolError(Exception):
     """A problem with the tool's arguments or input, reported to the model as a tool result with isError."""
 
 
-_PYTHON_RE = re.compile(r"\d+\.\d+t?", re.ASCII)
+_PYTHON_RE = re.compile(r"\d+\.\d+t?|next(-t)?", re.ASCII)
 _NAME_RE = re.compile(r"[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?", re.ASCII)
 _GAP = {Status.SOURCE.value, Status.MISSING.value, Status.UNKNOWN.value}
 
@@ -314,9 +318,11 @@ def _platforms(args: dict[str, Any]) -> list[str]:
 
 def _pythons(args: dict[str, Any]) -> list[str]:
     python = _string(args, "python") or ""
-    parts = [p.strip() for p in python.split(",") if p.strip()]
+    parts = [p.strip().lower() for p in python.split(",") if p.strip()]  # the CLI takes Next and 3.14T too
     if bad := [p for p in parts if not _PYTHON_RE.fullmatch(p)]:
-        raise ToolError(f"can't read Python version(s) {', '.join(map(repr, bad))} (expected e.g. '3.13' or '3.14t')")
+        raise ToolError(
+            f"can't read Python version(s) {', '.join(map(repr, bad))} (expected e.g. '3.13', '3.14t' or 'next')"
+        )
     return parts
 
 
@@ -551,7 +557,7 @@ def _run_cli(argv: list[str], path: Path) -> dict[str, Any]:
         "ignored": data["ignored"],
         "ignored_targets": data["ignored_targets"],
         "notes": notes,
-    }
+    } | ({"blocking_newer_python": data["blocking_newer_python"]} if "blocking_newer_python" in data else {})
 
 
 def _list_targets(args: dict[str, Any]) -> dict[str, Any]:
@@ -844,18 +850,28 @@ def serve(stdin: BinaryIO, stdout: BinaryIO) -> None:
         server.close(wait=finished)  # on Ctrl-C, don't start the calls still queued
 
 
-def main(argv: list[str] | None = None) -> int:
+# For `wheelgap mcp`, which always starts the server: how to check what `wheelgap mcp` used to mean.
+_SUBCOMMAND_HINT = (
+    "To check a folder named mcp, run `wheelgap ./mcp`; to check the PyPI package mcp, pin it: `wheelgap mcp==VERSION`."
+)
+
+
+def main(argv: list[str] | None = None, prog: str = "wheelgap-mcp") -> int:
     args = sys.argv[1:] if argv is None else argv
+    subcommand = prog == "wheelgap mcp"
     if args in (["--version"], ["-V"]):
         print(f"wheelgap-mcp {__version__}")
         return 0
     if args:
         print(
-            "usage: wheelgap-mcp\n\nAn MCP server for wheelgap over stdio. Add it to your agent's MCP settings with "
-            "the command `uvx --from wheelgap wheelgap-mcp`.",
+            f"usage: {prog}\n\nAn MCP server for wheelgap over stdio. Add it to your agent's MCP settings with "
+            "the command `uvx --from wheelgap wheelgap-mcp` (or `uvx wheelgap mcp`)."
+            + (f"\n\n{_SUBCOMMAND_HINT}" if subcommand else ""),
             file=sys.stderr,
         )
         return 0 if args in (["-h"], ["--help"]) else 2
+    if subcommand and sys.stdin is not None and sys.stdin.isatty():
+        print(f"wheelgap mcp: waiting for an MCP client on stdin (Ctrl-C to quit). {_SUBCOMMAND_HINT}", file=sys.stderr)
     try:
         serve(sys.stdin.buffer, sys.stdout.buffer)
     except KeyboardInterrupt:
