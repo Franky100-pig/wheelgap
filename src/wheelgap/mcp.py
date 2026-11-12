@@ -1,9 +1,13 @@
 """An MCP server, so coding agents can ask wheelgap whether a package has a wheel for a platform.
 
 Run it with `python -m wheelgap.mcp` (or the `wheelgap-mcp` command). It speaks the Model Context Protocol over
-stdio: one JSON-RPC 2.0 message per line on stdin and stdout, using the initialize handshake of the 2024-11-05 to
-2025-11-25 protocol revisions. Newer clients that first probe with server/discover get "method not found" and fall
-back to that handshake. Like the rest of wheelgap it needs only the standard library and packaging.
+stdio: one JSON-RPC 2.0 message per line on stdin and stdout. It serves both eras of the protocol, request by request:
+- 2024-11-05, 2025-03-26, 2025-06-18 and 2025-11-25, through the initialize handshake;
+- 2026-07-28, which has no handshake: each request names its protocol version and the client's capabilities in
+  params._meta, server/discover says which versions and capabilities the server has, and each result carries
+  resultType and the server's name and version. A request for a version the server doesn't serve gets error -32022,
+  listing the versions it does.
+Like the rest of wheelgap it needs only the standard library and packaging.
 
 Tool calls run on one worker thread, one at a time, while the main thread keeps reading stdin: it answers ping and
 handles notifications/cancelled during a long check_lockfile. One worker, because check_lockfile redirects the
@@ -19,7 +23,10 @@ Tools (all read-only; they look packages up on PyPI, or the index in WHEELGAP_IN
 
 Paths may be file:// URIs. If the client has the roots capability, the server asks it for roots/list after
 notifications/initialized (and again on notifications/roots/list_changed), and a relative path is resolved against the
-first root that contains it, then against the working directory.
+first root that contains it, then against the working directory. 2026-07-28 requests are stateless and the server may
+not send requests of its own, so there a tools/call with a relative path from a client with the roots capability gets
+an input_required result asking for roots/list, and the client retries with the roots in inputResponses. That relative
+path must then be in one of those roots (unless the list is empty): it is never looked for in the working directory.
 """
 
 from __future__ import annotations
@@ -36,7 +43,7 @@ import urllib.request
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, BinaryIO
 
 from packaging.version import InvalidVersion, Version
@@ -63,6 +70,8 @@ from .targets import (
 # The handshake-era revisions, oldest first. A client asking for one of these gets it back; any other version gets the
 # newest, and the client decides whether it can use that (as the MCP lifecycle spec says).
 PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
+# The revisions without a handshake, oldest first: each request carries its version in params._meta.
+MODERN_VERSIONS = ("2026-07-28",)
 _STRUCTURED_FROM = "2025-06-18"  # the first revision with structuredContent in tool results
 _PROGRESS_MESSAGE_FROM = "2025-03-26"  # the first revision with a message in notifications/progress
 
@@ -71,6 +80,25 @@ INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
+UNSUPPORTED_PROTOCOL_VERSION = -32022  # from 2026-07-28
+
+# The per-request _meta keys of 2026-07-28 (the first two are required on every request), and the result's.
+_VERSION_KEY = "io.modelcontextprotocol/protocolVersion"
+_CAPABILITIES_KEY = "io.modelcontextprotocol/clientCapabilities"
+_ENVELOPE_KEYS = (
+    _VERSION_KEY,
+    _CAPABILITIES_KEY,
+    "io.modelcontextprotocol/clientInfo",
+    "io.modelcontextprotocol/logLevel",
+)
+_SERVER_INFO_KEY = "io.modelcontextprotocol/serverInfo"
+_ROOTS_INPUT = "roots"  # our key for roots/list in a 2026 input_required result's inputRequests
+_REQUESTED_LIMIT = 100  # how much of an unsupported version string an error repeats
+SERVER_INFO = {"name": "wheelgap", "version": __version__}
+CAPABILITIES = {"tools": {"listChanged": False}}
+# 2026-07-28's caching hints, required on server/discover and tools/list. Both are fixed for the server's lifetime
+# and the same for every user: an hour, then the client asks again.
+_CACHE_HINTS = {"ttlMs": 3_600_000, "cacheScope": "public"}
 
 INSTRUCTIONS = (
     "wheelgap tells you whether pip or uv can install a package from a prebuilt wheel on a platform, or will have to "
@@ -120,7 +148,8 @@ _PYODIDE_LOCK_PROP = {
     "description": (
         "Absolute path or https URL of a Pyodide release's pyodide-lock.json, so packages that release ships itself "
         "count as 'bundled' on pyodide targets for its Python. Its Python must be one a pyodide target uses. "
-        "Relative paths are resolved against the server's working directory."
+        "A relative path is looked for in the client's roots if it shares them, else in the server's working "
+        "directory."
     ),
 }
 _READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
@@ -186,7 +215,8 @@ TOOLS: list[dict[str, Any]] = [
                 "path": {
                     "type": "string",
                     "description": "Absolute path or file:// URI of the lockfile or project directory (a relative "
-                    "path is resolved against the client's roots, then the server's working directory).",
+                    "path is looked for in the client's roots if it shares them, else in the server's working "
+                    "directory).",
                 },
                 "python": _PYTHON_PROP
                 | {
@@ -224,8 +254,8 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "dockerfile": {
                     "type": "string",
-                    "description": "Absolute path or file:// URI of the Dockerfile (a relative path is resolved "
-                    "against the client's roots, then the server's working directory).",
+                    "description": "Absolute path or file:// URI of the Dockerfile (a relative path is looked "
+                    "for in the client's roots if it shares them, else in the server's working directory).",
                 },
                 "path": {
                     "type": "string",
@@ -344,7 +374,11 @@ def _versions(args: dict[str, Any]) -> dict[str, str]:
 
 def _lock_spec(args: dict[str, Any]) -> str:
     spec = (_string(args, "pyodide_lock") or "").strip()
-    return spec if not spec or "://" in spec else str(Path(spec).expanduser())
+    if not spec or "://" in spec:
+        return spec
+    if _ROOTS_ONLY.get() and _is_relative(spec):  # a 2026 client named its roots: it must be in one of them
+        return str(_existing(spec))
+    return str(Path(spec).expanduser())
 
 
 def _check_package(args: dict[str, Any]) -> dict[str, Any]:
@@ -447,6 +481,8 @@ def _check_dockerfile(args: dict[str, Any]) -> dict[str, Any]:
 
 # The client's roots (from roots/list) for the call running on this thread; Server._call sets it.
 _ROOTS: ContextVar[tuple[Path, ...]] = ContextVar("wheelgap_mcp_roots", default=())
+# True when a relative path must be in one of those roots: a 2026 client named its roots for this very call.
+_ROOTS_ONLY: ContextVar[bool] = ContextVar("wheelgap_mcp_roots_only", default=False)
 _URI_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
 
 
@@ -490,7 +526,7 @@ def _diff_lockfiles(args: dict[str, Any]) -> dict[str, Any]:
         sides.append(packages)
     report = diff.compare(sides[0], sides[1], targets)
     data: dict[str, Any] = json.loads(diff.json_report(report, targets))
-    del data["version"]  # the server's version is in initialize's serverInfo
+    del data["version"]  # the server's version is in its serverInfo (initialize's, or the result's _meta)
     data["ok"] = not report.worse and not report.new
     data["paths"] = {"old": str(paths[0].resolve()), "new": str(paths[1].resolve())}
     return data
@@ -498,7 +534,8 @@ def _diff_lockfiles(args: dict[str, Any]) -> dict[str, Any]:
 
 def _existing(raw: str) -> Path:
     """An argument naming a file or directory: a path or a file:// URI. A relative path is looked for in the client's
-    roots first (the first root that contains it wins), then in the server's working directory."""
+    roots first (the first root that contains it wins), then in the server's working directory, unless the roots came
+    with a 2026 call: then a same-named file elsewhere would be another project's, so it's an error."""
     if _URI_RE.match(raw):
         uri_path = _file_uri_path(raw)
         if uri_path is None:
@@ -506,11 +543,40 @@ def _existing(raw: str) -> Path:
         path = uri_path
     else:
         path = Path(raw).expanduser()
-        if not path.is_absolute():
+        if not path.is_absolute() and _ROOTS_ONLY.get():
+            path = _in_roots(raw, path)
+        elif not path.is_absolute():
             path = next((root / path for root in _ROOTS.get() if (root / path).exists()), path)
     if not path.exists():
         raise ToolError(f"{raw}: no such file or directory (pass an absolute path)")
     return path
+
+
+def _in_roots(raw: str, path: PurePath) -> Path:
+    """A relative path on a 2026 call whose client named its roots: the first root that contains it, never the
+    working directory, and never outside the root (no ../ out of it)."""
+    if _anchored(path):  # \\foo or C:foo on Windows: joining it to a root would drop the root, or its folder
+        raise ToolError(f"{_clip(raw)}: neither relative nor absolute; pass an absolute path")
+    for root in _ROOTS.get():
+        candidate = root / path
+        try:
+            found = candidate.resolve().is_relative_to(root.resolve()) and candidate.exists()
+        except (OSError, RuntimeError):  # a symlink loop, a name too long (exists() raises that before 3.14), ...
+            found = False
+        if found:
+            return candidate
+    searched = _clip(", ".join(str(root) for root in _ROOTS.get()) or "none of them is a local folder")
+    raise ToolError(f"{_clip(raw)}: not in any of the client's roots ({searched}); pass an absolute path")
+
+
+def _anchored(path: PurePath) -> bool:
+    """A Windows path with a drive or a root but not both (C:uv.lock, \\uv.lock): not absolute, but not relative
+    to a folder either. Never true on POSIX."""
+    return not path.is_absolute() and bool(path.drive or path.root)
+
+
+def _clip(text: str, limit: int = 200) -> str:
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 def _run_cli(argv: list[str], path: Path) -> dict[str, Any]:
@@ -603,8 +669,17 @@ _HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
 class _Call:
     """A tools/call that is queued or running on the worker."""
 
-    def __init__(self, token: str | int | None) -> None:
+    def __init__(
+        self,
+        token: str | int | None,
+        version: str | None = None,
+        roots: tuple[Path, ...] | None = None,
+        roots_only: bool = False,
+    ) -> None:
         self.token = token
+        self.version = version  # a 2026 request's own protocol version; None for the handshake's
+        self.roots = roots  # a 2026 request's roots (from its inputResponses); None for the handshake's
+        self.roots_only = roots_only  # a relative path must be in those roots (the client listed some)
         self.cancelled = False
         self.base = 0  # lookups in fill_all runs that have finished (check_lockfile may run more than one)
         self.total = 0  # lookups in the current fill_all run
@@ -691,6 +766,14 @@ class Server:
             params = {}
         if not isinstance(params, dict):
             return _error(msg_id, INVALID_PARAMS, "params must be an object")
+        meta = params.get("_meta")
+        # 2026's per-request keys in _meta mark a 2026 request (a malformed one still gets its -32602); legacy ones may
+        # carry _meta too (a progressToken, or 2025-11-25's io.modelcontextprotocol/related-task). initialize is
+        # always the handshake, even with those keys, since 2026 has no initialize.
+        if method == "server/discover" or (
+            method != "initialize" and isinstance(meta, dict) and any(key in meta for key in _ENVELOPE_KEYS)
+        ):
+            return self._modern(msg_id, method, params, inline)
         if method == "initialize":
             return _reply(msg_id, self._initialize(params))
         if method == "ping":
@@ -698,26 +781,106 @@ class Server:
         if method == "tools/list":
             return _reply(msg_id, {"tools": TOOLS})
         if method == "tools/call":
-            name = params.get("name")
-            if not isinstance(name, str) or name not in _HANDLERS:
-                return _error(msg_id, INVALID_PARAMS, f"unknown tool: {name!r}")
-            arguments = params.get("arguments")
-            if arguments is None:
-                arguments = {}
-            if not isinstance(arguments, dict):
-                return _error(msg_id, INVALID_PARAMS, "arguments must be an object")
-            if inline or self._worker is None:
-                return _reply(msg_id, self._call(name, arguments))
-            meta = params.get("_meta")
-            token = meta.get("progressToken") if isinstance(meta, dict) else None
-            if not isinstance(token, (str, int)) or isinstance(token, bool):
-                token = None
-            call = _Call(token)
-            with self._lock:
-                self._calls[msg_id] = call
-            self._worker.submit(self._run, msg_id, call, name, arguments)
-            return None
+            return self._tools_call(msg_id, params, None, None, inline)
         return _error(msg_id, METHOD_NOT_FOUND, f"method not found: {method}")
+
+    def _modern(self, msg_id: str | int, method: str, params: dict[str, Any], inline: bool) -> dict[str, Any] | None:
+        """A 2026-07-28 request: served from its own params, with none of the handshake's state (not its version, nor
+        the roots it asked the client for)."""
+        meta = params.get("_meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        if missing := [key for key in (_VERSION_KEY, _CAPABILITIES_KEY) if key not in meta]:
+            return _error(msg_id, INVALID_PARAMS, f"params._meta must have {' and '.join(missing)}")
+        version = meta[_VERSION_KEY]
+        if not isinstance(version, str):
+            return _error(msg_id, INVALID_PARAMS, f"{_VERSION_KEY} must be a string")
+        if not isinstance(meta[_CAPABILITIES_KEY], dict):
+            return _error(msg_id, INVALID_PARAMS, f"{_CAPABILITIES_KEY} must be an object")
+        if version not in MODERN_VERSIONS:
+            # Every version served, newest first: a client that also speaks a handshake-era one can fall back to
+            # initialize with it, rather than give up.
+            supported = [*reversed(MODERN_VERSIONS), *reversed(PROTOCOL_VERSIONS)]
+            requested = version[:_REQUESTED_LIMIT]
+            if version in PROTOCOL_VERSIONS:
+                message = f"Protocol version {requested} is served only through the initialize handshake."
+            else:
+                message = f"Unsupported protocol version {requested!r}."
+            return _error(
+                msg_id, UNSUPPORTED_PROTOCOL_VERSION, message, {"supported": supported, "requested": requested}
+            )
+        if method == "server/discover":
+            # Only the versions a request can name in _meta: the handshake-era ones need initialize.
+            return _reply(
+                msg_id,
+                _complete(
+                    {
+                        "supportedVersions": list(reversed(MODERN_VERSIONS)),
+                        "capabilities": CAPABILITIES,
+                        "instructions": INSTRUCTIONS,
+                    }
+                    | _CACHE_HINTS
+                ),
+            )
+        if method == "tools/list":
+            return _reply(msg_id, _complete({"tools": TOOLS} | _CACHE_HINTS))
+        if method == "tools/call":
+            responses = params.get("inputResponses")
+            if responses is not None and not isinstance(responses, dict):
+                return _error(msg_id, INVALID_PARAMS, "inputResponses must be an object")
+            answer = (responses or {}).get(_ROOTS_INPUT)
+            if answer is not None:  # the retry after our input_required
+                if not isinstance(answer, dict) or not isinstance(answer.get("roots"), list):
+                    return _error(msg_id, INVALID_PARAMS, f"inputResponses.{_ROOTS_INPUT} must be a roots/list result")
+                roots = _root_paths(answer["roots"])
+                roots_only = bool(answer["roots"])  # an empty list: the client has none, so the working directory
+            elif meta[_CAPABILITIES_KEY].get("roots") not in (None, False) and _relative_paths(params):
+                # The client has roots (even a malformed declaration means it meant to), and a relative path may name
+                # a file in them rather than in the working directory: ask for them (a 2026 server can't send
+                # roots/list itself), then the client retries. Arguments that would fail anyway fail now instead.
+                if problem := _argument_problem(params):
+                    return _reply(msg_id, _complete({"content": [{"type": "text", "text": problem}], "isError": True}))
+                return _reply(
+                    msg_id,
+                    _complete({"inputRequests": {_ROOTS_INPUT: {"method": "roots/list"}}}, "input_required"),
+                )
+            else:
+                roots, roots_only = (), False
+            return self._tools_call(msg_id, params, version, roots, inline, roots_only=roots_only)
+        # ping, logging/setLevel and the rest are gone in 2026, and this server has no prompts or resources.
+        return _error(msg_id, METHOD_NOT_FOUND, f"method not found: {method}")
+
+    def _tools_call(
+        self,
+        msg_id: str | int,
+        params: dict[str, Any],
+        version: str | None,
+        roots: tuple[Path, ...] | None,
+        inline: bool,
+        *,
+        roots_only: bool = False,
+    ) -> dict[str, Any] | None:
+        """tools/call, on the worker unless inline. version and roots are a 2026 request's own, or None for the
+        handshake's."""
+        name = params.get("name")
+        if not isinstance(name, str) or name not in _HANDLERS:
+            return _error(msg_id, INVALID_PARAMS, f"unknown tool: {name!r}")
+        arguments = params.get("arguments")
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            return _error(msg_id, INVALID_PARAMS, "arguments must be an object")
+        if inline or self._worker is None:
+            return _reply(msg_id, self._call(name, arguments, version, roots, roots_only))
+        meta = params.get("_meta")
+        token = meta.get("progressToken") if isinstance(meta, dict) else None
+        if not isinstance(token, (str, int)) or isinstance(token, bool):
+            token = None
+        call = _Call(token, version, roots, roots_only)
+        with self._lock:
+            self._calls[msg_id] = call
+        self._worker.submit(self._run, msg_id, call, name, arguments)
+        return None
 
     def _cancel(self, msg_id: object) -> None:
         """notifications/cancelled: an unknown or finished request is ignored, as the spec says."""
@@ -735,10 +898,10 @@ class Server:
             return
         try:
             if call.token is None:
-                result = self._call(name, arguments)
+                result = self._call(name, arguments, call.version, call.roots, call.roots_only)
             else:
                 with pypi.reporting_progress(lambda done, total: self._progress(call, done, total)):
-                    result = self._call(name, arguments)
+                    result = self._call(name, arguments, call.version, call.roots, call.roots_only)
             reply = _reply(msg_id, result)
         except Exception as e:  # a bug: the client still gets an answer rather than waiting forever
             reply = _error(msg_id, INTERNAL_ERROR, f"internal error: {type(e).__name__}: {e}")
@@ -760,7 +923,7 @@ class Server:
         if progress <= call.sent:
             return
         params: dict[str, Any] = {"progressToken": call.token, "progress": progress, "total": overall}
-        if self.protocol_version >= _PROGRESS_MESSAGE_FROM:
+        if (call.version or self.protocol_version) >= _PROGRESS_MESSAGE_FROM:
             params["message"] = f"{progress} of {overall} index lookups done"
         with self._lock:
             if call.cancelled or self._send is None:
@@ -782,14 +945,7 @@ class Server:
     def _roots_answer(self, message: dict[str, Any]) -> None:
         self._roots_request = None
         result = message.get("result")
-        roots = result.get("roots") if isinstance(result, dict) else None
-        paths = []
-        for root in roots if isinstance(roots, list) else ():
-            uri = root.get("uri") if isinstance(root, dict) else None
-            path = _file_uri_path(uri) if isinstance(uri, str) else None
-            if path is not None:
-                paths.append(path)
-        self._roots = tuple(paths)  # an error or a malformed answer leaves no roots
+        self._roots = _root_paths(result.get("roots") if isinstance(result, dict) else None)
 
     def _initialize(self, params: dict[str, Any]) -> dict[str, Any]:
         capabilities = params.get("capabilities")
@@ -798,13 +954,29 @@ class Server:
         self.protocol_version = asked if asked in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[-1]
         return {
             "protocolVersion": self.protocol_version,
-            "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "wheelgap", "version": __version__},
+            "capabilities": CAPABILITIES,
+            "serverInfo": SERVER_INFO,
             "instructions": INSTRUCTIONS,
         }
 
-    def _call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        roots = _ROOTS.set(self._roots)
+    def _call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        version: str | None = None,
+        roots: tuple[Path, ...] | None = None,
+        roots_only: bool = False,
+    ) -> dict[str, Any]:
+        """A tool's result. version and roots are a 2026 request's own (with resultType and serverInfo in the
+        result), or None for the handshake's."""
+        if version is None:
+            return self._tool_result(name, arguments, self.protocol_version, self._roots, False)
+        return _complete(self._tool_result(name, arguments, version, roots or (), roots_only))
+
+    def _tool_result(
+        self, name: str, arguments: dict[str, Any], version: str, roots: tuple[Path, ...], roots_only: bool
+    ) -> dict[str, Any]:
+        token, only_token = _ROOTS.set(roots), _ROOTS_ONLY.set(roots_only)
         try:
             # wheelgap's own messages go to stderr already; this keeps any stray print off the protocol stream.
             with contextlib.redirect_stdout(sys.stderr):
@@ -815,9 +987,10 @@ class Server:
         except Exception as e:  # a bug: report it to the model rather than end the connection
             return {"content": [{"type": "text", "text": f"internal error: {type(e).__name__}: {e}"}], "isError": True}
         finally:
-            _ROOTS.reset(roots)
+            _ROOTS.reset(token)
+            _ROOTS_ONLY.reset(only_token)
         result: dict[str, Any] = {"content": [{"type": "text", "text": text}], "isError": False}
-        if self.protocol_version >= _STRUCTURED_FROM:
+        if version >= _STRUCTURED_FROM:
             result["structuredContent"] = data
         return result
 
@@ -831,8 +1004,78 @@ def _reply(msg_id: Any, result: dict[str, Any]) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
 
-def _error(msg_id: Any, code: int, message: str) -> dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
+def _complete(result: dict[str, Any], result_type: str = "complete") -> dict[str, Any]:
+    """A 2026-07-28 result: every one says its resultType, and the server names itself in each one's _meta."""
+    return {"resultType": result_type, **result, "_meta": {_SERVER_INFO_KEY: SERVER_INFO}}
+
+
+# The arguments each tool resolves with _existing (pyodide_lock: on 2026 roots calls), so against the client's
+# roots when relative.
+_PATH_ARGUMENTS = {
+    "check_package": ("pyodide_lock",),
+    "check_lockfile": ("path", "pyodide_lock"),
+    "check_dockerfile": ("dockerfile", "path"),
+    "diff_lockfiles": ("old", "new"),
+}
+
+
+def _relative_paths(params: dict[str, Any]) -> bool:
+    """Whether a tools/call passes a relative path that _existing would look for in the client's roots."""
+    arguments = params.get("arguments")
+    if not isinstance(arguments, dict):
+        return False
+    tool = params.get("name")
+    values = [arguments.get(key) for key in _PATH_ARGUMENTS.get(tool, ())] if isinstance(tool, str) else []
+    return any(isinstance(v, str) and v.strip() and not _URI_RE.match(v) and _is_relative(v) for v in values)
+
+
+def _argument_problem(params: dict[str, Any]) -> str | None:
+    """What a tool would reject in its arguments' names and types (the checks that need no files or lookups), so a
+    call that can't succeed isn't sent round for roots first."""
+    name, arguments = params.get("name"), params.get("arguments")
+    if not isinstance(name, str) or name not in _HANDLERS or not isinstance(arguments, dict):
+        return None  # _tools_call's protocol errors
+    try:
+        _check_keys(name, arguments)
+        schema = next(t for t in TOOLS if t["name"] == name)["inputSchema"]
+        for key in schema.get("required", []):
+            _string(arguments, key, required=True)
+        for key, prop in schema["properties"].items():
+            if prop["type"] == "string":
+                _string(arguments, key)
+            elif prop["type"] == "boolean" and arguments.get(key) is not None:
+                if not isinstance(arguments[key], bool):
+                    raise ToolError(f"'{key}' must be true or false")
+            elif prop["type"] == "array":
+                _platforms(arguments)
+    except ToolError as e:
+        return str(e)
+    return None
+
+
+def _is_relative(raw: str) -> bool:
+    try:
+        return not Path(raw).expanduser().is_absolute()
+    except RuntimeError:  # ~user with no such user: the tool reports it
+        return False
+
+
+def _root_paths(roots: object) -> tuple[Path, ...]:
+    """The local folders in a roots/list result's roots (other URIs and malformed entries are left out)."""
+    paths = []
+    for root in roots if isinstance(roots, list) else ():
+        uri = root.get("uri") if isinstance(root, dict) else None
+        path = _file_uri_path(uri) if isinstance(uri, str) else None
+        if path is not None and path.is_absolute():  # file:, file://localhost or file:../x would be the cwd's
+            paths.append(path)
+    return tuple(paths)
+
+
+def _error(msg_id: Any, code: int, message: str, data: object = None) -> dict[str, Any]:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": msg_id, "error": error}
 
 
 def serve(stdin: BinaryIO, stdout: BinaryIO) -> None:
