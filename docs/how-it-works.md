@@ -58,9 +58,17 @@ folder and its entries readable by you only.
 `--online` always asks the index again and saves the fresh answer, so later runs use it; `--no-cache` neither reads nor
 saves the cache for one run. Entries older than 24 hours are deleted, at most once a day, and `wheelgap --clear-cache`
 deletes all of them (add inputs to check them right after). Both touch only wheelgap's own entry files, and never follow
-a link. After 0.9.0, `--conda-forge` answers are kept the same way, cut down to the subdir, Python, ABI and
-virtual-package needs of each build of the checked version. Unpinned names, version ranges and `--index-url` lookups
-aren't cached, and neither are lookups from the Python API.
+a link. Unpinned names, version ranges and `--index-url` lookups aren't cached, and neither are lookups from the
+Python API.
+
+After 0.9.0, the same folder also keeps, for 24 hours each:
+
+- `--conda-forge` answers, cut down to the subdir, Python, ABI and virtual-package needs of each build of the checked
+  version;
+- `--notes` lookups, a package the tracker doesn't list included;
+- `--build-info` answers (the sdist's `[build-system]` table), but only from a download that matched its sha256.
+
+They follow `--no-cache` and `--online` like the other lookups.
 
 ## Private indexes
 
@@ -73,6 +81,49 @@ the URL passed to `--index-url` (`https://user:token@host/simple`) and never app
 Packages a lockfile pins to another index are never looked up on PyPI by name: a namesake on PyPI would be another
 package. They keep their locked files, or are skipped as `private index` when the lock has none. `WHEELGAP_INDEX_URL`
 points the JSON API lookups at a mirror; see [Pipfile.lock](inputs.md#pipfilelock).
+
+## Which package names leave the run {#pypi-origin}
+
+!!! note "After 0.9.0"
+    `--conda-forge`, `--notes` and `--build-info` are not in 0.9.0.
+
+Three opt-in flags send the names of packages with gaps somewhere other than the index: `--conda-forge` to
+anaconda.org, `--notes` to wheelgap.github.io, and `--build-info` to PyPI's file host, for the sdist. A name from a
+private index must never leave the run, so all three send a package's name only when wheelgap knows the package is
+PyPI's. That's one rule, shared by the three, and it holds when all of these do:
+
+- **Lookups go to pypi.org:** no `--index-url` (or `index-url` in `[tool.wheelgap]`) and no `WHEELGAP_INDEX_URL`
+  pointing at another index. With either, none of the three sends anything, and a note on stderr says so.
+- **The package comes from an index:** not a Git, path, URL, editable or conda package, and not one already skipped
+  as `private index`.
+- **And either** its lock records its index as exactly `https://pypi.org/simple` (a `uv.lock` registry or a
+  `pylock.toml` index; a `poetry.lock` legacy source or a `pixi.lock` index with that exact URL counts too, except for
+  `--notes`), **or** this run looked it up and found it on pypi.org, and nothing points pip or uv at another index:
+    - **The input names no other index.** That's package names, a requirements file with no `-i`/`--index-url`,
+      `--extra-index-url`, `-f`/`--find-links` or `--no-index` option (in any form pip reads, in it or in the files it
+      pulls in with `-r` and `-c`), a `pyproject.toml` with no index or sources in `[tool.uv]`, `[tool.uv.pip]`,
+      `[tool.poetry]`, `[tool.pdm]` or `[tool.pixi.pypi-options]`, or a `Pipfile.lock` whose sources are all PyPI. A
+      `-c` file that isn't read (a URL or `${VAR}`) or an abbreviated `--requirement`/`--constraint` option counts as
+      naming one.
+    - **No `uv.toml`, `pyproject.toml` or `pdm.toml` sets an index** in the input's folder or a folder above it, up to
+      the repository root (the first with a `.git`). One that can't be read counts as setting one.
+    - **No environment variable sets one:** `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`, `PIP_FIND_LINKS`,
+      `PIP_NO_INDEX`, `PIP_CONFIG_FILE` (any case after `PIP_`), `UV_INDEX_URL`, `UV_DEFAULT_INDEX`, `UV_INDEX`,
+      `UV_EXTRA_INDEX_URL`, `UV_FIND_LINKS`, `UV_NO_INDEX`, `UV_CONFIG_FILE` or any `UV_INDEX_*`.
+
+So `pdm.lock` entries, `poetry.lock` and `pixi.lock` entries that record no index, `pylock.toml` entries without an
+`index`, and packages from another index are never sent. User and system settings aren't read: a `pip.conf` or
+`pip.ini`, `~/.config/uv/uv.toml`, `/etc/uv/uv.toml` and `.netrc`. If those point pip or uv at a private index, don't
+use these flags (or set one of the variables above).
+
+Each flag then adds its own limits:
+
+- **`--conda-forge`** follows the rule as it is, and a note on stderr names the packages it didn't look up.
+- **`--notes`** takes the recorded-index route only from `uv.lock` and `pylock.toml`, and is off with `--offline`
+  (or `offline = true`).
+- **`--build-info`** is off for the whole run when an environment variable above is set, as well as with
+  `--offline`. It downloads the sdist from the URL in the lock when that's on `files.pythonhosted.org` and names that
+  release's sdist, checked against the lock's sha256, and otherwise asks PyPI's JSON API for it.
 
 ## Scanning the top PyPI packages
 

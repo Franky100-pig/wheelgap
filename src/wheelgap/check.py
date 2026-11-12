@@ -21,7 +21,7 @@ try:  # packaging's parsed-marker node types (private, so guarded: without them 
 except ImportError:  # pragma: no cover
     _Value = _Variable = None  # type: ignore[assignment,misc]
 
-from .sources import Edge, Package, Source, uv_extra_names, uv_group_names, uv_selected_roots
+from .sources import Edge, Package, PoetryExtras, Source, uv_extra_names, uv_group_names, uv_selected_roots
 from .targets import ANDROID_FLOOR, IOS_FLOOR, MANYLINUX_FLOOR, MANYLINUX_X86_ARCHES, PLATFORMS, Target
 
 
@@ -319,8 +319,11 @@ def _quote(text: str) -> str | None:
     return f"'{text}'" if "'" not in text else None  # both kinds of quote: can't re-serialise safely
 
 
-def _atom(node: tuple, target: Target, environment: dict | None = None) -> bool | None:
-    """One comparison: True/False, or None when it involves something we can't know."""
+def _atom(
+    node: tuple, target: Target | None, environment: dict | None = None, poetry_extras: PoetryExtras | None = None
+) -> bool | None:
+    """One comparison: True/False, or None when it involves something we can't know (or, with no target, anything
+    but a Poetry extra)."""
     if _Variable is None or _Value is None:
         return None  # packaging's internals changed: treat every comparison as unknown (never hide)
     parts: list[str] = []
@@ -336,7 +339,9 @@ def _atom(node: tuple, target: Target, environment: dict | None = None) -> bool 
             parts.append(quoted)
         else:
             parts.append(str(n.value))  # the operator
-    if not names or names & ((_UNKNOWABLE - (environment or {}).keys()) | target.unknown_markers):
+    if poetry_extras is not None and names == {"extra"}:
+        return _poetry_extra(node, poetry_extras)
+    if target is None or not names or names & ((_UNKNOWABLE - (environment or {}).keys()) | target.unknown_markers):
         return None
     text = " ".join(parts)
     if environment is not None:
@@ -353,7 +358,24 @@ def _atom(node: tuple, target: Target, environment: dict | None = None) -> bool 
     return _atom_cache[key]
 
 
-def _evaluate3(markers: list, target: Target, environment: dict | None = None) -> bool | None:
+def _poetry_extra(node: tuple, extras: PoetryExtras) -> bool | None:
+    """An `extra` comparison as Poetry evaluates a lock's markers: `extra` stands for the set of extras selected, so
+    `extra == "api"` holds if api is one of them and `extra != "api"` if it isn't (SingleMarker.validate in
+    https://github.com/python-poetry/poetry-core/blob/2.5.0/src/poetry/core/version/markers.py, called from
+    Transaction.calculate_operations in Poetry 2.5's src/poetry/puzzle/transaction.py). A name that isn't one of the
+    project's extras, or any other operator, is unknown."""
+    known, selected = extras
+    if len(node) != 3 or str(node[1].value) not in ("==", "!="):
+        return None
+    value = node[2] if isinstance(node[0], _Variable) else node[0]
+    if not isinstance(value, _Value) or (name := canonicalize_name(value.value)) not in known:
+        return None
+    return (name in selected) == (str(node[1].value) == "==")
+
+
+def _evaluate3(
+    markers: list, target: Target | None, environment: dict | None = None, poetry_extras: PoetryExtras | None = None
+) -> bool | None:
     """Kleene evaluation of packaging's parsed marker list: `and` binds tighter than `or`."""
     groups: list[list[bool | None]] = [[]]
     for item in markers:
@@ -362,13 +384,65 @@ def _evaluate3(markers: list, target: Target, environment: dict | None = None) -
         elif item == "and":
             continue
         elif isinstance(item, list):
-            groups[-1].append(_evaluate3(item, target, environment))
+            groups[-1].append(_evaluate3(item, target, environment, poetry_extras))
         else:
-            groups[-1].append(_atom(item, target, environment))
+            groups[-1].append(_atom(item, target, environment, poetry_extras))
     results: list[bool | None] = []
     for group in groups:
         results.append(False if False in group else None if None in group else True)
     return True if True in results else None if None in results else False
+
+
+def _parsed_marker(marker: str) -> Marker | None:
+    if marker not in _marker_cache:
+        try:
+            _marker_cache[marker] = Marker(marker)
+        except InvalidMarker:
+            _marker_cache[marker] = None
+    return _marker_cache[marker]
+
+
+def poetry_marker_holds(marker: str, target: Target | None, extras: PoetryExtras) -> bool:
+    """Whether a Poetry 2.x lock marker can hold on `target` with these extras (see _poetry_extra). With no target,
+    whether it can hold on any target: only its extra comparisons are known then."""
+    m = _parsed_marker(marker)
+    if m is None:
+        return True  # can't parse it: assume the package is needed rather than hide a gap
+    try:
+        return _evaluate3(m._markers, target, poetry_extras=extras) is not False
+    except Exception:  # packaging changed its internals: count it as needed rather than hide a gap
+        return True
+
+
+def poetry_extras_decide(marker: str, extras: PoetryExtras) -> tuple[bool | None, bool]:
+    """How the selected extras decide a Poetry 2.x lock marker. If it's only `extra` comparisons on the project's
+    extras (`extra == "a" or extra == "b"`), the selection alone decides it: (True or False, False). Anything else
+    (`sys_platform == "win32" or extra == "a"`) also depends on how the package is reached, which Poetry 2.0-2.2 (and
+    installer.re-resolve) read differently from the lock, so it's (None, ruled_out): evaluated per target with every
+    extra unknown, a superset, where ruled_out says whether the selection rules out one of its extra comparisons."""
+    m = _parsed_marker(marker)
+    if m is None or _Variable is None:
+        return None, False
+    atoms: list[tuple] = []
+
+    def walk(items: list) -> None:
+        for item in items:
+            if isinstance(item, list):
+                walk(item)
+            elif isinstance(item, tuple):
+                atoms.append(item)
+
+    try:
+        walk(m._markers)
+        decided = [
+            _poetry_extra(atom, extras) if {n.value for n in atom if isinstance(n, _Variable)} == {"extra"} else None
+            for atom in atoms
+        ]
+        if atoms and all(d is not None for d in decided):
+            return _evaluate3(m._markers, None, poetry_extras=extras) is not False, False
+        return None, False in decided
+    except Exception:  # packaging changed its internals: count it as needed rather than hide a gap
+        return None, False
 
 
 def marker_holds(
@@ -380,12 +454,7 @@ def marker_holds(
 ) -> bool:
     if not marker:
         return True
-    if marker not in _marker_cache:
-        try:
-            _marker_cache[marker] = Marker(marker)
-        except InvalidMarker:
-            _marker_cache[marker] = None
-    m = _marker_cache[marker]
+    m = _parsed_marker(marker)
     if m is None:
         return True  # can't parse it: assume the package is needed rather than hide a gap
     try:

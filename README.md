@@ -75,6 +75,8 @@ python = ["3.13", "3.14t"]
 targets = ["linux-x86_64", "linux-aarch64", "musl-aarch64"]
 ```
 
+Not sure what to put there? After 0.9.0, `wheelgap --suggest-targets` reads the platforms your CI and Dockerfiles already name and suggests these lines ([how](https://wheelgap.github.io/wheelgap/targets/#suggest-targets)).
+
 Each cell in the table is one of:
 
 | cell | meaning |
@@ -96,7 +98,7 @@ data = json.load(open("wheelgap.json"))
 key = next(t["label"] for t in data["targets"] if t["python"] == "3.13" and t["platform"] == "linux-x86_64")
 ```
 
-After 0.9.0, `--explain --conda-forge` also says when conda-forge has a build of the same version for a gap's target.
+After 0.9.0, `--explain` can also show the coverage tracker's notes (`--notes`), what a source build needs (`--build-info`) and conda-forge builds that fit (`--conda-forge`). These are opt-in, since they send package names elsewhere ([which names](https://wheelgap.github.io/wheelgap/how-it-works/#pypi-origin)).
 
 The docs cover [inputs and dependency selection](https://wheelgap.github.io/wheelgap/inputs/), [`--explain`](https://wheelgap.github.io/wheelgap/output/#explain), [the `--json` schema](https://wheelgap.github.io/wheelgap/output/#json), [every flag](https://wheelgap.github.io/wheelgap/cli/) and the [recipes](https://wheelgap.github.io/wheelgap/recipes/) for multi-arch images, monorepos and free-threading readiness.
 
@@ -115,7 +117,7 @@ Python versions take a trailing `t` for free-threaded builds (`3.14t`). `--glibc
     args: uv.lock -p 3.13 -t linux-x86_64,linux-aarch64
 ```
 
-The job fails when a dependency would build from source on a target you ship, for example when a dependency bump drops ARM wheels. The gap table also goes to the run's summary page (set `summary: false` to turn that off). [CI](https://wheelgap.github.io/wheelgap/ci/) covers the Action, `--markdown`, `--junit` and GitLab.
+The job fails when a dependency would build from source on a target you ship, for example when a dependency bump drops ARM wheels. The gap table also goes to the run's summary page (set `summary: false` to turn that off). After 0.9.0, `compare-to: base` fails only when a pull request makes the lockfile worse, and `comment: true` posts the result on the pull request ([details and permissions](https://wheelgap.github.io/wheelgap/ci/#compare-to)). [CI](https://wheelgap.github.io/wheelgap/ci/) covers the Action, `--markdown`, `--junit` and GitLab.
 
 ## With pre-commit
 

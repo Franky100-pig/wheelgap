@@ -10,6 +10,9 @@ targets = ["linux-x86_64", "linux-aarch64", "musl-aarch64"]
 glibc = "2.31"
 ```
 
+Not sure what to put there? After 0.9.0, [`wheelgap --suggest-targets`](targets.md#suggest-targets) reads the
+platforms and Pythons your CI and Dockerfiles already name and suggests these lines.
+
 wheelgap reads the `pyproject.toml` in the folder of the first file or directory you pass (next to the lockfile),
 or in the current directory when you pass none. An unknown key, or a value of the wrong type, is an input error
 (exit 2).
@@ -81,8 +84,9 @@ as [`--pyodide-lock`](cli.md#pyodide-lock); see [Pyodide](targets.md#pyodide).
 
 ### `extras` {#extras}
 
-A list of project extras to include: `extras = ["api"]`. Only applies to `uv.lock` inputs. `--extra` replaces the
-list; an empty list selects no extras. See [dependency selection](inputs.md#uvlock).
+A list of project extras to include: `extras = ["api"]`. Applies to `uv.lock` inputs, and after 0.9.0 to Poetry 2.x
+`poetry.lock` inputs too. `--extra` replaces the list; an empty list selects no extras. See
+[dependency selection](inputs.md#uvlock).
 
 ### `groups` {#groups}
 
@@ -107,6 +111,18 @@ exits 1 when a package can't be installed at all (or couldn't be checked). Same 
 
 `true` or `false`. `quiet = true` shows only the gap summary and package names, as [`-q`](cli.md#quiet) does;
 `--no-quiet` turns it off for one run.
+
+### `notes` {#notes}
+
+*After 0.9.0.* `true` or `false`. `notes = true` makes `--explain` also show the coverage tracker's notes, as
+[`--notes`](cli.md#notes) does, which sends the names of packages with gaps to wheelgap.github.io; `--no-notes` turns it
+off for one run. See [Tracker notes](output.md#notes).
+
+### `build-info` {#build-info}
+
+*After 0.9.0.* `true` or `false`. `build-info = true` makes `--explain` also say what each `source` build needs, as
+[`--build-info`](cli.md#build-info) does, which downloads the sdists of packages known to be PyPI's. See
+[Build requirements](output.md#build-info).
 
 ## Index access
 

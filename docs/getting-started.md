@@ -96,5 +96,7 @@ installs the package (`via: myapp → uvicorn → uvloop`). If you think wheelga
 - Run it in CI: [the GitHub Action, pre-commit and GitLab](ci.md).
 - Accept known gaps with [`--ignore`](cli.md#ignore), or, after 0.9.0, watch a platform without failing on it with
   [`--advisory`](cli.md#advisory).
+- Not sure which targets you ship to? After 0.9.0,
+  [`wheelgap --suggest-targets`](targets.md#suggest-targets) reads them from your CI and Dockerfiles.
 - Compare the lockfile before and after a dependency bump with [`wheelgap diff`](diff.md).
 - See the [recipes](recipes.md) for multi-arch images, monorepos and free-threading readiness.

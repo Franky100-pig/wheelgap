@@ -35,6 +35,10 @@ class SourceError(ValueError):
     pass
 
 
+# A Poetry 2.x lock's extras for an extras selection: (every extra in its [extras] table, the ones selected), canonical.
+PoetryExtras = tuple[frozenset[str], frozenset[str]]
+
+
 @dataclass
 class Package:
     name: str
@@ -56,6 +60,9 @@ class Package:
     registry: str | None = None
     # The index picked `version` (an unpinned or ranged requirement): it isn't a pin from the input.
     version_from_index: bool = False
+    # uv.lock / pylock.toml: the sdist's URL and sha256, as the lock records them (for --build-info).
+    sdist_url: str | None = None
+    sdist_sha256: str | None = None
     # This run found the package on pypi.org's JSON API (pypi.fill), so its name is public there.
     found_on_pypi: bool = False
     # `files` are only some of the release's files (pixi.lock records the one it picked per platform), so the
@@ -128,6 +135,11 @@ class Source:
     # by the groups Poetry records on them.
     poetry_tables: list[dict] | None = None
     poetry_pyproject: Path | None = None
+    # poetry.lock only: the extras in its [extras] table, which `poetry install --extras` accepts.
+    poetry_lock_extras: list[str] = field(default_factory=list)
+    # poetry.lock after a selection: the note that says where extras couldn't leave packages out, because Poetry
+    # 2.0-2.2 may install them without the extra (see poetry_extras_decide and _poetry_extras_declared_elsewhere).
+    poetry_extras_unsure: str | None = None
     # pdm.lock only: each package's `groups` list (None for a package that records none, as before PDM 2.x),
     # kept so --group/--only-group/--no-dev can pick packages. None when the input isn't a pdm.lock.
     pdm_groups: list[list[str] | None] | None = None
@@ -193,6 +205,22 @@ def _filename(entry: dict) -> str | None:
     return None
 
 
+def _sdist_source(entry: object, hash_key: str) -> tuple[str | None, str | None]:
+    """(URL, sha256) of a uv.lock sdist (hash = "sha256:...") or a pylock.toml one (hashes = {sha256 = ...})."""
+    if not isinstance(entry, dict):
+        return None, None
+    url, digest = entry.get("url"), entry.get(hash_key)
+    if isinstance(digest, dict):
+        digest = digest.get("sha256")
+    elif isinstance(digest, str) and digest.startswith("sha256:"):
+        digest = digest.removeprefix("sha256:")
+    else:
+        digest = None
+    if not (isinstance(digest, str) and len(digest) == 64 and all(c in "0123456789abcdefABCDEF" for c in digest)):
+        digest = None
+    return (url if isinstance(url, str) else None), (digest.lower() if digest else None)
+
+
 def _uv_edges(p: dict) -> list[Edge]:
     groups = [p.get("dependencies", [])]
     for table in ("optional-dependencies", "dev-dependencies"):
@@ -218,6 +246,7 @@ def parse_uv_lock(path: Path) -> Source:
             files = [f for f in (_filename(w) for w in p.get("wheels", [])) if f]
             if p.get("sdist"):
                 files.append(_filename(p["sdist"]) or f"{p['name']}-{p.get('version')}.tar.gz")
+                pkg.sdist_url, pkg.sdist_sha256 = _sdist_source(p["sdist"], "hash")
             pkg.files = files
         i = len(source.packages)
         source.packages.append(pkg)
@@ -270,35 +299,46 @@ def select_uv_dependencies(
     *,
     configured_extras: bool = False,
     poetry: bool = True,
+    pdm: bool = True,
 ) -> None:
-    """Apply `selection` to the uv.lock sources, and its groups to Poetry 2.x poetry.lock and pdm.lock sources. With
+    """Apply `selection` to the uv.lock and Poetry 2.x poetry.lock sources, and its groups to pdm.lock sources. With
     strict (selectors from the command line), other inputs are an error; otherwise (from [tool.wheelgap]) they're left
-    as they are. configured_extras: the extras come from [tool.wheelgap], which apply to uv.lock inputs only, so a
-    poetry.lock or pdm.lock doesn't reject them. poetry=False leaves poetry.lock and pdm.lock inputs as they are (only
-    extras configured)."""
-    if selection.only_groups and (selection.extras or selection.all_extras):
-        raise SourceError("--only-group cannot be combined with --extra or --all-extras")
+    as they are. configured_extras: the extras come from [tool.wheelgap], which don't apply to pdm.lock inputs, so a
+    pdm.lock doesn't reject them. poetry=False leaves poetry.lock inputs as they are, and pdm=False pdm.lock inputs
+    (only extras configured)."""
+    # `poetry install --only main --extras api` is a production install, so poetry.lock inputs allow it.
+    if (
+        selection.only_groups
+        and (selection.extras or selection.all_extras)
+        and (not sources or any(source.poetry_tables is None for source in sources))
+    ):
+        raise SourceError("--only-group cannot be combined with --extra or --all-extras for uv.lock inputs")
     if selection.no_dev and "dev" in selection.groups | selection.only_groups:
         raise SourceError("--no-dev cannot be combined with an explicit dev group")
     if strict and (not sources or any(source.uv_packages is None for source in sources)):
         others = [source for source in sources if source.uv_packages is None]
         if sources and all(source.poetry_tables is not None or source.pdm_groups is not None for source in others):
-            if selection.all_extras or (selection.extras and not configured_extras):
+            pdm_lock = any(source.pdm_groups is not None for source in others)
+            if pdm_lock and (selection.all_extras or (selection.extras and not configured_extras)):
                 raise SourceError(
-                    "extra selection requires uv.lock inputs (poetry.lock and pdm.lock support groups only)"
+                    "extra selection requires uv.lock or poetry.lock inputs (pdm.lock supports groups only)"
                 )
         else:
-            raise SourceError("extra/group selection requires uv.lock inputs")
+            unsupported = [s.label for s in others if s.poetry_tables is None and s.pdm_groups is None]
+            raise SourceError(
+                "extra/group selection requires uv.lock, Poetry 2.x poetry.lock or pdm.lock inputs "
+                f"(not {', '.join(unsupported) or 'no input'})"
+            )
     for source in sources:
         if source.pdm_groups is not None:
             # A lock without package groups or inherit_metadata: configured groups leave it as it is.
-            if poetry and (strict or (source.pdm_inherit_metadata and all(g is not None for g in source.pdm_groups))):
+            if pdm and (strict or (source.pdm_inherit_metadata and all(g is not None for g in source.pdm_groups))):
                 _select_pdm_groups(source, selection)
             continue
         if source.poetry_tables is not None:
-            # A Poetry 1.x lock doesn't record groups per package; configured groups leave it as it is.
+            # A Poetry 1.x lock doesn't record groups or extras per package; a configured selection leaves it as it is.
             if poetry and (strict or source.edges is None):
-                _select_poetry_groups(source, selection)
+                _select_poetry(source, selection)
             continue
         if source.uv_packages is None:
             continue
@@ -344,18 +384,36 @@ def _poetry_markers(p: dict, groups: Iterable[str]) -> list[str] | None:
     return [m for g in groups if isinstance(m := markers.get(g), str)] or None
 
 
-def _select_poetry_groups(source: Source, selection: UvSelection) -> None:
+def _select_poetry(source: Source, selection: UvSelection) -> None:
     """Keep the poetry.lock packages that Poetry would install for `selection`, with Poetry's meanings: `main` and
     every non-optional group by default, `--group` adds a group (like `poetry install --with`), `--no-dev` leaves
-    out `dev`, and `--only-group` installs only the named groups (`main` too only if named)."""
+    out `dev`, and `--only-group` installs only the named groups (`main` too only if named). Extras are only those
+    selected, as with `poetry install --extras` / `--all-extras`: a package's markers read `extra` as that set."""
+    from .check import poetry_extras_decide  # check imports this module
+
     tables = source.poetry_tables or []
     if source.edges is not None or any(not isinstance(t.get("groups"), list) for t in tables):
-        raise SourceError(f"{source.label}: group selection needs a poetry.lock from Poetry 2.x (with package groups)")
+        raise SourceError(
+            f"{source.label}: extra/group selection needs a poetry.lock from Poetry 2.x (with package groups)"
+        )
+    # Poetry checks --extras against the lock's [extras] table, which lists every extra (empty ones too).
+    known_extras = frozenset(canonicalize_name(name) for name in source.poetry_lock_extras)
+    if selection.extras - known_extras:
+        raise SourceError(f"{source.label}: unknown extras: {', '.join(sorted(selection.extras - known_extras))}")
+    extras: PoetryExtras | None = (known_extras, known_extras if selection.all_extras else selection.extras)
     known = {"main"} | {canonicalize_name(g) for t in tables for g in t["groups"]}
     optional: set[str] = set()
     pyproject = source.poetry_pyproject
+    unsure = None
+    if known_extras and (pyproject is None or not pyproject.is_file()):
+        unsure = "no pyproject.toml beside it to show how its extras are declared"
     if pyproject is not None and pyproject.is_file():
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        elsewhere, unreadable = _poetry_extras_declared_elsewhere(data)
+        if unreadable:
+            unsure = f"pyproject.toml has requirements wheelgap can't read ({', '.join(unreadable)})"
+        elif elsewhere:
+            unsure = f"{', '.join(elsewhere)} in an extra and declared elsewhere in pyproject.toml"
         # PEP 735 groups (Poetry 2.2+): an empty one is in no package's groups, but it's still a known group.
         pep735 = data.get("dependency-groups")
         known.update(canonicalize_name(name) for name in (pep735 if isinstance(pep735, dict) else {}))
@@ -364,6 +422,13 @@ def _select_poetry_groups(source: Source, selection: UvSelection) -> None:
             known.add(canonicalize_name(name))
             if isinstance(group, dict) and group.get("optional") is True:
                 optional.add(canonicalize_name(name))
+    if unsure is not None:
+        # The lock's markers can be wrong for Poetry 2.0-2.2 here: never let extras leave a package out of it.
+        source.poetry_extras_unsure = (
+            f"{unsure}, so Poetry 2.0-2.2 and 2.3+ may install different packages without an extra; "
+            "extras leave no package out of this lock"
+        )
+        extras = None
     unknown = (selection.groups | selection.only_groups) - known
     if unknown:
         raise SourceError(f"{source.label}: unknown groups: {', '.join(sorted(unknown))}")
@@ -374,15 +439,97 @@ def _select_poetry_groups(source: Source, selection: UvSelection) -> None:
     if selection.no_dev:
         chosen.discard("dev")
     kept = []
+    kept_anyway: list[str] = []
     for pkg, table in zip(source.packages, tables, strict=True):
         groups = [g for g in table["groups"] if canonicalize_name(g) in chosen]
-        if groups:
-            pkg.markers = _poetry_markers(table, groups)
-            kept.append(pkg)
-        else:
+        if not groups:
             source.unselected_keys.add(pkg.key)
+            continue
+        markers = _poetry_markers(table, groups)
+        if markers is not None and extras is not None:
+            decided = [poetry_extras_decide(m, extras) for m in markers]
+            if all(holds is not None for holds, _ in decided):
+                if not any(holds for holds, _ in decided):
+                    source.unselected_keys.add(pkg.key)  # only for extras that aren't selected
+                    continue
+                markers = None  # a selected extra installs it, on every target
+            elif any(holds is False or ruled_out for holds, ruled_out in decided):
+                kept_anyway.append(pkg.name)  # the extras selected would have left it out somewhere
+        pkg.markers = markers
+        kept.append(pkg)
+    if kept_anyway:
+        shown = ", ".join(kept_anyway[:5]) + (f" and {len(kept_anyway) - 5} more" if len(kept_anyway) > 5 else "")
+        source.poetry_extras_unsure = (
+            f"{shown} kept for every extra: their markers combine an extra with other conditions, and Poetry 2.0-2.2 "
+            "can install them without the extra"
+        )
     source.packages = kept
     source.poetry_tables = None
+
+
+def _poetry_extras_declared_elsewhere(data: dict) -> tuple[list[str], list[str]]:
+    """Names in an extra that pyproject.toml also declares somewhere else: in the main dependencies (in any form), in
+    a group, or in another extra entry that isn't the same plain requirement. Poetry 2.x can lock these, and what they
+    depend on, with only the extra's marker (`requests; python_version < '3.11'` that an extra also lists becomes
+    `extra == "s3"`), and then Poetry 2.3 and later (which install from the lock's markers) leave them out where
+    Poetry 2.0 to 2.2 (which re-resolve, as installer.re-resolve does) install them. Found with Poetry 2.5.1 locks
+    installed by Poetry 2.0.1, 2.2.1 and 2.5.1. The same plain requirement in several extras locks correctly. Also
+    returns the requirement strings it can't read, which could be any of these."""
+
+    def table(value: object) -> dict:
+        return value if isinstance(value, dict) else {}
+
+    def strings(value: object) -> list[str]:
+        return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+    unreadable: list[str] = []
+
+    def requirements(specs: list[str]) -> list[Requirement]:
+        out: list[Requirement] = []
+        for spec in specs:
+            try:
+                out.append(Requirement(spec))
+            except InvalidRequirement:
+                unreadable.append(spec)
+        return out
+
+    def names(specs: list[str]) -> list[str]:
+        return [canonicalize_name(req.name) for req in requirements(specs)]
+
+    project = table(data.get("project"))
+    poetry = table(table(data.get("tool")).get("poetry"))
+    legacy = {canonicalize_name(name): spec for name, spec in table(poetry.get("dependencies")).items()}
+    # Each extra entry, as (name, what it says): a repeated entry is safe only if it's the same plain requirement.
+    entries: list[tuple[str, str | None]] = []
+    for specs in table(project.get("optional-dependencies")).values():
+        for req in requirements(strings(specs)):
+            says = f"{sorted(map(canonicalize_name, req.extras))} {req.specifier} {req.url}"
+            entries.append((canonicalize_name(req.name), None if req.marker else says))
+    pep621 = {name for name, _ in entries}
+    for specs in table(poetry.get("extras")).values():
+        for legacy_name in map(canonicalize_name, strings(specs)):
+            dependency = legacy.get(legacy_name)
+            plain = isinstance(dependency, dict) and not {"markers", "python", "platform"} & dependency.keys()
+            entries.append((legacy_name, f"tool.poetry {legacy_name}" if plain else None))
+    in_extras = {name for name, _ in entries}
+    elsewhere: set[str] = set()
+    for name in in_extras:
+        said = [what for n, what in entries if n == name]
+        if len(said) > 1 and (None in said or len(set(said)) > 1):
+            elsewhere.add(name)
+    # Main dependencies. A [tool.poetry.dependencies] table with optional = true is how a legacy extra declares its
+    # dependency, so only that doesn't count; any form counts for a [project] optional-dependencies name.
+    elsewhere |= in_extras & set(names(strings(project.get("dependencies"))))
+    for name, declared in legacy.items():
+        own = isinstance(declared, dict) and declared.get("optional") is True and name not in pep621
+        if name != "python" and not own:
+            elsewhere.add(name)
+    # Groups.
+    tables = [table(poetry.get("dev-dependencies"))]
+    tables += [table(table(g).get("dependencies")) for g in table(poetry.get("group")).values()]
+    elsewhere |= {canonicalize_name(name) for t in tables for name in t}
+    elsewhere |= {name for group in table(data.get("dependency-groups")).values() for name in names(strings(group))}
+    return sorted(elsewhere & in_extras), unreadable
 
 
 def _select_pdm_groups(source: Source, selection: UvSelection) -> None:
@@ -447,6 +594,7 @@ def parse_pylock(path: Path) -> Source:
             files = [f for f in (_filename(w) for w in p.get("wheels", [])) if f]
             if p.get("sdist"):
                 files.append(_filename(p["sdist"]) or f"{p['name']}-{p.get('version')}.tar.gz")
+                pkg.sdist_url, pkg.sdist_sha256 = _sdist_source(p["sdist"], "hashes")
             pkg.files = files
         pkgs.append(pkg)
     requires = data.get("requires-python")
@@ -504,8 +652,13 @@ def parse_poetry_lock(path: Path) -> Source:
         declared = _project_dependencies(path.parent / "pyproject.toml")
         roots |= {i for i, p in enumerate(pkgs) if p.key in declared}
         return Source(path.name, pkgs, edges=edges, roots=sorted(roots), poetry_tables=data.get("package", []))
+    extras = data.get("extras")
     return Source(
-        path.name, pkgs, poetry_tables=data.get("package", []), poetry_pyproject=path.parent / "pyproject.toml"
+        path.name,
+        pkgs,
+        poetry_tables=data.get("package", []),
+        poetry_pyproject=path.parent / "pyproject.toml",
+        poetry_lock_extras=[name for name in extras if isinstance(name, str)] if isinstance(extras, dict) else [],
     )
 
 

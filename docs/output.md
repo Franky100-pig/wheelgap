@@ -87,67 +87,138 @@ uvloop 0.21.0 on win-arm64: ● source
 Other inputs have no dependency graph, so they show no path. If you think wheelgap got a package wrong, this output
 (or `--json --explain`) is all a bug report needs, with no need to share your lockfile.
 
+### Tracker notes {#notes}
+
+!!! note "After 0.9.0"
+    `--notes` and `notes = true` are not in 0.9.0.
+
+With `--notes` (or `notes = true` in `[tool.wheelgap]`), `--explain` also shows the
+[coverage tracker](https://wheelgap.github.io/tracker/)'s
+[notes](https://github.com/wheelgap/tracker/blob/main/notes/README.md) for a package with a gap: what the scan can't
+know, such as a binary package to use instead, a system library to install first, or an upstream issue to follow. A
+note is shown once per package, under its explanation, with the gap platforms it covers and its links:
+
+```text
+psycopg2 2.9.10: note from the wheelgap tracker for linux-x86_64 (alternative, checked 2026-11-11)
+  - psycopg2 has wheels for Windows x86-64 only. psycopg2-binary has wheels for these platforms (not for free-threaded Python): `pip install psycopg2-binary`. …
+    https://www.psycopg.org/docs/install.html#psycopg-vs-psycopg-binary
+```
+
+- `--notes` needs `--explain`, and `--no-notes` overrides `notes = true` for one run.
+- Only notes for a platform with a gap are shown. A note for `all` platforms covers the nine the tracker scans
+  (`linux-x86_64`, `linux-aarch64`, `musl-x86_64`, `musl-aarch64`, `macos-x86_64`, `macos-arm64`, `win-amd64`,
+  `win-arm64` and `pyodide`), not other targets. The tracker checks the latest release, so a note limited to some
+  releases (its `versions`) is shown only when your version is a plain release that matches them.
+- With `--json --explain`, each package gets a `notes` list (empty without `--notes` or when there are none), each note
+  with the tracker's `platforms`, `kind`, `text`, `links`, `versions` and `updated`, plus the `targets` (labels, like
+  `rejected`'s keys) it covers. `--markdown` puts them in the collapsed section with the rejected wheels, as plain
+  text.
+- Notes come from a public repository, so treat their text as plain text, not markup. wheelgap shows only notes in the
+  tracker's published format, as strictly as the tracker's own checker reads it, and drops any whose text or links
+  could pass for a GitHub Actions workflow command (`##[`, or a word starting with `::`).
+- **It sends the names of packages with gaps to wheelgap.github.io** (one small file per package), which is why it's
+  opt-in: `--explain` on a lockfile otherwise makes no requests. When there's a package it could look up, `--explain`
+  says so in one dim line on stderr (not with `-q`). Only names that pass
+  [the PyPI-origin rule](how-it-works.md#pypi-origin) are sent, and nothing at all with `--offline`, `--index-url` or a
+  `WHEELGAP_INDEX_URL` mirror; `--notes` then says on stderr that notes are off.
+- Each request gets one try with a 10-second timeout, all of them together get 15 seconds, and the first connection
+  failure stops the rest, so a runner without internet access isn't held up: wheelgap then says on stderr that it
+  couldn't reach wheelgap.github.io, or that it didn't answer in time, so notes may be missing (not with `-q`). Lookups
+  are cached for 24 hours, a package the tracker doesn't list included, and follow `--no-cache` and `--online`. A note
+  that can't be fetched, or a package the tracker doesn't list, adds nothing, and the exit status never depends on
+  notes.
+
+### Build requirements {#build-info}
+
+!!! note "After 0.9.0"
+    `--build-info` and `build-info = true` are not in 0.9.0.
+
+With `--build-info` (or `build-info = true` in `[tool.wheelgap]`), `--explain` also says what each `source` build
+needs, from the `[build-system]` table in the sdist's own `pyproject.toml`, once per package:
+
+```text
+rpds-py 0.27.0 on musl-armv7l: ● source
+  build needs: at least a Rust toolchain (maturin<2.0,>=1.9)
+```
+
+- `maturin` and `setuptools-rust` mean a Rust toolchain; `scikit-build-core`, `scikit-build` and `cmake` mean CMake
+  and a C/C++ compiler; `Cython` and `meson-python` mean a C/C++ compiler. Every other requirement is listed by name
+  and version range (`at least a C/C++ compiler (cython>=3.0), setuptools, wheel`), since wheelgap can't tell what it
+  implies. A requirement with an environment marker counts only if the marker holds on one of the targets that build
+  it. At most 50 requirements are shown (then `and N more`), each cut to 200 characters.
+- `no compiler` is only said for a `build-backend` that can't run one, named in `requires` from an index:
+  `flit_core.buildapi` (from `flit-core` or `flit`), `flit.buildapi` (from `flit`), or `poetry.core.masonry.api`
+  (from `poetry-core`, without a `build` script). Without a `build-backend`, pip uses setuptools, which can compile
+  anything; an in-tree backend (`backend-path`) is named as such.
+- With `--json --explain --build-info`, each package gets `build_requires`: the same requirements, normalized
+  (`["maturin<2.0,>=1.9"]`), or `null`.
+- **It's off by default because it downloads:** lockfiles are otherwise read without contacting the network. Only
+  packages that pass [the PyPI-origin rule](how-it-works.md#pypi-origin) are read, `--online` included, so other names
+  don't reach pypi.org. Nothing is read in a run with `--index-url`, `WHEELGAP_INDEX_URL` or a `PIP_*`/`UV_*` index
+  setting in the environment, which a note on stderr says (not with `-q`), and `--offline` turns it off.
+- The whole `.tar.gz` is read in memory, never written to disk, up to 64 MB downloaded, and it gives no answer
+  wherever pip could read another `pyproject.toml` from it than wheelgap would, or would fail: several top folders,
+  links out of the sdist or written through, hard links to anything but an earlier file of that exact name, links
+  alongside non-ASCII names or a `~` (macOS and Windows fold those), a non-ASCII name right next to `pyproject.toml`
+  (HFS+ ignores some invisible code points), names Windows reads as others (a trailing dot or space, `:`, a backslash,
+  a short name like `PYPROJ~1.TOM`), repeated names, a name differing only in case. `.zip` sdists, releases with more
+  than one sdist, and sdists without a `[build-system]` table get no answer either.
+- At most 30 seconds go to it in all (name lookups in DNS aside, which only the resolver's own timeouts bound), with
+  one 10-second attempt per download, and the first connection failure stops the rest; a server or proxy that answers
+  a byte at a time is cut off at the deadline. Either way, a note on stderr says how many packages weren't read (not
+  with `-q`). Otherwise a failure prints nothing, and build info never changes the exit code. Answers are cached for
+  24 hours with the other lookups, but only from a download that matched its sha256.
+
 ### conda-forge hint {#conda-forge}
 
 !!! note "After 0.9.0"
     `--conda-forge` is not in 0.9.0.
 
-`--conda-forge` adds a hint to `--explain`: for a package with a gap on a glibc Linux, macOS or Windows target, it asks
-[anaconda.org](https://anaconda.org/conda-forge) whether conda-forge has a package with exactly the same (canonical)
-name and a build of the same version that fits that target. For example, `wheelgap numpy==2.3.4 -p 3.14t -t
-linux-ppc64le --explain --conda-forge` adds:
+`--conda-forge` adds a hint to `--explain` (it needs `--explain`): for a package with a gap on a glibc Linux, macOS
+or Windows target, it asks [anaconda.org](https://anaconda.org/conda-forge) whether conda-forge has a package
+with exactly the same (canonical) name and a build of the same version that fits that target. For example,
+`wheelgap numpy==2.3.4 -p 3.14t -t linux-ppc64le --explain --conda-forge` adds:
 
-```
+```text
 numpy: conda-forge has a package named numpy with 2.3.4 builds for linux-ppc64le
 ```
 
-A build fits when all of these hold:
+A target whose only fitting builds are `noarch` is marked `(noarch)` in that line. A build fits when all of these
+hold:
 
-- It's on conda-forge's `main` label and not marked broken.
+- It's of the checked version, on conda-forge's `main` label and not marked broken.
 - It's for the target's conda subdir (`linux-64`, `linux-aarch64`, `linux-ppc64le`, `linux-riscv64`, `osx-64`,
   `osx-arm64`, `win-64`, `win-arm64`) or `noarch`.
 - Its `__glibc` and `__osx` minimums hold for the target's glibc and macOS versions (`--glibc`, `--macos`);
-  conda-forge's riscv64 builds need glibc 2.39, for example. A `noarch` build that depends on `__win`, `__unix`,
-  `__linux`, `__osx` or `__glibc` fits only those OSes, and one that needs another virtual package (such as `__cuda`)
-  never counts.
+  conda-forge's riscv64 builds need glibc 2.39, for example. A build that depends on `__win`, `__unix`, `__linux`,
+  `__osx` or `__glibc` fits only those OSes. A build that needs another virtual package (such as `__cuda`), or a
+  Python that isn't CPython (such as PyPy), never counts.
 - It's for the target's Python:
-  - a compiled build by its `python_abi` dependency: the same version and ABI, free-threaded or not;
-  - an abi3 build (`_python_abi3_support`) for any non-free-threaded CPython its `cpython` constraint admits;
-  - a `noarch` build by its `python` constraints.
+    - a compiled build by its `python_abi` dependency: the same version and ABI, free-threaded or not;
+    - an abi3 build (`_python_abi3_support`) for any non-free-threaded CPython its `cpython` constraint admits;
+    - a `noarch` build by its `python` constraints, free-threaded Python included;
+    - an older compiled build with no `python_abi` by its `python` constraint, and never for free-threaded Python.
 
-  A build whose Python can't be told doesn't count.
+    A build whose Python can't be told doesn't count.
 
 musl, Pyodide, iOS and Android targets never match, and neither do `linux-i686`, `linux-armv7l`, `linux-s390x` and
 `win32`, where conda-forge builds no current Python. With `--json --explain`, the package gets a `conda_forge` object:
 `"conda_forge": {"name": "numpy", "version": "2.3.4", "builds": {"linux-ppc64le": ["linux-ppc64le"]}}`, keyed by target
 label like `rejected`, with the subdirs of the builds that fit.
 
-It's only a hint, so it never changes a status, the summary or the exit code: a conda-forge build doesn't make `pip
-install` work, and conda names don't always match PyPI's (PyPI's `torch` is `pytorch` there). Without the flag nothing
-is looked up. With it, only names known to be on PyPI are sent to anaconda.org. Either a lockfile package's registry or
-index is exactly `https://pypi.org/simple` (`uv.lock`, `pylock.toml`), or this run found the package on pypi.org and
-nothing points pip or uv at another index:
+It's only a hint, so it never changes a status, the summary or the exit code: a conda-forge build doesn't make
+`pip install` work, and conda names don't always match PyPI's (PyPI's `torch` is `pytorch` there).
 
-- **The input names no other index.** That's package names, a requirements file with no `-i`/`--index-url`,
-  `--extra-index-url`, `-f`/`--find-links` or `--no-index` option (in any form pip reads, in it or in the files it pulls
-  in with `-r` and `-c`), a `pyproject.toml` with no index or sources in `[tool.uv]`, `[tool.uv.pip]`, `[tool.poetry]`,
-  `[tool.pdm]` or `[tool.pixi.pypi-options]`, or a `Pipfile.lock` whose sources are all PyPI. A `-c` file that isn't
-  read (a URL or `${VAR}`) or an abbreviated `--requirement`/`--constraint` option counts as naming one.
-- **No `uv.toml`, `pyproject.toml` or `pdm.toml` sets an index** in the input's folder or a folder above it, up to the
-  repository root (the first with a `.git`). One that can't be read counts as setting one.
-- **No environment variable sets one:** `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`, `PIP_FIND_LINKS`, `PIP_NO_INDEX`,
-  `PIP_CONFIG_FILE` (any case after `PIP_`), `UV_INDEX_URL`, `UV_DEFAULT_INDEX`, `UV_INDEX`, `UV_EXTRA_INDEX_URL`,
-  `UV_FIND_LINKS`, `UV_NO_INDEX`, `UV_CONFIG_FILE` or any `UV_INDEX_*`.
-
-User and system settings aren't read: a `pip.conf` or `pip.ini`, `~/.config/uv/uv.toml`, `/etc/uv/uv.toml` and `.netrc`.
-If those point pip or uv at a private index, don't use `--conda-forge` (or set one of the variables above). Others, such
-as `pdm.lock`, `poetry.lock` and `pixi.lock` packages, aren't looked up, and a note on stderr names them. A run with
-`--index-url`, `index-url` or `WHEELGAP_INDEX_URL` looks nothing up, and `--offline` refuses the flag. Each request is
-tried once (with a 15-second socket timeout), all of them together get 30 seconds, and the first that can't reach
-anaconda.org stops the rest. Answers over 16 MB (pyarrow's is about 60 MB) are refused, so at most about 250 MB is in
-use. When a lookup fails or is dropped, a note on stderr says no hint isn't a "no". Answers, including "too large" and
-"no such package", are cached for 24 hours like pinned lookups (`--no-cache` skips the cache); failures aren't.
-
+- **Which names are sent.** Without the flag nothing is looked up. With it, only names that pass
+  [the PyPI-origin rule](how-it-works.md#pypi-origin) are sent to anaconda.org; a note on stderr names the others. A
+  run with `--index-url`, `index-url` or `WHEELGAP_INDEX_URL` looks nothing up, and `--offline` refuses the flag.
+- **Time and size.** Each request is tried once (with a 15-second socket timeout), at most three at a time, all of
+  them together get 30 seconds, and the first that can't reach anaconda.org stops the rest. Answers over 16 MB
+  (pyarrow's is about 60 MB) are refused, so at most about 250 MB is in use. When a lookup fails or is dropped, a note
+  on stderr says no hint isn't a "no".
+- **Cache.** Answers, including "too large" and "no such package", are cached for 24 hours like pinned lookups, cut
+  down to the subdir, Python, ABI and virtual-package needs of each build of the checked version; `--no-cache` skips
+  the cache and `--online` asks again. Failures aren't cached.
 
 ## --json {#json}
 

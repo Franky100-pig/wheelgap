@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import gzip
+import hashlib
 import http.client
 import json
 import math
 import os
+import posixpath
+import socket
+import ssl
+import tarfile
+import threading
 import time
+import tomllib
 import urllib.error
 import urllib.request
+import zlib
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -33,6 +42,7 @@ from . import __version__, cache
 from .sources import Package, SourceError
 
 DEFAULT_INDEX = "https://pypi.org/pypi"
+_clock = time.monotonic  # deadlines are _clock() values; tests replace it
 
 
 def index_url() -> str:
@@ -81,7 +91,103 @@ class _HTTPSRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_OPENER = urllib.request.build_opener(_HTTPSRedirectHandler)
+# Each connection registers its socket here while a deadline watches the request (see _deadline_watch).
+_watched: ContextVar[tuple[float, list[socket.socket]] | None] = ContextVar("wheelgap_watched", default=None)
+
+
+def _shut(sock: socket.socket) -> None:
+    with contextlib.suppress(OSError):
+        socket.socket.shutdown(sock, socket.SHUT_RDWR)  # the plain socket's: SSLSocket.shutdown drops its state
+
+
+def _register(sock: socket.socket) -> None:
+    """Put a new socket under the current deadline watch, if any; shut it at once if the deadline has passed (a
+    connection a redirect opens late)."""
+    if (watch := _watched.get()) is not None:
+        deadline, socks = watch
+        socks.append(sock)
+        if _clock() >= deadline:
+            _shut(sock)
+
+
+class _WatchedSSLSocket(ssl.SSLSocket):
+    """Registered before its TLS handshake: wrapping detaches the plain socket registered at connect."""
+
+    def do_handshake(self, block: bool = False) -> None:
+        _register(self)
+        super().do_handshake(block)
+
+
+def _watching(cls):
+    """A connection class whose sockets _deadline_watch can shut down: from the moment they exist, so before a
+    proxy's CONNECT answer and the TLS handshake. Name resolution comes before there is a socket, so it's bound only
+    by the resolver's own timeouts."""
+
+    class Watched(cls):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            create = self._create_connection
+
+            def create_watched(*args, **kwargs):
+                sock = create(*args, **kwargs)
+                _register(sock)
+                return sock
+
+            self._create_connection = create_watched
+            context = getattr(self, "_context", None)
+            if isinstance(context, ssl.SSLContext):  # a context of this connection's own (http.client makes one)
+                context.sslsocket_class = _WatchedSSLSocket
+
+    return Watched
+
+
+_WATCHED = {cls: _watching(cls) for cls in (http.client.HTTPConnection, http.client.HTTPSConnection)}
+
+
+class _WatchedConnections:
+    """Opens connections that _deadline_watch can shut down."""
+
+    def do_open(self, http_class, req, **http_conn_args):
+        return super().do_open(_WATCHED.get(http_class, http_class), req, **http_conn_args)  # type: ignore[misc]
+
+
+class _HTTPHandler(_WatchedConnections, urllib.request.HTTPHandler):
+    pass
+
+
+class _HTTPSHandler(_WatchedConnections, urllib.request.HTTPSHandler):
+    pass
+
+
+_OPENER = urllib.request.build_opener(_HTTPSRedirectHandler, _HTTPHandler, _HTTPSHandler)
+
+
+@contextmanager
+def _deadline_watch(deadline: float | None) -> Iterator[None]:
+    """Shut the request's connection down once `deadline` (a _clock() value) passes, and raise DeadlineExceeded:
+    a socket timeout can't stop a server that sends a byte now and then, inside one readline of the headers."""
+    if deadline is None:
+        yield
+        return
+    socks: list[socket.socket] = []
+    token = _watched.set((deadline, socks))
+
+    def shut_all() -> None:
+        for sock in socks:
+            _shut(sock)
+
+    timer = threading.Timer(max(0.0, deadline - _clock()), shut_all)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    except Exception:
+        if _clock() >= deadline:
+            raise DeadlineExceeded from None
+        raise
+    finally:
+        timer.cancel()
+        _watched.reset(token)
 
 
 def _request(req: urllib.request.Request, timeout: float, attempts: int, read):
@@ -124,17 +230,268 @@ def _read_capped(resp, max_bytes: int) -> bytes:
     return body
 
 
-def fetch_json(url: str, timeout: float = 20.0, attempts: int = 4, max_bytes: int | None = None) -> dict:
+def fetch_json(
+    url: str, timeout: float = 20.0, attempts: int = 4, max_bytes: int | None = None, deadline: float | None = None
+) -> dict:
     """GET a JSON document (see _request for what is retried).
 
     With max_bytes, for documents that can be large: the server may send it gzipped (decoded as it's read), and a body
-    over max_bytes raises ResponseTooLarge (not retried) after reading no more than max_bytes + 1 bytes of it."""
+    over max_bytes raises ResponseTooLarge (not retried) after reading no more than max_bytes + 1 bytes of it.
+    With `deadline` (a _clock() value), the request is cut off then (DeadlineExceeded): see _deadline_watch."""
     headers = {"User-Agent": f"wheelgap/{__version__}", "Accept": "application/json"}
-    if max_bytes is None:
-        return _request(urllib.request.Request(url, headers=headers), timeout, attempts, json.load)
-    headers["Accept-Encoding"] = "gzip"
-    req = urllib.request.Request(url, headers=headers)
-    return _request(req, timeout, attempts, lambda resp: json.loads(_read_capped(resp, max_bytes)))
+    with _deadline_watch(deadline):
+        if max_bytes is None:
+            return _request(urllib.request.Request(url, headers=headers), timeout, attempts, json.load)
+        headers["Accept-Encoding"] = "gzip"
+        req = urllib.request.Request(url, headers=headers)
+        return _request(req, timeout, attempts, lambda resp: json.loads(_read_capped(resp, max_bytes)))
+
+
+# --explain --build-info reads sdists (see build.py). Past any of these caps an sdist gives no answer.
+SDIST_MAX_BYTES = 64 * 1024 * 1024  # downloaded (numpy's sdist is 19 MiB)
+SDIST_MAX_UNPACKED = 512 * 1024 * 1024  # of tar unpacked from them
+SDIST_MAX_HEADER = 64 * 1024  # one pax or GNU long-name header, which tarfile reads whole into memory
+SDIST_MAX_HEADERS = 4 * 1024 * 1024  # all of them in one sdist (global pax headers pile up)
+PYPROJECT_MAX_BYTES = 1024 * 1024
+_HEADER_TYPES = (tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK, tarfile.XHDTYPE, tarfile.XGLTYPE, b"X")
+_MEMBER_TYPES = (
+    *(tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.CONTTYPE, tarfile.DIRTYPE),
+    *(tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.CHRTYPE, tarfile.BLKTYPE, tarfile.FIFOTYPE),
+)
+
+
+class SdistRefused(Exception):
+    """No answer from this sdist: past a cap, unreadable, or pip could read another pyproject.toml from it than
+    wheelgap would (or would refuse to unpack it). `verified`: the download matched its sha256, or declared itself
+    too big, so the answer won't change and may be cached."""
+
+    def __init__(self, reason: str, verified: bool = False):
+        super().__init__(reason)
+        self.reason, self.verified = reason, verified
+
+
+class SdistHashMismatch(Exception):
+    """The download isn't the file whose sha256 the lock or the index gave."""
+
+
+class DeadlineExceeded(Exception):
+    """The time allowed for reading sdists ran out."""
+
+
+class _Limited:
+    """A read-only stream over `inner`, read one network read at a time (read1, when it has one) so that the
+    deadline is checked between any two. Raises SdistRefused past `cap` bytes; `digest` sees every byte."""
+
+    def __init__(self, inner, cap: int, deadline: float | None = None, digest=None):
+        self._read = getattr(inner, "read1", inner.read)
+        self._left, self._deadline, self._digest = cap, deadline, digest
+
+    def read(self, n: int = -1) -> bytes:
+        """`n` bytes, fewer only at the end of the stream (gzip reads its 2-byte magic number in one call)."""
+        want = self._left + 1 if n < 0 else min(n, self._left + 1)
+        chunks: list[bytes] = []
+        got = 0
+        while got < want:
+            if self._deadline is not None and _clock() > self._deadline:
+                raise DeadlineExceeded
+            chunk = self._read(want - got)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            got += len(chunk)
+            if n < 0:
+                break
+        data = b"".join(chunks)
+        if len(data) > self._left:
+            raise SdistRefused("too big")
+        self._left -= len(data)
+        if self._digest is not None:
+            self._digest.update(data)
+        return data
+
+
+class _TarInfo(tarfile.TarInfo):
+    """Refuses what tarfile would otherwise hold in memory whatever its size: pax and GNU long-name headers past
+    SDIST_MAX_HEADER each or SDIST_MAX_HEADERS in all, and the map of a sparse file (sdists have none)."""
+
+    def _proc_member(self, tar):
+        if self.type in _HEADER_TYPES:
+            tar.wheelgap_header_bytes = getattr(tar, "wheelgap_header_bytes", 0) + self.size
+            if self.size > SDIST_MAX_HEADER or tar.wheelgap_header_bytes > SDIST_MAX_HEADERS:
+                raise SdistRefused("header too big")
+        if self.type == tarfile.GNUTYPE_SPARSE:
+            raise SdistRefused("sparse file")
+        return super()._proc_member(tar)  # type: ignore[misc]
+
+    def _proc_gnusparse_00(self, *args):  # pax sparse formats
+        raise SdistRefused("sparse file")
+
+    _proc_gnusparse_01 = _proc_gnusparse_10 = _proc_gnusparse_00
+
+
+def _escapes(member: tarfile.TarInfo, parts: list[str], top: str) -> bool:
+    """Whether a link points outside the unpacked sdist, which pip refuses (tarfile's data filter)."""
+    if member.issym():
+        if member.linkname.startswith("/"):
+            return True
+        target = posixpath.normpath(posixpath.join(posixpath.dirname("/".join(parts)) or ".", member.linkname))
+    else:  # a hard link names an archive member; pip strips the top folder from it as from names
+        lead, _, rest = member.linkname.lstrip("/").partition("/")
+        if lead != top:  # (one to the top folder itself names no earlier file: see _root_pyproject)
+            return True
+        target = posixpath.normpath(rest)
+    return target == ".." or target.startswith("../")
+
+
+def _windows_alias(part: str) -> bool:
+    """A name Windows may read as another: a trailing dot or space is dropped, and `:` opens a stream. That covers
+    `..` too, whose target pip may not even unpack into. (`~`, of short 8.3 names, is checked in _root_pyproject.)"""
+    return part.endswith((".", " ")) or ":" in part
+
+
+SDIST_MAX_NAMES = 16 * 1024 * 1024  # bytes of member names kept, to check hard links against
+
+
+def _root_pyproject(stream: _Limited) -> bytes | None:
+    """The pyproject.toml pip finds at the root of the unpacked sdist, read from an uncompressed tar stream, or None.
+
+    pip's untar_file (pip 26.3) strips the one folder every member shares, and the last member for a path wins.
+    Wherever pip could end up with another file than this one, or would fail, this raises SdistRefused:
+    - more than one top folder, a file in place of the top folder, or a member under pyproject.toml/;
+    - a name with a backslash, or one Windows reads as another, `..` included (see _windows_alias);
+    - a short (8.3) name that could be pyproject.toml's (`PYPROJ~1.TOM`), or a `~` anywhere in an sdist with links;
+    - a non-ASCII name right in the top folder: HFS+ ignores some code points (U+200C to U+200F and others), so
+      `pyproject.toml` with one of them added is pyproject.toml there;
+    - a link out of the sdist, a hard link to anything but an earlier file named exactly so, a member written
+      through a link, a device, or a member type pip doesn't know;
+    - links together with non-ASCII names: macOS folds case and Unicode forms in ways a comparison here can't follow
+      (ASCII lower-casing is exact, and no non-ASCII name folds to pyproject.toml);
+    - a pyproject.toml that isn't one plain file named exactly `<top>/pyproject.toml`, with one content.
+    The whole tar is read, but only that file is kept, and the names of earlier files (for hard links).
+    """
+    top: str | None = None
+    links: set[str] = set()  # lower-cased paths of links seen so far
+    files: set[str] = set()  # names of the files so far, as written, for hard links (tarfile looks them up)
+    kept = 0
+    has_link = non_ascii = tilde = False
+    found: bytes | None = None
+    with tarfile.open(fileobj=stream, mode="r|", tarinfo=_TarInfo, encoding="utf-8") as tar:  # type: ignore[call-overload]
+        while (member := tar.next()) is not None:
+            tar.members.clear()  # stream mode keeps every header otherwise
+            if member.type not in _MEMBER_TYPES:
+                raise SdistRefused("a member type pip doesn't know")
+            if "\\" in member.name or "\\" in member.linkname:  # a separator on Windows only
+                raise SdistRefused("backslash in a name")
+            non_ascii = non_ascii or not (member.name + member.linkname).isascii()
+            tilde = tilde or "~" in member.name + member.linkname
+            name = member.name.lstrip("/")
+            lead, _, rest = name.partition("/")
+            if not lead or top not in (None, lead):
+                raise SdistRefused("not one top folder")
+            top = lead
+            parts = [p for p in rest.split("/") if p not in ("", ".")]
+            if any(_windows_alias(p) for p in (lead, *parts)):
+                raise SdistRefused("a name Windows reads as another")
+            if len(parts) == 1 and "~" in parts[0] and parts[0].lower().endswith(".tom"):
+                raise SdistRefused("a short name Windows may read as pyproject.toml")
+            if len(parts) == 1 and not parts[0].isascii():
+                raise SdistRefused("a non-ASCII name next to pyproject.toml")
+            if not parts and not member.isdir():
+                raise SdistRefused("a file in place of the top folder")
+            lowered = [p.lower() for p in parts]
+            if "pyproject.toml" in lowered[:-1]:
+                raise SdistRefused("a member under pyproject.toml")
+            path = "/".join(lowered)
+            if any("/".join(lowered[:i]) in links for i in range(1, len(parts) + 1)):
+                raise SdistRefused("a member written through a link")
+            if member.issym() or member.islnk():
+                if _escapes(member, parts, lead):
+                    raise SdistRefused("a link out of the sdist")
+                if member.islnk() and member.linkname.lstrip("/") not in files:
+                    raise SdistRefused("a hard link to no earlier file of that name")
+                has_link = True
+                links.add(path)
+            elif member.isdev():
+                raise SdistRefused("a device")
+            elif member.isreg() and name not in files:
+                kept += len(name)
+                if kept > SDIST_MAX_NAMES:
+                    raise SdistRefused("too many members")
+                files.add(name)
+            if has_link and (non_ascii or tilde):
+                raise SdistRefused("links with non-ASCII names or a `~`")
+            if path != "pyproject.toml":
+                continue
+            if member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE) or rest != "pyproject.toml":
+                raise SdistRefused("pyproject.toml isn't a plain file named so")
+            if member.size > PYPROJECT_MAX_BYTES:
+                raise SdistRefused("pyproject.toml too big")
+            f = tar.extractfile(member)
+            data = f.read() if f else b""
+            if found is not None and data != found:
+                raise SdistRefused("two different pyproject.toml")
+            found = data
+    return found
+
+
+def fetch_sdist_pyproject(
+    url: str, sha256: str | None = None, deadline: float | None = None, timeout: float = 10.0
+) -> tuple[dict | None, bool]:
+    """(the parsed pyproject.toml at the root of the .tar.gz sdist at `url`, as pip reads it, or None if it has none;
+    whether the download matched `sha256`, so the answer can be cached).
+
+    The whole sdist is streamed in memory, never to disk, and hashed to the end before any answer counts. Raises
+    SdistRefused for no answer (see _root_pyproject, and the SDIST_MAX_* caps), SdistHashMismatch,
+    DeadlineExceeded past `deadline`, or the network error. One attempt only, with no retries, and https only, with
+    fetch_json's redirect rules. .zip sdists aren't read (ValueError).
+    """
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not parts.path.endswith(".tar.gz"):
+        raise ValueError("only https:// .tar.gz sdists are read")
+    req = urllib.request.Request(url, headers={"User-Agent": f"wheelgap/{__version__}"})
+    if deadline is not None:
+        timeout = max(0.1, min(timeout, deadline - _clock()))
+
+    def read(resp) -> tuple[bytes | None, bool]:
+        headers = getattr(resp, "headers", None)
+        declared = headers.get("Content-Length", "") if headers is not None else ""
+        if declared.isdigit() and int(declared) > SDIST_MAX_BYTES:
+            # The server says so: no need to download it. Kept (cached) only for a download with a sha256 to check.
+            raise SdistRefused("too big", verified=sha256 is not None)
+        digest = hashlib.sha256()
+        packed = _Limited(resp, SDIST_MAX_BYTES, deadline, digest)
+        refused: SdistRefused | None = None
+        found = None
+        try:
+            with gzip.GzipFile(fileobj=packed, mode="rb") as unpacked:  # type: ignore[call-overload]
+                found = _root_pyproject(_Limited(unpacked, SDIST_MAX_UNPACKED, deadline))
+        except SdistRefused as e:
+            refused = e
+        except (tarfile.TarError, gzip.BadGzipFile, zlib.error) as e:
+            refused = SdistRefused(f"not a .tar.gz ({type(e).__name__})")
+        except (RecursionError, MemoryError) as e:  # headers nested too deep, or too much of them
+            refused = SdistRefused(type(e).__name__)
+        if sha256 is None:  # nothing to check the bytes against: an answer, but not one to keep
+            if refused is not None:
+                raise refused
+            return found, False
+        while packed.read(1 << 16):  # the rest of the file, for the hash (SdistRefused past the cap: unverified)
+            pass
+        if digest.hexdigest() != sha256.lower():
+            raise SdistHashMismatch
+        if refused is not None:
+            refused.verified = True
+            raise refused
+        return found, True
+
+    with _deadline_watch(deadline):
+        raw, verified = _request(req, timeout, 1, read)
+    if raw is None:
+        return None, verified
+    try:  # as pip reads it: UTF-8 text with universal newlines
+        return tomllib.loads(raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")), verified
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        raise SdistRefused(f"invalid pyproject.toml ({type(e).__name__})", verified) from None
 
 
 SIMPLE_JSON = "application/vnd.pypi.simple.v1+json"

@@ -105,12 +105,14 @@ These select which dependencies of a `uv.lock`, Poetry 2.x `poetry.lock`, `pdm.l
 
 ### `--extra` {#extra}
 
-`--extra NAME`: include a uv project extra, or a `pyproject.toml` `[project.optional-dependencies]` group.
-Repeatable. Not supported for `poetry.lock` or `pdm.lock`.
+`--extra NAME`: include a uv project extra, or a `pyproject.toml` `[project.optional-dependencies]` group, and after
+0.9.0 a Poetry 2.x `poetry.lock` extra (like `poetry install --extras NAME`). Repeatable. Not supported for
+`pdm.lock`.
 
 ### `--all-extras` {#all-extras}
 
-Include every uv project extra (or every `pyproject.toml` extra).
+Include every uv project extra (or every `pyproject.toml` extra, and after 0.9.0 every Poetry 2.x `poetry.lock`
+extra).
 
 ### `--group` {#group}
 
@@ -186,7 +188,23 @@ After 0.9.0, a wheel that would fit but whose release was yanked is named with t
 the same version that fits a gap's target. Only glibc Linux, macOS and Windows targets with a current conda-forge
 Python can match, and it never changes a status, the summary or the exit code. Only names known to be on PyPI are sent
 to anaconda.org; a run with `--index-url` or `WHEELGAP_INDEX_URL` looks nothing up, and `--offline` refuses the flag.
-See [conda-forge hint](output.md#conda-forge).
+See [conda-forge hint](output.md#conda-forge) and [the PyPI-origin rule](how-it-works.md#pypi-origin).
+
+### `--notes`, `--no-notes` {#notes}
+
+**After 0.9.0.** With `--explain`, also show the [coverage tracker](https://wheelgap.github.io/tracker/)'s notes for a
+package with a gap, such as a binary package to use instead. It sends the names of packages with gaps to
+wheelgap.github.io, so it's opt-in, and only for names that pass [the PyPI-origin rule](how-it-works.md#pypi-origin);
+never with `--offline`, `--index-url` or a `WHEELGAP_INDEX_URL` mirror. `notes = true` in `[tool.wheelgap]` turns it
+on by default, and `--no-notes` turns it off for one run. See [Tracker notes](output.md#notes).
+
+### `--build-info` {#build-info}
+
+**After 0.9.0.** With `--explain`, also say what each `source` build needs (`build needs: at least a Rust toolchain
+(maturin<2.0,>=1.9)`), from the `[build-system]` table of the sdist's `pyproject.toml`. It downloads sdists, so it's
+opt-in, and only for packages that pass [the PyPI-origin rule](how-it-works.md#pypi-origin); it's off with `--offline`,
+`--index-url`, `WHEELGAP_INDEX_URL` or a pip or uv index setting in the environment. `build-info = true` in
+`[tool.wheelgap]` turns it on by default. See [Build requirements](output.md#build-info).
 
 ### `-q`, `--quiet`, `--no-quiet` {#quiet}
 
@@ -250,6 +268,16 @@ Exit 0 even when gaps are found, for informational runs. Bad input still exits 2
 
 List the platforms, their aliases and compatibility limits (and the `--distro` names), then exit. With `--json`, print
 the platforms as JSON. Can't be combined with `--markdown`.
+
+### `--suggest-targets` {#suggest-targets}
+
+**After 0.9.0.** `--suggest-targets [DIR]`: read the platforms and Pythons that `DIR` (default: the current directory)
+already names in its GitHub Actions workflows and Dockerfiles, print each with the file and line it came from, then a
+`[tool.wheelgap]` snippet to paste into `pyproject.toml`. It only suggests: nothing is changed or checked, and it exits
+0. With `--json`, it prints the same as an object. It can't be combined with `-p`, `-t`, `--dockerfile`,
+`--list-targets`, `--markdown` or input files, and a `DIR` that isn't a folder exits 2. What it can't read for sure is
+listed with its file and line rather than guessed. See
+[Suggest targets from your CI and Dockerfiles](targets.md#suggest-targets).
 
 ### `-V`, `--version` {#version}
 
