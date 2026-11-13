@@ -62,13 +62,44 @@ def test_uv_lock_dependency_group_names(tmp_path):
         ('{ name = "b", marker = 5 }', "package a has a dependency 'b' with a `marker` that isn't a string"),
         ('{ name = "b", version = ["1.0"] }', "package a has a dependency 'b' with a `version` that isn't a string"),
         ('{ name = { x = "b" } }', "package a has a dependency with a `name` that isn't a string"),
-        ('{ name = "b", extra = 3 }', "package a has a dependency 'b' with an `extra` that isn't a string"),
+        ('{ name = "b", extra = 3 }', "package a has a dependency 'b' with an `extra` that isn't a list of strings"),
+        # uv writes a list here; a string would be read as its characters, and the extra's packages left out
+        ('{ name = "b", extra = "s3" }', "package a has a dependency 'b' with an `extra` that isn't a list of strings"),
     ],
 )
 def test_uv_lock_dependency_edge_of_the_wrong_type_raises(tmp_path, edge, message):
     # Used to reach packaging as a TypeError, far from the file. A list of extras is a format uv writes.
     (tmp_path / "uv.lock").write_text(
         f'version = 1\n\n[[package]]\nname = "a"\nversion = "1.0"\ndependencies = [{edge}]\n', encoding="utf-8"
+    )
+    with pytest.raises(SourceError, match=re.escape(message)):
+        load_inputs([str(tmp_path)])
+
+
+@pytest.mark.parametrize(
+    "tables, message",
+    [
+        (
+            '[package.optional-dependencies]\ns3 = [{ name = "b", marker = 5 }]\n',
+            "package a has a dependency 'b' with a `marker` that isn't a string",
+        ),
+        (
+            '[package.dev-dependencies]\ndev = [{ name = "b", version = 1 }]\n',
+            "package a has a dependency 'b' with a `version` that isn't a string",
+        ),
+        (
+            '\n[manifest]\nrequirements = [{ name = "b", marker = 5 }]\n',
+            "the manifest has a dependency 'b' with a `marker` that isn't a string",
+        ),
+        (
+            "\n[manifest.dependency-groups]\ndev = [{ name = 5 }]\n",
+            "the manifest has a dependency with a `name` that isn't a string",
+        ),
+    ],
+)
+def test_uv_lock_edge_of_the_wrong_type_in_a_group_or_the_manifest_raises(tmp_path, tables, message):
+    (tmp_path / "uv.lock").write_text(
+        f'version = 1\n\n[[package]]\nname = "a"\nversion = "1.0"\n{tables}', encoding="utf-8"
     )
     with pytest.raises(SourceError, match=re.escape(message)):
         load_inputs([str(tmp_path)])

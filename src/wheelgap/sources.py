@@ -221,43 +221,45 @@ def _sdist_source(entry: object, hash_key: str) -> tuple[str | None, str | None]
     return (url if isinstance(url, str) else None), (digest.lower() if digest else None)
 
 
+def _uv_edge(path: Path, owner: str, d: object) -> Edge:
+    """One uv.lock dependency edge. A field of the wrong type (`marker = 5`) crashes later, inside `packaging`, so
+    it's a SourceError here, next to the file. `owner` says whose edge it is: "package a" or "the manifest"."""
+    if not isinstance(d, dict):
+        raise SourceError(f"{path.name}: {owner} has a dependency that isn't a table")
+    if "name" not in d:
+        raise SourceError(f"{path.name}: {owner} has a dependency without a `name`")
+    if not isinstance(d["name"], str):
+        raise SourceError(f"{path.name}: {owner} has a dependency with a `name` that isn't a string")
+    for what in ("version", "marker"):
+        value = d.get(what)
+        if value is not None and not isinstance(value, str):
+            raise SourceError(
+                f"{path.name}: {owner} has a dependency {d['name']!r} with a `{what}` that isn't a string"
+            )
+    # uv writes the extras an edge asks for as a list. A plain string would be read as its characters.
+    for what in ("extra", "extras"):
+        extra = d.get(what)
+        if extra is not None and not (isinstance(extra, list) and all(isinstance(e, str) for e in extra)):
+            raise SourceError(
+                f"{path.name}: {owner} has a dependency {d['name']!r} with an `{what}` that isn't a list of strings"
+            )
+    return (d["name"], d.get("version"), d.get("marker"))
+
+
 def _uv_edges(path: Path, p: dict) -> list[Edge]:
-    """A uv.lock package's dependency edges, from `dependencies` and the two tables of groups. A field of the wrong
-    type (`marker = 5`) crashes later, inside `packaging`, so it's a SourceError here, next to the file."""
-    package = p.get("name")
+    """A uv.lock package's dependency edges, from `dependencies` and the two tables of groups."""
+    owner = f"package {p.get('name')}"
     groups: list[object] = [p.get("dependencies", [])]
     for table in ("optional-dependencies", "dev-dependencies"):
         value = p.get(table, {})
         if not isinstance(value, dict):
-            raise SourceError(f"{path.name}: package {package} has a `{table}` that isn't a table of groups")
+            raise SourceError(f"{path.name}: {owner} has a `{table}` that isn't a table of groups")
         groups.extend(value.values())
     out: list[Edge] = []
     for group in groups:
         if not isinstance(group, list):
-            raise SourceError(f"{path.name}: package {package} has a group of dependencies that isn't a list")
-        for d in group:
-            if not isinstance(d, dict):
-                raise SourceError(f"{path.name}: package {package} has a dependency that isn't a table")
-            if "name" not in d:
-                raise SourceError(f"{path.name}: package {package} has a dependency without a `name`")
-            if not isinstance(d["name"], str):
-                raise SourceError(f"{path.name}: package {package} has a dependency with a `name` that isn't a string")
-            for what in ("version", "marker"):
-                value = d.get(what)
-                if value is not None and not isinstance(value, str):
-                    raise SourceError(
-                        f"{path.name}: package {package} has a dependency {d['name']!r} with a `{what}` "
-                        "that isn't a string"
-                    )
-            extra = d.get("extra")
-            if extra is not None and not (
-                isinstance(extra, str) or (isinstance(extra, list) and all(isinstance(e, str) for e in extra))
-            ):
-                raise SourceError(
-                    f"{path.name}: package {package} has a dependency {d['name']!r} with an `extra` "
-                    "that isn't a string or a list of strings"
-                )
-            out.append((d["name"], d.get("version"), d.get("marker")))
+            raise SourceError(f"{path.name}: {owner} has a group of dependencies that isn't a list")
+        out.extend(_uv_edge(path, owner, d) for d in group)
     return out
 
 
@@ -291,8 +293,10 @@ def parse_uv_lock(path: Path) -> Source:
     for name, group in manifest.get("dependency-groups", {}).items():
         for d in group:
             source.root_groups[len(source.root_edges)] = name
-            source.root_edges.append((d["name"], None, d.get("marker")))
-    source.root_edges.extend((d["name"], None, d.get("marker")) for d in manifest.get("requirements", []))
+            source.root_edges.append((_uv_edge(path, "the manifest", d)[0], None, d.get("marker")))
+    source.root_edges.extend(
+        (_uv_edge(path, "the manifest", d)[0], None, d.get("marker")) for d in manifest.get("requirements", [])
+    )
     if not source.roots and not source.root_edges:
         source.edges = None  # no idea where the graph starts; treat every package as needed
     if isinstance(data.get("requires-python"), str):
