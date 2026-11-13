@@ -242,11 +242,11 @@ def _uv_edges(path: Path, p: dict) -> list[Edge]:
                 raise SourceError(f"{path.name}: package {package} has a dependency without a `name`")
             if not isinstance(d["name"], str):
                 raise SourceError(f"{path.name}: package {package} has a dependency with a `name` that isn't a string")
-            for field in ("version", "marker"):
-                value = d.get(field)
+            for what in ("version", "marker"):
+                value = d.get(what)
                 if value is not None and not isinstance(value, str):
                     raise SourceError(
-                        f"{path.name}: package {package} has a dependency {d['name']!r} with a `{field}` "
+                        f"{path.name}: package {package} has a dependency {d['name']!r} with a `{what}` "
                         "that isn't a string"
                     )
             extra = d.get("extra")
