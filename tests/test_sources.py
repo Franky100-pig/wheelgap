@@ -511,6 +511,17 @@ def test_uv_path_dependency_is_not_a_root(tmp_path):
     assert rows["pywin32"].results == {lin: Status.NOT_NEEDED, win: Status.WHEEL}
 
 
+@pytest.mark.parametrize("markers", ["[\"sys_platform == 'win32'\"]", "[]", "1", "true", "{ main = 1 }"])
+def test_poetry_rejects_wrong_typed_markers(tmp_path, markers):
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "colorama"\nversion = "0.4.6"\ngroups = ["main", "dev"]\n'
+        f'markers = {markers}\nfiles = []\n\n[metadata]\nlock-version = "2.1"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match=r"poetry\.lock.*colorama.*markers"):
+        load_inputs([str(tmp_path)])
+
+
 def test_poetry_dict_markers_with_an_unconditional_group(tmp_path):
     (tmp_path / "poetry.lock").write_text(
         '[[package]]\nname = "colorama"\nversion = "0.4.6"\ngroups = ["main", "dev"]\n'

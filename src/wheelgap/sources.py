@@ -655,6 +655,12 @@ def parse_poetry_lock(path: Path) -> Source:
     for p in data.get("package", []):
         pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name)
         markers = p.get("markers")
+        if markers is not None and not (
+            isinstance(markers, str)
+            or isinstance(markers, dict)
+            and all(isinstance(marker, str) for marker in markers.values())
+        ):
+            raise SourceError(f"{path.name}: {pkg.name}: markers must be a string or a table of strings")
         if isinstance(markers, str):
             pkg.markers = [markers]
         elif isinstance(markers, dict):
