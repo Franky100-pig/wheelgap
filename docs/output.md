@@ -151,7 +151,8 @@ rpds-py 0.27.0 on musl-armv7l: ● source
   (from `poetry-core`, without a `build` script). Without a `build-backend`, pip uses setuptools, which can compile
   anything; an in-tree backend (`backend-path`) is named as such.
 - With `--json --explain --build-info`, each package gets `build_requires`: the same requirements, normalized
-  (`["maturin<2.0,>=1.9"]`), or `null`.
+  (`["maturin<2.0,>=1.9"]`), or `null` when there's no source build or no answer. When build info is off for the
+  whole run (see below), the key is left out.
 - **It's off by default because it downloads:** lockfiles are otherwise read without contacting the network. Only
   packages that pass [the PyPI-origin rule](how-it-works.md#pypi-origin) are read, `--online` included, so other names
   don't reach pypi.org. Nothing is read in a run with `--index-url`, `WHEELGAP_INDEX_URL` or a `PIP_*`/`UV_*` index

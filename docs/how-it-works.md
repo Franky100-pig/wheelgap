@@ -122,8 +122,9 @@ Each flag then adds its own limits:
 - **`--notes`** takes the recorded-index route only from `uv.lock` and `pylock.toml`, and is off with `--offline`
   (or `offline = true`).
 - **`--build-info`** is off for the whole run when an environment variable above is set, as well as with
-  `--offline`. It downloads the sdist from the URL in the lock when that's on `files.pythonhosted.org` and names that
-  release's sdist, checked against the lock's sha256, and otherwise asks PyPI's JSON API for it.
+  `--offline`. When the lock records an sdist URL (`uv.lock`, `pylock.toml`), it downloads from that URL only if it's
+  on `files.pythonhosted.org` and names that release's sdist, checked against the lock's sha256; otherwise there's no
+  answer. When the lock records no URL, it asks PyPI's JSON API for it.
 
 ## Scanning the top PyPI packages
 

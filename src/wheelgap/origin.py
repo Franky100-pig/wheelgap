@@ -62,12 +62,13 @@ def known_pypi(
 
     - the run looks packages up on pypi.org: no --index-url (`simple_index`) and no WHEELGAP_INDEX_URL mirror;
     - the package comes from an index (not git, a path, a URL, or a skipped private index);
-    - either its lock says it came from PyPI (uv.lock's registry, pylock.toml's index is https://pypi.org/simple),
-      or this run found it on pypi.org (Package.found_on_pypi) and neither its input (Source.pypi_only) nor the
-      environment (index_env) names another index.
+    - either its lock says it came from PyPI (uv.lock's registry, pylock.toml's index, a poetry.lock legacy source
+      or a pixi.lock index is exactly https://pypi.org/simple), or this run found it on pypi.org
+      (Package.found_on_pypi) and neither its input (Source.pypi_only) nor the environment (index_env) names another
+      index.
 
-    So never a pdm.lock or poetry.lock entry, a pylock.toml entry with no index, a requirements file with an
-    --index-url line, or anything else wheelgap can't place."""
+    So never a pdm.lock entry, a poetry.lock or pixi.lock entry that records no index, a pylock.toml entry with no
+    index, a requirements file with an --index-url line, or anything else wheelgap can't place."""
     if other_index(simple_index, env) is not None or pkg.skip:
         return False
     if isinstance(pkg.registry, str) and pkg.registry.rstrip("/") == pypi.PYPI_SIMPLE:

@@ -243,14 +243,16 @@ The snippet combines every job in every workflow, including lint, release and bo
 - **Runner versions.** A pinned label also names its glibc (`ubuntu-22.04` has 2.35, `ubuntu-24.04` 2.39) or its macOS
   version (`macos-14` is 14.0). A `-latest` label moves, so it names neither. `ubuntu-26.04` names none yet: GitHub's
   runner-images readme doesn't give its glibc.
-- **Dockerfiles.** Every `Dockerfile`, `Containerfile`, `Dockerfile.*` (also `dockerfile.dev`) and `*.Dockerfile` is
-  read, except in hidden folders, virtual environments, `node_modules`, and `tests`, `test`, `fixtures`, `examples`,
-  `example`, `docs`, `build`, `dist` and `target` folders. The final stage's image is read exactly as `--dockerfile`
+- **Dockerfiles.** Every `Dockerfile` and `Containerfile`, `Dockerfile.x`, `Dockerfile-x`, `Dockerfile_x` (also
+  `dockerfile.dev`), the same for `Containerfile`, and `*.Dockerfile` and `*.Containerfile` is read (names are matched
+  without regard to case, and ones ending in `.md`, `.py`, `.yml` and the like aren't Dockerfiles). Hidden folders,
+  virtual environments, `node_modules`, `__pycache__` and `site-packages`, and `tests`, `test`, `fixtures`, `examples`,
+  `example`, `docs`, `build`, `dist` and `target` folders are skipped. The final stage's image is read exactly as `--dockerfile`
   reads it, for the target, the Python and the glibc or musl version. Without `--platform` it's read as `linux/amd64`,
   and the output says so.
 
-The snippet sets `glibc`, `musl` or `macos` only when every source of those targets names the same version. Otherwise a
-`#` line says why it's left out. It also leaves out `python` when no Python was found. `--json` prints the same as an
+The snippet sets `glibc`, `musl` or `macos` only when every source of those targets names the same version. When
+sources name different versions, or only some name one, a `#` line says why it's left out. It also leaves out `python` when no Python was found. `--json` prints the same as an
 object with `targets`, `python` (each with `file`, `line` and `from`), `unreadable` and `config`.
 
 There's no YAML parser in the standard library, so a workflow is read only when every line is in a small subset of YAML
@@ -267,9 +269,10 @@ with the first line that isn't. The subset is:
     - a block scalar header (`|`, `>-`...);
     - a flow list over several lines, as Prettier writes it, with `[` ending its line (or alone on the next), one item
       per line, and `]` on its own line.
-- **Accepted but never read.** Anchors and aliases (`&paths`, `*paths`), double-quoted values with escapes, and plain
-  values continued on more-indented lines (long `if:` and `run:` lines) are accepted where they aren't needed, and
-  refused where wheelgap would read them.
+- **Anchors.** An anchor on a block (`with: &w`) is accepted and read as usual.
+- **Accepted but never read.** Aliases (`*w`), double-quoted values with escapes, and plain values continued on
+  more-indented lines (long `if:` and `run:` lines) are accepted where they aren't needed, and refused where wheelgap
+  would read them.
 
 Everything else isn't read: multi-line quoted values, anchors or tags inside a value, an alias with no anchor before it,
 a key or anchor used twice, lines indented under a value (including `key: {...}`), `? ` keys, `<<` merge keys, a second
@@ -288,7 +291,6 @@ and never guessed:
 - a job that runs in a `container:`;
 - an unquoted `3.10` (YAML reads it as the number 3.1) or `0x10`;
 - `python-version-file`;
-- a job id used twice;
 - Dockerfile templates (`Dockerfile.j2`, `Dockerfile.template`), files or folders it can't open, and Dockerfiles
   `--dockerfile` would reject.
 

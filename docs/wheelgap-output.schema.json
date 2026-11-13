@@ -151,11 +151,11 @@
                 "build_requires": {
                     "type": ["array", "null"],
                     "items": {"type": "string"},
-                    "description": "Present with --explain --build-info: the [build-system] requires of the release's sdist, normalized (name, extras, version range) and limited to those whose marker holds on a target in rejected that is source; null when there is no source build or no answer (the sdist isn't positively from PyPI, couldn't be read, or pip could read another pyproject.toml from it)."
+                    "description": "Present in versions after 0.9.0 (0.9.0 and older don't write it), with --explain --build-info: the [build-system] requires of the release's sdist, normalized (name, extras, version range) and limited to those whose marker holds on a target in rejected that is source; null when there is no source build or no answer (the sdist isn't positively from PyPI, couldn't be read, or pip could read another pyproject.toml from it)."
                 },
                 "notes": {
                     "type": "array",
-                    "description": "Present with --explain: the coverage tracker's notes (https://github.com/wheelgap/tracker/blob/main/notes/README.md) that apply to this package's gaps, each with the gap targets it covers. Only looked up with --notes (or notes = true), for packages that are positively from PyPI, and never with --offline, --index-url or a WHEELGAP_INDEX_URL mirror. Empty without --notes, when there are none, or when the lookup failed. Treat text as untrusted plain text.",
+                    "description": "Present in versions after 0.9.0 (0.9.0 and older don't write it), with --explain: the coverage tracker's notes (https://github.com/wheelgap/tracker/blob/main/notes/README.md) that apply to this package's gaps, each with the gap targets it covers. Only looked up with --notes (or notes = true), for packages that are positively from PyPI, and never with --offline, --index-url or a WHEELGAP_INDEX_URL mirror. Empty without --notes, when there are none, or when the lookup failed. Treat text as untrusted plain text.",
                     "items": {
                         "type": "object",
                         "additionalProperties": false,

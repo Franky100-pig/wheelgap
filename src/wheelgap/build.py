@@ -190,11 +190,12 @@ def _on_pypi_files(url: str) -> bool:
 def where(pkg: Package, source: Source, simple_index: str | None = None) -> tuple[Release, str | None] | None:
     """(release, sdist URL) for a release whose sdist wheelgap may read, or None.
 
-    The package must be positively PyPI's (origin.known_pypi, the rule --conda-forge follows too): never a pdm.lock or
-    poetry.lock entry, a pylock.toml entry without an index, a private index or a direct URL, whose names may be
-    private and whose PyPI namesakes are other packages; and nothing in a run with --index-url or WHEELGAP_INDEX_URL.
-    Then the URL is the lock's own (uv.lock, pylock.toml), if it's on PyPI's file host and names this release's sdist,
-    or None to ask PyPI's JSON API for it."""
+    The package must be positively PyPI's (origin.known_pypi, the rule --conda-forge follows too): never a pdm.lock
+    entry, a poetry.lock or pixi.lock entry that records no index, a pylock.toml entry without an index, a private
+    index or a direct URL, whose names may be private and whose PyPI namesakes are other packages; and nothing in a run
+    with --index-url or WHEELGAP_INDEX_URL. When the lock records an sdist URL (uv.lock, pylock.toml), that URL is used
+    only if it's on PyPI's file host and names this release's sdist (otherwise None: no answer); when it records none
+    (a poetry.lock or pixi.lock entry on pypi.org, say), the URL is None to ask PyPI's JSON API for it."""
     sdist = _sdist(pkg)
     if sdist is None or not pkg.version or not origin.known_pypi(pkg, source, simple_index=simple_index):
         return None

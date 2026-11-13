@@ -1,5 +1,5 @@
 # The documentation site: https://wheelgap.github.io/wheelgap/
-# Build it with `uv run --group docs mkdocs build --strict` (or `mkdocs serve` to preview).
+# Build it with `uv run --locked --group docs mkdocs build --strict` (or `mkdocs serve` to preview).
 # .github/workflows/docs.yml builds it on every pull request and deploys it from main.
 site_name: wheelgap
 site_description: Find the Python dependencies that have no prebuilt wheel for your target platform, before your Docker build does.
