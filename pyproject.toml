@@ -25,6 +25,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/wheelgap/wheelgap"
+Documentation = "https://wheelgap.github.io/wheelgap/"
 Issues = "https://github.com/wheelgap/wheelgap/issues"
 Changelog = "https://github.com/wheelgap/wheelgap/blob/main/CHANGELOG.md"
 
@@ -34,6 +35,7 @@ wheelgap-mcp = "wheelgap.mcp:main"
 
 [dependency-groups]
 dev = ["mypy>=1.13", "pytest>=8", "pyyaml>=6.0.2; sys_platform != 'win32' or platform_machine != 'ARM64' or python_full_version >= '3.12'", "ruff>=0.8"]
+docs = ["mkdocs-material>=9.7"]
 
 [build-system]
 requires = ["hatchling>=1.27"]
