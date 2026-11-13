@@ -65,6 +65,8 @@ def test_uv_lock_dependency_group_names(tmp_path):
         ('{ name = "b", extra = 3 }', "package a has a dependency 'b' with an `extra` that isn't a list of strings"),
         # uv writes a list here; a string would be read as its characters, and the extra's packages left out
         ('{ name = "b", extra = "s3" }', "package a has a dependency 'b' with an `extra` that isn't a list of strings"),
+        ('"b"', "package a has a dependency that isn't a table"),
+        ('{ marker = "x" }', "package a has a dependency without a `name`"),
     ],
 )
 def test_uv_lock_dependency_edge_of_the_wrong_type_raises(tmp_path, edge, message):
@@ -95,6 +97,20 @@ def test_uv_lock_dependency_edge_of_the_wrong_type_raises(tmp_path, edge, messag
             "\n[manifest.dependency-groups]\ndev = [{ name = 5 }]\n",
             "the manifest has a dependency with a `name` that isn't a string",
         ),
+        # the manifest writes `extras` where a package's edge writes `extra`
+        (
+            '\n[manifest]\nrequirements = [{ name = "b", extras = "s3" }]\n',
+            "the manifest has a dependency 'b' with an `extras` that isn't a list of strings",
+        ),
+        # the lists and tables that hold the edges
+        ("dependencies = 5\n", "package a has a group of dependencies that isn't a list"),
+        ("optional-dependencies = 5\n", "package a has a `optional-dependencies` that isn't a table of groups"),
+        ("\n[manifest]\nrequirements = 5\n", "the manifest has a `requirements` that isn't a list"),
+        ("\n[manifest.dependency-groups]\ndev = 5\n", "the manifest has a group of dependencies that isn't a list"),
+        (
+            "\n[manifest]\ndependency-groups = []\n",
+            "the manifest has a `dependency-groups` that isn't a table of groups",
+        ),
     ],
 )
 def test_uv_lock_edge_of_the_wrong_type_in_a_group_or_the_manifest_raises(tmp_path, tables, message):
@@ -102,6 +118,12 @@ def test_uv_lock_edge_of_the_wrong_type_in_a_group_or_the_manifest_raises(tmp_pa
         f'version = 1\n\n[[package]]\nname = "a"\nversion = "1.0"\n{tables}', encoding="utf-8"
     )
     with pytest.raises(SourceError, match=re.escape(message)):
+        load_inputs([str(tmp_path)])
+
+
+def test_uv_lock_manifest_that_is_not_a_table_raises(tmp_path):
+    (tmp_path / "uv.lock").write_text("version = 1\nmanifest = 5\n", encoding="utf-8")
+    with pytest.raises(SourceError, match=re.escape("uv.lock: `manifest` isn't a table")):
         load_inputs([str(tmp_path)])
 
 

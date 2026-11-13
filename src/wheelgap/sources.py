@@ -266,6 +266,16 @@ def _uv_edges(path: Path, p: dict) -> list[Edge]:
 def parse_uv_lock(path: Path) -> Source:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     manifest = data.get("manifest", {})
+    if not isinstance(manifest, dict):
+        raise SourceError(f"{path.name}: `manifest` isn't a table")
+    # The manifest's lists of edges are walked here and again for a selection, so their shapes are checked first.
+    manifest_groups = manifest.get("dependency-groups", {})
+    if not isinstance(manifest_groups, dict):
+        raise SourceError(f"{path.name}: the manifest has a `dependency-groups` that isn't a table of groups")
+    if not all(isinstance(group, list) for group in manifest_groups.values()):
+        raise SourceError(f"{path.name}: the manifest has a group of dependencies that isn't a list")
+    if not isinstance(manifest.get("requirements", []), list):
+        raise SourceError(f"{path.name}: the manifest has a `requirements` that isn't a list")
     members = {canonicalize_name(m) for m in manifest.get("members", [])}
     edges: dict[int, list[Edge]] = {}
     source = Source(path.name, edges=edges, uv_packages=data.get("package", []), uv_manifest=manifest)
@@ -290,7 +300,7 @@ def parse_uv_lock(path: Path) -> Source:
         # (directory = "libs/x") is reached through its dependents' edges and their markers instead.
         if (kind in ("editable", "virtual") and src.get(kind) == ".") or pkg.key in members:
             source.roots.append(i)
-    for name, group in manifest.get("dependency-groups", {}).items():
+    for name, group in manifest_groups.items():
         for d in group:
             source.root_groups[len(source.root_edges)] = name
             source.root_edges.append((_uv_edge(path, "the manifest", d)[0], None, d.get("marker")))
