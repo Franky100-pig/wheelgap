@@ -613,6 +613,25 @@ def _poetry_edges(p: dict) -> list[Edge]:
     return out
 
 
+def _poetry_package_markers(path: Path, p: dict, name: str) -> list[str] | None:
+    """A Poetry 2.x package's markers, or None for "installed everywhere". A `markers` Poetry doesn't write (a list,
+    a number, a table of non-strings) is an error: reading it as "no marker" would put the package on every target."""
+    markers = p.get("markers")
+    if markers is None:
+        return None
+    if isinstance(markers, str):
+        return [markers]
+    if not isinstance(markers, dict):
+        raise SourceError(f"{path.name}: package {name} has a `markers` that isn't a string or a table of strings")
+    for group, marker in markers.items():
+        if not isinstance(marker, str):
+            raise SourceError(f"{path.name}: package {name} has a `markers.{group}` that isn't a string")
+    # Poetry leaves a group out of the dict when the package is always installed for it.
+    if any(g not in markers for g in p.get("groups", [])):
+        return None
+    return list(markers.values()) or None
+
+
 def parse_poetry_lock(path: Path) -> Source:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     metadata = data.get("metadata", {})
@@ -621,13 +640,7 @@ def parse_poetry_lock(path: Path) -> Source:
     edges: dict[int, list[Edge]] = {}
     for p in data.get("package", []):
         pkg = Package(package_name(path, p.get("name")), p.get("version"), origin=path.name)
-        markers = p.get("markers")
-        if isinstance(markers, str):
-            pkg.markers = [markers]
-        elif isinstance(markers, dict):
-            # Poetry leaves a group out of the dict when the package is always installed for it.
-            always = any(g not in markers for g in p.get("groups", []))
-            pkg.markers = None if always else ([m for m in markers.values() if isinstance(m, str)] or None)
+        pkg.markers = _poetry_package_markers(path, p, pkg.name)
         src_type = p.get("source", {}).get("type")
         if src_type in ("git", "hg", "svn", "bzr", "directory", "file", "url"):
             pkg.skip = src_type

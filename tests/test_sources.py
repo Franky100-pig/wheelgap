@@ -492,6 +492,37 @@ def test_poetry_dict_markers_with_an_unconditional_group(tmp_path):
     assert src.packages[0].markers is None  # dev always installs it, so it's needed everywhere
 
 
+def test_poetry_markers_list_is_an_error(tmp_path):
+    # Poetry writes a string or a table; a list used to be read as "no marker", i.e. installed on every target.
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "colorama"\nversion = "0.4.6"\ngroups = ["main"]\n'
+        'markers = ["sys_platform == \\"win32\\""]\nfiles = []\n\n[metadata]\nlock-version = "2.1"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match="package colorama has a `markers` that isn't a string"):
+        load_inputs([str(tmp_path)])
+
+
+def test_poetry_markers_number_is_an_error(tmp_path):
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "colorama"\nversion = "0.4.6"\ngroups = ["main"]\nmarkers = 5\nfiles = []\n\n'
+        '[metadata]\nlock-version = "2.1"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match="package colorama has a `markers` that isn't a string"):
+        load_inputs([str(tmp_path)])
+
+
+def test_poetry_markers_table_of_non_strings_is_an_error(tmp_path):
+    (tmp_path / "poetry.lock").write_text(
+        '[[package]]\nname = "colorama"\nversion = "0.4.6"\ngroups = ["main"]\nmarkers = { main = 5 }\n'
+        'files = []\n\n[metadata]\nlock-version = "2.1"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match="package colorama has a `markers.main` that isn't a string"):
+        load_inputs([str(tmp_path)])
+
+
 def test_poetry_1x_lock_walks_dependency_markers(tmp_path):
     # Before lock-version 2.1, markers only sit on dependency edges.
     (tmp_path / "poetry.lock").write_text(
