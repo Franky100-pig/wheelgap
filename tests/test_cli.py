@@ -356,6 +356,16 @@ def test_quiet_preserves_json_and_exit_status(capsys, fixtures):
     assert run(capsys, *args, "--quiet") == run(capsys, *args)
 
 
+def test_uv_lock_dependency_edge_of_the_wrong_type_exits_2(capsys, tmp_path):
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\n\n[[package]]\nname = "a"\nversion = "1.0"\ndependencies = [{ name = "b", marker = 5 }]\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 2 and not out
+    assert "package a has a dependency 'b' with a `marker` that isn't a string" in err
+
+
 def test_quiet_preserves_list_targets_output(capsys):
     assert run(capsys, "--list-targets", "--quiet") == run(capsys, "--list-targets")
 

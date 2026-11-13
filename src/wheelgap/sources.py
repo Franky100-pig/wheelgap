@@ -221,11 +221,44 @@ def _sdist_source(entry: object, hash_key: str) -> tuple[str | None, str | None]
     return (url if isinstance(url, str) else None), (digest.lower() if digest else None)
 
 
-def _uv_edges(p: dict) -> list[Edge]:
-    groups = [p.get("dependencies", [])]
+def _uv_edges(path: Path, p: dict) -> list[Edge]:
+    """A uv.lock package's dependency edges, from `dependencies` and the two tables of groups. A field of the wrong
+    type (`marker = 5`) crashes later, inside `packaging`, so it's a SourceError here, next to the file."""
+    package = p.get("name")
+    groups: list[object] = [p.get("dependencies", [])]
     for table in ("optional-dependencies", "dev-dependencies"):
-        groups.extend(p.get(table, {}).values())
-    return [(d["name"], d.get("version"), d.get("marker")) for g in groups for d in g]
+        value = p.get(table, {})
+        if not isinstance(value, dict):
+            raise SourceError(f"{path.name}: package {package} has a `{table}` that isn't a table of groups")
+        groups.extend(value.values())
+    out: list[Edge] = []
+    for group in groups:
+        if not isinstance(group, list):
+            raise SourceError(f"{path.name}: package {package} has a group of dependencies that isn't a list")
+        for d in group:
+            if not isinstance(d, dict):
+                raise SourceError(f"{path.name}: package {package} has a dependency that isn't a table")
+            if "name" not in d:
+                raise SourceError(f"{path.name}: package {package} has a dependency without a `name`")
+            if not isinstance(d["name"], str):
+                raise SourceError(f"{path.name}: package {package} has a dependency with a `name` that isn't a string")
+            for field in ("version", "marker"):
+                value = d.get(field)
+                if value is not None and not isinstance(value, str):
+                    raise SourceError(
+                        f"{path.name}: package {package} has a dependency {d['name']!r} with a `{field}` "
+                        "that isn't a string"
+                    )
+            extra = d.get("extra")
+            if extra is not None and not (
+                isinstance(extra, str) or (isinstance(extra, list) and all(isinstance(e, str) for e in extra))
+            ):
+                raise SourceError(
+                    f"{path.name}: package {package} has a dependency {d['name']!r} with an `extra` "
+                    "that isn't a string or a list of strings"
+                )
+            out.append((d["name"], d.get("version"), d.get("marker")))
+    return out
 
 
 def parse_uv_lock(path: Path) -> Source:
@@ -250,7 +283,7 @@ def parse_uv_lock(path: Path) -> Source:
             pkg.files = files
         i = len(source.packages)
         source.packages.append(pkg)
-        edges[i] = _uv_edges(p)
+        edges[i] = _uv_edges(path, p)
         # Roots are the project itself (source "."), plus workspace members. A path dependency elsewhere
         # (directory = "libs/x") is reached through its dependents' edges and their markers instead.
         if (kind in ("editable", "virtual") and src.get(kind) == ".") or pkg.key in members:

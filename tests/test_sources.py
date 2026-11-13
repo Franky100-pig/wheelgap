@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -53,6 +54,34 @@ def test_uv_lock_dependency_group_names(tmp_path):
     (src,) = load_inputs([str(tmp_path)])
     assert [name for name, _, _ in src.root_edges] == ["pytest", "sphinx", "app"]
     assert src.root_groups == {0: "dev", 1: "docs"}  # the plain requirement has no group
+
+
+@pytest.mark.parametrize(
+    "edge, message",
+    [
+        ('{ name = "b", marker = 5 }', "package a has a dependency 'b' with a `marker` that isn't a string"),
+        ('{ name = "b", version = ["1.0"] }', "package a has a dependency 'b' with a `version` that isn't a string"),
+        ('{ name = { x = "b" } }', "package a has a dependency with a `name` that isn't a string"),
+        ('{ name = "b", extra = 3 }', "package a has a dependency 'b' with an `extra` that isn't a string"),
+    ],
+)
+def test_uv_lock_dependency_edge_of_the_wrong_type_raises(tmp_path, edge, message):
+    # Used to reach packaging as a TypeError, far from the file. A list of extras is a format uv writes.
+    (tmp_path / "uv.lock").write_text(
+        f'version = 1\n\n[[package]]\nname = "a"\nversion = "1.0"\ndependencies = [{edge}]\n', encoding="utf-8"
+    )
+    with pytest.raises(SourceError, match=re.escape(message)):
+        load_inputs([str(tmp_path)])
+
+
+def test_uv_lock_dependency_extra_may_be_a_list(tmp_path):
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\n\n[manifest]\nrequirements = [{ name = "a" }]\n\n[[package]]\nname = "a"\nversion = "1.0"\n'
+        'dependencies = [{ name = "b", extra = ["s3", "gcs"] }]\n',
+        encoding="utf-8",
+    )
+    (src,) = load_inputs([str(tmp_path)])
+    assert src.edges[0] == [("b", None, None)]
 
 
 def test_poetry_lock(fixtures):
