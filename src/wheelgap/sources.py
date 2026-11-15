@@ -10,7 +10,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import unquote, urlparse, urlsplit
+from urllib.parse import ParseResult, unquote, urlparse
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -207,19 +207,22 @@ def pythons_outside_lock(source: Source, targets: Iterable[Target], *, bounds_on
 
 
 def _filename(entry: dict, origin: str, package: str) -> str | None:
+    url = entry.get("url")
+    parts: ParseResult | None = None
+    if isinstance(url, str):
+        # A lock URL that `urlparse` can't read (an unclosed IPv6 bracket) or whose host holds a space is a
+        # broken lock, even when the entry also records a file name: name the file and the package instead of
+        # letting ValueError escape. The URL isn't echoed back, since it may carry credentials.
+        try:
+            parts = urlparse(url)
+        except ValueError:
+            pass
+        if parts is None or any(c.isspace() for c in parts.netloc.rpartition("@")[2]):
+            raise SourceError(f"{origin}: package {package} has a file URL that can't be parsed")
     for k in ("filename", "file", "name"):
         if isinstance(entry.get(k), str) and entry[k].endswith((".whl", ".tar.gz", ".zip", ".tar.bz2", ".tgz")):
             return entry[k]
-    url = entry.get("url")
-    if isinstance(url, str):
-        # A lock URL that `urlsplit` can't read (an unclosed IPv6 bracket) or whose authority holds a
-        # space is a broken lock: name the file and the package instead of letting ValueError escape.
-        try:
-            parts = urlsplit(url)
-        except ValueError:
-            parts = None
-        if parts is None or any(c.isspace() for c in parts.netloc):
-            raise SourceError(f"{origin}: package {package} has a file URL that can't be parsed: {url!r}")
+    if parts is not None:
         return unquote(Path(parts.path).name)
     path = entry.get("path")
     if isinstance(path, str):
