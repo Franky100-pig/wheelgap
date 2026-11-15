@@ -826,6 +826,36 @@ def test_pylock_records_requires_python_and_index(tmp_path):
     assert src.requires_python == "==3.13.*" and src.packages[0].registry == "https://pypi.org/simple"
 
 
+def test_uv_lock_file_url_that_cannot_be_parsed_is_an_input_error(tmp_path):
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\n\n[[package]]\nname = "b"\nversion = "1.0"\n'
+        'wheels = [{ url = "https://[files.pythonhosted.org/b-1.0-py3-none-any.whl" }]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match=r"uv\.lock.*package b.*can't be parsed"):
+        load_inputs([str(tmp_path)])
+
+
+def test_uv_lock_file_url_with_a_space_in_the_host_is_an_input_error(tmp_path):
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\n\n[[package]]\nname = "b"\nversion = "1.0"\n'
+        'wheels = [{ url = "https://files pythonhosted.org/b-1.0-py3-none-any.whl" }]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match=r"uv\.lock.*package b.*can't be parsed"):
+        load_inputs([str(tmp_path)])
+
+
+def test_pylock_sdist_url_that_cannot_be_parsed_is_an_input_error(tmp_path):
+    (tmp_path / "pylock.toml").write_text(
+        'lock-version = "1.0"\n\n[[packages]]\nname = "b"\nversion = "1.0"\n'
+        'sdist = { url = "https://[files.pythonhosted.org/b-1.0.tar.gz" }\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SourceError, match=r"pylock\.toml.*package b.*can't be parsed"):
+        load_inputs([str(tmp_path / "pylock.toml")])
+
+
 def test_pipfile_lock_non_string_version_raises(tmp_path):
     path = tmp_path / "Pipfile.lock"
     path.write_text(json.dumps({"default": {"requests": {"version": 2}}}), encoding="utf-8")
